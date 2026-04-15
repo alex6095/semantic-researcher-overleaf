@@ -4,6 +4,7 @@ import { EventBus } from '../utils/eventBus';
 import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
 import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { ProjectLabelResponseSchema } from '../api/base';
+import { LocalReplicaSCMProvider } from './localReplicaSCM';
 
 interface HistoryRecord {
     before?: number,
@@ -357,6 +358,24 @@ export class HistoryViewProvider {
         this.updateView();
     }
 
+    private async updateViewForUri(uri: vscode.Uri) {
+        if (uri.scheme===ROOT_NAME) {
+            const {pathParts} = parseUri(uri);
+            if (pathParts[0]===OUTPUT_FOLDER_NAME) { return; }
+            this.updateView(pathParts);
+            return;
+        }
+
+        if (uri.scheme==='file') {
+            const path = await LocalReplicaSCMProvider.uriToPath(uri);
+            if (!path) { return; }
+
+            const pathParts = path.split('/').filter(Boolean);
+            if (pathParts[0]===OUTPUT_FOLDER_NAME) { return; }
+            this.updateView(pathParts);
+        }
+    }
+
     updateView(pathParts?: string[]) {
         this.historyView.description = pathParts?.at(-1);
         this.treeDataProvider.refreshData( pathParts?.join('/') );
@@ -380,15 +399,15 @@ export class HistoryViewProvider {
                     const activeTextUri = vscode.window.activeTextEditor?.document.uri;
                     if (activeTextUri && activeTextUri.path!==uri.path) { return; }
                     if (!activeTextUri && vscode.workspace.textDocuments.map(d=>d.uri.path).includes(uri.path)) { return; }
-
-                    // filter output folder
-                    const {pathParts} = parseUri(uri);
-                    if (pathParts[0]===OUTPUT_FOLDER_NAME) { return; }
-
-                    this.updateView( pathParts );
+                    void this.updateViewForUri(uri);
                 }, 100);
             }),
-            //FIXME: on "file://" uri open
+            vscode.window.onDidChangeActiveTextEditor((editor) => {
+                const uri = editor?.document.uri;
+                if (uri) {
+                    void this.updateViewForUri(uri);
+                }
+            }),
         ];
     }
 }

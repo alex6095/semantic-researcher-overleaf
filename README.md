@@ -39,6 +39,8 @@ The full user guide is available at [GitHub Wiki](https://github.com/overleaf-wo
 
     <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo07-local.gif" height=400px/>
 
+  Use `Open Project Locally ...` to create a replica under a parent folder, or `Select Project Folder Locally ...` to use an exact folder as the replica root.
+
 ### How to Login with Cookies
 
 <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/login_with_cookie.png" height=400px/>

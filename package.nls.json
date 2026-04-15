@@ -26,6 +26,7 @@
     "commands.projectManager.openProjectInCurrentWindow.title": "Open Project in Current Window",
     "commands.projectManager.openProjectInNewWindow.title": "Open Project in New Window",
     "commands.projectManager.openProjectLocalReplica.title": "Open Project Locally ...",
+    "commands.projectManager.selectProjectFolderLocalReplica.title": "Select Project Folder Locally ...",
 
     "commands.projectHistory.refresh.title": "Refresh Project History",
     "commands.projectHistory.clearSelection.title": "Clear Selection",
@@ -37,6 +38,7 @@
     "commands.projectHistory.downloadProject.title": "Download Project",
     "commands.projectHistory.revealHistoryView.title": "Focus on Overleaf History View",
     "commands.projectSCM.configSCM.title": "Configure Source Control ...",
+    "commands.projectSCM.toggleLocalCompilePreview.title": "Toggle Local Compile & PDF Preview",
 
     "commands.compileManager.compile.title": "Compile Project",
     "commands.compileManager.viewPdf.title": "View Compiled PDF",

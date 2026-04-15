@@ -273,10 +273,17 @@
         "category": "%extension.displayName%"
       },
       {
+        "command": "overleaf-workshop.projectManager.selectProjectFolderLocalReplica",
+        "title": "%commands.projectManager.selectProjectFolderLocalReplica.title%",
+        "icon": "$(folder-opened)",
+        "enablement": "viewItem == project || viewItem == project_in_tag",
+        "category": "%extension.displayName%"
+      },
+      {
         "command": "overleaf-workshop.projectHistory.refresh",
         "title": "%commands.projectHistory.refresh.title%",
         "icon": "$(refresh)",
-        "enablement": "resourceScheme == overleaf-workshop",
+        "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activate",
         "category": "%extension.displayName%"
       },
       {
@@ -328,7 +335,7 @@
       {
         "command": "overleaf-workshop.projectHistory.revealHistoryView",
         "title": "%commands.projectHistory.revealHistoryView.title%",
-        "enablement": "resourceScheme == overleaf-workshop",
+        "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activate",
         "category": "%extension.displayName%"
       },
       {
@@ -336,6 +343,13 @@
         "title": "%commands.projectSCM.configSCM.title%",
         "icon": "$(gear)",
         "enablement": "resourceScheme == overleaf-workshop || overleaf-workshop.activate",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "overleaf-workshop.projectSCM.toggleLocalCompilePreview",
+        "title": "%commands.projectSCM.toggleLocalCompilePreview.title%",
+        "icon": "$(open-preview)",
+        "enablement": "overleaf-workshop.activate",
         "category": "%extension.displayName%"
       },
       {
@@ -552,7 +566,7 @@
           "icon": "$(history)",
           "name": "%views.explorer.overleaf-workshop.projectHistory%",
           "contextualTitle": "%views.explorer.overleaf-workshop.contextualTitle%",
-          "when": "resourceScheme == overleaf-workshop"
+          "when": "resourceScheme == overleaf-workshop || overleaf-workshop.activate"
         },
         {
           "type": "webview",
@@ -595,6 +609,11 @@
           "command": "overleaf-workshop.projectSCM.configSCM",
           "when": "view == overleaf-workshop.projectHistory",
           "group": "navigation@1"
+        },
+        {
+          "command": "overleaf-workshop.projectSCM.toggleLocalCompilePreview",
+          "when": "view == overleaf-workshop.projectHistory && overleaf-workshop.activate",
+          "group": "navigation@1.5"
         },
         {
           "command": "overleaf-workshop.projectHistory.refresh",
@@ -729,6 +748,11 @@
           "group": "1_openActions@3"
         },
         {
+          "command": "overleaf-workshop.projectManager.selectProjectFolderLocalReplica",
+          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "group": "1_openActions@4"
+        },
+        {
           "command": "overleaf-workshop.projectHistory.createLabel",
           "when": "view == overleaf-workshop.projectHistory && viewItem =~ /historyItem(Labelled)?/",
           "group": "1_labelActions@0"
@@ -778,6 +802,7 @@
     "download-latex-basics": "download -o data/vendor -s 1 -e https://github.com/jlelong/vscode-latex-basics/archive/refs/tags/v1.5.4.zip",
     "postinstall": "patch-package && npm run download-pdfjs && npm run download-latex-basics",
     "vscode:prepublish": "npm run compile",
+    "package:semantic-researcher-fork": "node ./scripts/package-semantic-researcher-fork.mjs",
     "update-l10n": "npx @vscode/l10n-dev export -o ./l10n ./src",
     "compile": "tsc -p ./ && cd views/chat-view && npm run build",
     "watch": "tsc -watch -p ./",

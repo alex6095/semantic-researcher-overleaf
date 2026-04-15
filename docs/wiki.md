@@ -139,9 +139,11 @@ However, due to the [limitation of the virtual workspace](https://github.com/mic
 #### Open Project Locally
 
 > [!NOTE]
-> The Overleaf features are not completely enabled in a local folder. Specifically, the [compile](#compile-project), [PDF preview](#preview-document), [intellisense](#intellisense) and [project history](#history-of-changes) features are disabled by default.
+> The Overleaf features are not completely enabled in a local folder. Specifically, the [compile](#compile-project), [PDF preview](#preview-document) and [intellisense](#intellisense) features are disabled by default.
 > 
-> Currently, there is no way to enable these features in a local folder, especially considering people would like to use the LaTeX Workshop extension in a local folder. If you are in demand of these features, please consider to create a discussion in the [GitHub Discussions](https://github.com/overleaf-workshop/Overleaf-Workshop/discussions)
+> The [project history](#history-of-changes) view is available in both the virtual workspace and a local replica, and follows the active document when possible.
+>
+> The compile and preview commands can be re-enabled in a local replica by using `Toggle Local Compile & PDF Preview` from the command palette or the History view toolbar. Many users still prefer to pair the local replica with the LaTeX Workshop extension instead.
 
 The "Open Project Locally" feature is provided via a [local replica](#local-replica). The local replica is a folder on your local machine with a `.overleaf` folder presence, which is kept in sync with the project on the Overleaf server.
 
@@ -157,6 +159,12 @@ Please follow the steps below to setup a local replica and open the project loca
     ![screenshots-setup-local-replica-folder](assets/screenshot-setup-local-replica-folder.png)
 
 3. After the local replica is created, a input box will pop up to ask you to choose the local replica folder to open. Then you can open the project locally.
+
+#### Select Project Folder Locally
+
+If you already have a specific local folder that should become the replica root itself, right click on the project and select `Select Project Folder Locally ...`.
+
+This command differs from `Open Project Locally ...` in one important way: the selected folder is used directly as the replica root, so `.overleaf/settings.json` and the synced project files will be created inside that exact folder.
 
 ## Basic Usage
 
@@ -416,7 +424,7 @@ P.S. The compile is also automatically triggered when you save a `.tex` file. Th
 
 **A2**: Due to the [limitation of the virtual workspace](https://github.com/microsoft/vscode/wiki/Virtual-Workspaces#signal-whether-your-extension-can-handle-virtual-workspaces), most of the existing VS Code extensions does not work in the virtual workspace. In this case, you can choose to [open the project locally](#open-project-locally) as a workaround.
 
-Please notice that not all Overleaf features enabled in a local folder. More specifically, the [compile](#compile-project), [PDF preview](#preview-document), [intellisense](#intellisense) and [project history](#history-of-changes) features are disabled by default. You need to refer to [LaTeX Workshop Extension](https://github.com/James-Yu/LaTeX-Workshop) as a complement.
+Please notice that not all Overleaf features are enabled in a local folder. The [compile](#compile-project), [PDF preview](#preview-document) and [intellisense](#intellisense) features are still limited there, so many users pair a local replica with [LaTeX Workshop Extension](https://github.com/James-Yu/LaTeX-Workshop). The [project history](#history-of-changes) view is available in a local replica as well.
 
 
 #### Q3: Why the extension loses connection to the server frequently or loading indefinitely?

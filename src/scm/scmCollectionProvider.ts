@@ -47,6 +47,10 @@ interface SCMRecord {
     triggers: vscode.Disposable[];
 }
 
+interface CreateSCMOptions {
+    exactBaseUri?: boolean;
+}
+
 export class SCMCollectionProvider extends vscode.Disposable {
     private readonly core: CoreSCMProvider;
     private readonly scms: SCMRecord[] = [];
@@ -133,6 +137,14 @@ export class SCMCollectionProvider extends vscode.Disposable {
     }
 
     private async createSCM(scmProto: SupportedSCM, baseUri: vscode.Uri, newSCM=false, enabled=true) {
+        const existing = this.scms.find(item =>
+            item.scm.baseUri.toString()===baseUri.toString()
+            && (item.scm.constructor as any).label===scmProto.label
+        );
+        if (existing) {
+            return existing.scm;
+        }
+
         const scm = new scmProto(this.vfs, baseUri);
         // insert into global state
         if (newSCM) {
@@ -169,7 +181,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
         }
     }
 
-    private createNewSCM(scmProto: SupportedSCM) {
+    private createNewSCM(scmProto: SupportedSCM, options?: CreateSCMOptions) {
         return new Promise(resolve => {
             const inputBox = scmProto.baseUriInputBox;
             inputBox.ignoreFocusOut = true;
@@ -188,16 +200,23 @@ export class SCMCollectionProvider extends vscode.Disposable {
                 }
             });
         })
-        .then((uri) => scmProto.validateBaseUri(uri as string || '', this.vfs.projectName))
+        .then((uri) => {
+            if (options?.exactBaseUri && scmProto===LocalReplicaSCMProvider) {
+                return LocalReplicaSCMProvider.validateExactBaseUri(uri as string || '');
+            }
+            return scmProto.validateBaseUri(uri as string || '', this.vfs.projectName);
+        })
         .then(async (baseUri) => {
             if (baseUri) {
                 const scm = await this.createSCM(scmProto, baseUri, true);
                 if (scm) {
                     vscode.window.showInformationMessage( vscode.l10n.t('"{scm}" created: {uri}.', {scm:scmProto.label, uri: decodeURI(scm.baseUri.toString()) }) );
+                    return scm;
                 } else {
                     vscode.window.showErrorMessage( vscode.l10n.t('"{scm}" creation failed.', {scm:scmProto.label}) );
                 }
             }
+            return undefined;
         });
     }
 
@@ -249,6 +268,20 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     break;
             }
         });
+    }
+
+    private getLocalReplicaSCM(): LocalReplicaSCMProvider | undefined {
+        const record = this.scms.find(item => item.scm instanceof LocalReplicaSCMProvider);
+        return record?.scm as LocalReplicaSCMProvider | undefined;
+    }
+
+    private async toggleLocalReplicaCompilePreview() {
+        const scm = this.getLocalReplicaSCM();
+        if (!scm) {
+            vscode.window.showWarningMessage(vscode.l10n.t('No local replica is active in the current workspace.'));
+            return;
+        }
+        await scm.toggleCompilePreviewEnabled();
     }
 
     showSCMConfiguration() {
@@ -305,6 +338,12 @@ export class SCMCollectionProvider extends vscode.Disposable {
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.newSCM`, (scmProto) => {
                 return this.createNewSCM(scmProto);
+            }),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.newSCMWithOptions`, (scmProto, options?: CreateSCMOptions) => {
+                return this.createNewSCM(scmProto, options);
+            }),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.toggleLocalCompilePreview`, () => {
+                return this.toggleLocalReplicaCompilePreview();
             }),
             this as vscode.Disposable,
         ];

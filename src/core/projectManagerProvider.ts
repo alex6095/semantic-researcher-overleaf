@@ -645,6 +645,34 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         });
     }
 
+    async selectProjectFolderLocalReplica(project: ProjectItem) {
+        // should close other open vfs firstly
+        const vfsFolder = vscode.workspace.workspaceFolders?.find(folder => folder.uri.scheme===ROOT_NAME);
+        if (vfsFolder) {
+            vscode.window.showWarningMessage( vscode.l10n.t('Please close the open remote overleaf folder firstly.') );
+            return;
+        }
+
+        const uri = vscode.Uri.parse(project.uri);
+        const vfs = (await (await vscode.commands.executeCommand('remoteFileSystem.prefetch', uri))) as VirtualFileSystem;
+        await vfs.init();
+
+        try {
+            const scm = await vscode.commands.executeCommand(
+                `${ROOT_NAME}.projectSCM.newSCMWithOptions`,
+                LocalReplicaSCMProvider,
+                {exactBaseUri: true},
+            ) as LocalReplicaSCMProvider | undefined;
+
+            if (scm) {
+                vscode.commands.executeCommand('vscode.openFolder', scm.baseUri, false);
+                vscode.commands.executeCommand('workbench.view.explorer');
+            }
+        } finally {
+            vfs.dispose();
+        }
+    }
+
     get triggers() {
         return [
             // register tree data provider
@@ -715,6 +743,9 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectLocalReplica`, (item) => {
                 this.openProjectLocalReplica(item);
+            }),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.selectProjectFolderLocalReplica`, (item) => {
+                this.selectProjectFolderLocalReplica(item);
             }),
         ];
     }
