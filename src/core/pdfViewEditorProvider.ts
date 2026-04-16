@@ -63,7 +63,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
             if (doc.cache.buffer.byteLength !== 0) {
                 webviewPanel.webview.postMessage({type:'update', content:doc.cache.buffer});
             }
-        }
+        };
 
         const docOnDidChangeListener = doc.onDidChange(() => {
             updateWebview();
