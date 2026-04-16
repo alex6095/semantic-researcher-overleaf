@@ -164,7 +164,10 @@ Please follow the steps below to setup a local replica and open the project loca
 
 If you already have a specific local folder that should become the replica root itself, right click on the project and select `Select Project Folder Locally ...`.
 
-This command differs from `Open Project Locally ...` in one important way: the selected folder is used directly as the replica root, so `.overleaf/settings.json` and the synced project files will be created inside that exact folder.
+This command differs from `Open Project Locally ...` in two important ways:
+
+1. the selected folder is used directly as the replica root, so `.overleaf/settings.json` and the synced project files will be created inside that exact folder;
+2. the selected folder becomes the active local replica root for the current VS Code window, so local history, chat, collaboration helpers, compile / preview actions, and intellisense-related features resolve against that exact folder without replacing the current window.
 
 ## Basic Usage
 
