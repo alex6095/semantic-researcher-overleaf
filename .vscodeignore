@@ -1,10 +1,14 @@
 .vscode/**
 .vscode-test/**
+.github/**
+.husky/**
 src/**
 patches/**
 docs/**
 .gitignore
 .yarnrc
+commitlint.config.js
+scripts/**
 **/tsconfig.json
 **/.eslintrc.json
 **/*.map

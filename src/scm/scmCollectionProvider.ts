@@ -51,6 +51,11 @@ interface CreateSCMOptions {
     exactBaseUri?: boolean;
 }
 
+function parsePersistedBaseUri(baseUri: string): vscode.Uri {
+    const uri = vscode.Uri.parse(baseUri);
+    return uri.scheme==='' ? vscode.Uri.file(baseUri) : uri;
+}
+
 export class SCMCollectionProvider extends vscode.Disposable {
     private readonly core: CoreSCMProvider;
     private readonly scms: SCMRecord[] = [];
@@ -126,11 +131,20 @@ export class SCMCollectionProvider extends vscode.Disposable {
 
     private initSCMs() {
         const scmPersists = GlobalStateManager.getServerProjectSCMPersists(this.context, this.vfs.serverName, this.vfs.projectId);
-        Object.values(scmPersists).forEach(async scmPersist => {
+        Object.entries(scmPersists).forEach(async ([scmKey, scmPersist]) => {
             const scmProto = supportedSCMs.find(scm => scm.label===scmPersist.label);
             if (scmProto!==undefined) {
                 const enabled = scmPersist.enabled ?? true;
-                const baseUri = vscode.Uri.parse(scmPersist.baseUri);
+                const baseUri = parsePersistedBaseUri(scmPersist.baseUri);
+                const canonicalScmKey = baseUri.toString();
+                if (scmKey!==canonicalScmKey || scmPersist.baseUri!==canonicalScmKey) {
+                    this.vfs.setProjectSCMPersist(scmKey, undefined);
+                    this.vfs.setProjectSCMPersist(canonicalScmKey, {
+                        ...scmPersist,
+                        enabled,
+                        baseUri: canonicalScmKey,
+                    });
+                }
                 await this.createSCM(scmProto, baseUri, false, enabled);
             }
         });
@@ -164,7 +178,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
             this.vfs.setProjectSCMPersist(scm.scmKey, {
                 enabled: enabled,
                 label: scmProto.label,
-                baseUri: scm.baseUri.path,
+                baseUri: scm.baseUri.toString(),
                 settings: {} as JSON,
             });
         }
@@ -177,7 +191,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
         } catch (error) {
             // permanently remove failed scm
             // this.vfs.setProjectSCMPersist(scm.scmKey, undefined);
-            vscode.window.showErrorMessage( vscode.l10n.t('"{scm}" creation failed.', {scm:scmProto.label}) );
+            const message = error instanceof Error ? error.message : String(error);
+            console.error(`"${scmProto.label}" creation failed for ${baseUri.toString()}:`, error);
+            vscode.window.showErrorMessage( vscode.l10n.t('"{scm}" creation failed: {message}', {scm:scmProto.label, message}) );
             return undefined;
         }
     }
@@ -225,8 +241,6 @@ export class SCMCollectionProvider extends vscode.Disposable {
                 if (scm) {
                     vscode.window.showInformationMessage( vscode.l10n.t('"{scm}" created: {uri}.', {scm:scmProto.label, uri: decodeURI(scm.baseUri.toString()) }) );
                     return scm;
-                } else {
-                    vscode.window.showErrorMessage( vscode.l10n.t('"{scm}" creation failed.', {scm:scmProto.label}) );
                 }
             }
             return undefined;

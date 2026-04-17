@@ -25,6 +25,11 @@ function isDirectoryAncestor(parent: vscode.Uri, child: vscode.Uri) {
     return child.path===parent.path || child.path.startsWith(normalizedParent);
 }
 
+function parsePersistedLocalRoot(rootUri: string): vscode.Uri {
+    const uri = vscode.Uri.parse(rootUri);
+    return uri.scheme==='' ? vscode.Uri.file(rootUri) : uri;
+}
+
 async function pathExists(uri: vscode.Uri) {
     try {
         await vscode.workspace.fs.stat(uri);
@@ -95,7 +100,7 @@ export async function initializeLocalReplicaWorkspace() {
     let rootUri: vscode.Uri | undefined;
     const savedRoot = extensionContext?.workspaceState.get<string>(ACTIVE_REPLICA_ROOT_KEY);
     if (savedRoot) {
-        const parsed = vscode.Uri.parse(savedRoot);
+        const parsed = parsePersistedLocalRoot(savedRoot);
         if (await pathExists(vscode.Uri.joinPath(parsed, '.overleaf/settings.json'))) {
             rootUri = parsed;
         }

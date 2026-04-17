@@ -1,16 +1,17 @@
-# Overleaf Workshop
+# Semantic Researcher Overleaf
 
-[![GitHub Repo stars](https://img.shields.io/github/stars/overleaf-workshop/Overleaf-Workshop)](https://github.com/overleaf-workshop/Overleaf-Workshop)
-[![version](https://img.shields.io/visual-studio-marketplace/v/iamhyc.overleaf-workshop)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop)
-[![Visual Studio Marketplace Installs](https://img.shields.io/visual-studio-marketplace/i/iamhyc.overleaf-workshop)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop)
-[![updated](https://img.shields.io/visual-studio-marketplace/last-updated/iamhyc.overleaf-workshop)](https://marketplace.visualstudio.com/items?itemName=iamhyc.overleaf-workshop)
-[![release](https://img.shields.io/visual-studio-marketplace/release-date/iamhyc.overleaf-workshop)](https://vsmarketplacebadge.apphb.com/downloads-short/iamhyc.overleaf-workshop.svg)
+[![GitHub Repo](https://img.shields.io/badge/GitHub-alex6095%2Fsemantic--researcher--overleaf-blue)](https://github.com/alex6095/semantic-researcher-overleaf)
+[![version](https://img.shields.io/visual-studio-marketplace/v/alex6095.semantic-researcher-overleaf)](https://marketplace.visualstudio.com/items?itemName=alex6095.semantic-researcher-overleaf)
+[![Visual Studio Marketplace Installs](https://img.shields.io/visual-studio-marketplace/i/alex6095.semantic-researcher-overleaf)](https://marketplace.visualstudio.com/items?itemName=alex6095.semantic-researcher-overleaf)
+[![updated](https://img.shields.io/visual-studio-marketplace/last-updated/alex6095.semantic-researcher-overleaf)](https://marketplace.visualstudio.com/items?itemName=alex6095.semantic-researcher-overleaf)
 
-Open Overleaf (ShareLatex) projects in VSCode, with full collaboration support.
+Open Overleaf (ShareLaTeX) projects in VS Code with local replica workflows tuned for semantic-researcher use.
+
+This extension is a fork of [Overleaf Workshop](https://github.com/overleaf-workshop/Overleaf-Workshop). It keeps the upstream AGPL-3.0 license and original contributor credits while carrying local workflow fixes for this fork.
 
 ### User Guide
 
-The full user guide is available at [GitHub Wiki](https://github.com/overleaf-workshop/Overleaf-Workshop/wiki).
+The upstream user guide is available at [GitHub Wiki](https://github.com/overleaf-workshop/Overleaf-Workshop/wiki).
 
 ### Features
 

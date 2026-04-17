@@ -1,14 +1,16 @@
 {
-  "name": "overleaf-workshop",
+  "name": "semantic-researcher-overleaf",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.8",
+  "version": "0.15.9",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
     "email": "ychong@petalmail.com"
   },
-  "publisher": "iamhyc",
+  "publisher": "alex6095",
+  "license": "SEE LICENSE IN LICENSE",
+  "homepage": "https://github.com/alex6095/semantic-researcher-overleaf#readme",
   "contributors": [
     {
       "name": "iamhyc",
@@ -47,16 +49,23 @@
   ],
   "repository": {
     "type": "git",
-    "url": "https://github.com/overleaf-workshop/overleaf-workshop"
+    "url": "https://github.com/alex6095/semantic-researcher-overleaf.git"
   },
   "bugs": {
-    "url": "https://github.com/overleaf-workshop/overleaf-workshop/issues"
+    "url": "https://github.com/alex6095/semantic-researcher-overleaf/issues"
   },
   "engines": {
     "vscode": "^1.80.0"
   },
   "categories": [
     "Other"
+  ],
+  "keywords": [
+    "overleaf",
+    "sharelatex",
+    "latex",
+    "semantic-researcher",
+    "local-replica"
   ],
   "activationEvents": [
     "onFileSystem:overleaf-workshop",
@@ -791,7 +800,8 @@
     "download-latex-basics": "download -o data/vendor -s 1 -e https://github.com/jlelong/vscode-latex-basics/archive/refs/tags/v1.5.4.zip",
     "postinstall": "patch-package && npm run download-pdfjs && npm run download-latex-basics",
     "vscode:prepublish": "npm run compile",
-    "package:semantic-researcher-fork": "node ./scripts/package-semantic-researcher-fork.mjs",
+    "package:vsix": "npx @vscode/vsce package --no-yarn",
+    "publish:marketplace": "npx @vscode/vsce publish --no-yarn",
     "update-l10n": "npx @vscode/l10n-dev export -o ./l10n ./src",
     "compile": "tsc -p ./ && cd views/chat-view && npm run build",
     "watch": "tsc -watch -p ./",
