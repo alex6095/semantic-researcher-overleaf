@@ -13,6 +13,12 @@ import {
     onDidChangeActiveReplicaRoot,
 } from './utils/localReplicaWorkspace';
 
+type ActiveReplicaSyncTarget = {
+    key: string,
+    uri: vscode.Uri,
+    rootUri: vscode.Uri,
+};
+
 export function activate(context: vscode.ExtensionContext) {
     // Register: [core] RemoteFileSystemProvider
     const remoteFileSystemProvider = new RemoteFileSystemProvider(context);
@@ -35,15 +41,65 @@ export function activate(context: vscode.ExtensionContext) {
     const langIntellisenseProvider = new LangIntellisenseProvider(context, remoteFileSystemProvider);
     context.subscriptions.push( ...langIntellisenseProvider.triggers );
 
-    const syncActiveReplicaProject = async () => {
+    let activeReplicaSyncPromise: Promise<void> | undefined;
+    let activeReplicaSyncKey: string | undefined;
+    let queuedActiveReplicaSyncKey: string | undefined;
+
+    const getActiveReplicaSyncTarget = (): ActiveReplicaSyncTarget | undefined => {
         const uri = getActiveReplicaOriginUri();
-        if (uri?.scheme===ROOT_NAME) {
-            await remoteFileSystemProvider.activateProject(uri);
-            const rootUri = getActiveReplicaRoot();
-            if (rootUri) {
-                await vscode.commands.executeCommand(`${ROOT_NAME}.projectSCM.ensureLocalReplicaSCM`, rootUri);
-            }
+        const rootUri = getActiveReplicaRoot();
+        if (uri?.scheme!==ROOT_NAME || !rootUri) {
+            return undefined;
         }
+        return {
+            key: `${uri.toString()}::${rootUri.toString()}`,
+            uri,
+            rootUri,
+        };
+    };
+
+    const runActiveReplicaSync = async (initialTarget: ActiveReplicaSyncTarget) => {
+        let target: ActiveReplicaSyncTarget | undefined = initialTarget;
+        while (target) {
+            activeReplicaSyncKey = target.key;
+            queuedActiveReplicaSyncKey = undefined;
+            await remoteFileSystemProvider.activateProject(target.uri);
+
+            const latestTarget = getActiveReplicaSyncTarget();
+            if (latestTarget?.key===target.key) {
+                await vscode.commands.executeCommand(`${ROOT_NAME}.projectSCM.ensureLocalReplicaSCM`, target.rootUri);
+            }
+
+            const queuedKey = queuedActiveReplicaSyncKey;
+            const currentTarget = getActiveReplicaSyncTarget();
+            target = queuedKey && currentTarget?.key===queuedKey && currentTarget.key!==activeReplicaSyncKey
+                ? currentTarget
+                : undefined;
+        }
+    };
+
+    const syncActiveReplicaProject = () => {
+        const target = getActiveReplicaSyncTarget();
+        if (!target) {
+            return Promise.resolve();
+        }
+        if (activeReplicaSyncPromise) {
+            if (target.key!==activeReplicaSyncKey) {
+                queuedActiveReplicaSyncKey = target.key;
+            }
+            return activeReplicaSyncPromise;
+        }
+
+        activeReplicaSyncPromise = runActiveReplicaSync(target)
+        .catch(error => {
+            console.error('Active Local Replica sync failed:', error);
+        })
+        .finally(() => {
+            activeReplicaSyncPromise = undefined;
+            activeReplicaSyncKey = undefined;
+            queuedActiveReplicaSyncKey = undefined;
+        });
+        return activeReplicaSyncPromise;
     };
 
     context.subscriptions.push(

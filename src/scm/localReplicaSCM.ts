@@ -11,6 +11,7 @@ import {
     readReplicaSettings,
 } from '../utils/localReplicaWorkspace';
 import { stringifyOverleafUri } from '../utils/overleafUri';
+import { formatUnknownError } from '../utils/errorMessage';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 
@@ -281,7 +282,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             while (queue.length!==0) {
                 const nextRoot = queue.shift();
                 const vfsUri = this.vfs.pathToUri(nextRoot!);
-                const items = await vscode.workspace.fs.readDirectory(vfsUri);
+                const items = await this.withFileSystemContext(
+                    'Read remote directory',
+                    vfsUri,
+                    () => vscode.workspace.fs.readDirectory(vfsUri),
+                );
                 if (token.isCancellationRequested) { return undefined; }
                 //
                 for (const [name, type] of items) {
@@ -291,7 +296,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     }
                     if (type === vscode.FileType.Directory) {
                         this.setBypassCache(relPath, new Uint8Array(), 'pull');
-                        await vscode.workspace.fs.createDirectory(this.localUri(relPath));
+                        const localUri = this.localUri(relPath);
+                        await this.withFileSystemContext(
+                            'Create local directory',
+                            localUri,
+                            () => vscode.workspace.fs.createDirectory(localUri),
+                        );
                         queue.push(relPath+'/');
                     } else {
                         files.push([name, relPath]);
@@ -309,7 +319,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 //
                 const baseContent = this.baseCache[relPath];
                 const localContent = await this.readFile(relPath);
-                const remoteContent = await vscode.workspace.fs.readFile(vfsUri);
+                const remoteContent = await this.withFileSystemContext(
+                    'Read remote file',
+                    vfsUri,
+                    () => vscode.workspace.fs.readFile(vfsUri),
+                );
                 if (baseContent===undefined || localContent===undefined) {
                     this.setBypassCache(relPath, remoteContent);
                     await this.writeFile(relPath, remoteContent);
@@ -327,7 +341,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     await this.writeFile(relPath, mergedContent);
                     // write the merged content to remote
                     if (localPatches.length!==0) {
-                        await vscode.workspace.fs.writeFile(vfsUri, mergedContent);
+                        await this.withFileSystemContext(
+                            'Write remote file',
+                            vfsUri,
+                            () => vscode.workspace.fs.writeFile(vfsUri, mergedContent),
+                        );
                     }
                 }
             }
@@ -439,16 +457,37 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return vscode.Uri.joinPath(this.baseUri, relPath.replace(/^\/+/, ''));
     }
 
+    private async withFileSystemContext<T>(
+        operation: string,
+        uri: vscode.Uri,
+        task: () => Thenable<T> | Promise<T>,
+    ): Promise<T> {
+        try {
+            return await task();
+        } catch (error) {
+            throw new Error(`${operation} failed for ${uri.toString()}: ${formatUnknownError(error)}`);
+        }
+    }
+
     private async ensureParentDirectory(relPath: string) {
         const pathParts = relPath.replace(/^\/+/, '').split('/').filter(Boolean);
         if (pathParts.length<=1) { return; }
-        await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(this.baseUri, ...pathParts.slice(0, -1)));
+        const parentUri = vscode.Uri.joinPath(this.baseUri, ...pathParts.slice(0, -1));
+        await this.withFileSystemContext(
+            'Create local parent directory',
+            parentUri,
+            () => vscode.workspace.fs.createDirectory(parentUri),
+        );
     }
 
     async writeFile(relPath: string, content: Uint8Array): Promise<void> {
         await this.ensureParentDirectory(relPath);
         const uri = this.localUri(relPath);
-        return vscode.workspace.fs.writeFile(uri, content);
+        return this.withFileSystemContext(
+            'Write local file',
+            uri,
+            () => vscode.workspace.fs.writeFile(uri, content),
+        );
     }
 
     readFile(relPath: string): Thenable<Uint8Array|undefined> {

@@ -713,7 +713,10 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         const scm = await vscode.commands.executeCommand(
             `${ROOT_NAME}.projectSCM.newSCMWithOptions`,
             LocalReplicaSCMProvider,
-            {exactBaseUri: true},
+            {
+                exactBaseUri: true,
+                replaceExistingLabel: LocalReplicaSCMProvider.label,
+            },
         ) as LocalReplicaSCMProvider | undefined;
 
         if (scm) {

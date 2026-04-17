@@ -8,6 +8,7 @@ import { HistoryViewProvider } from './historyViewProvider';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { EventBus } from '../utils/eventBus';
 import { ROOT_NAME } from '../consts';
+import { formatUnknownError } from '../utils/errorMessage';
 
 const supportedSCMs = [
     LocalReplicaSCMProvider,
@@ -49,6 +50,7 @@ interface SCMRecord {
 
 interface CreateSCMOptions {
     exactBaseUri?: boolean;
+    replaceExistingLabel?: string;
 }
 
 function parsePersistedBaseUri(baseUri: string): vscode.Uri {
@@ -59,6 +61,7 @@ function parsePersistedBaseUri(baseUri: string): vscode.Uri {
 export class SCMCollectionProvider extends vscode.Disposable {
     private readonly core: CoreSCMProvider;
     private readonly scms: SCMRecord[] = [];
+    private readonly pendingSCMs = new Map<string, Promise<BaseSCM | undefined>>();
     private readonly statusBarItem: vscode.StatusBarItem;
     private readonly statusListener: vscode.Disposable;
     private historyDataProvider: HistoryViewProvider;
@@ -151,6 +154,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
     }
 
     private async createSCM(scmProto: SupportedSCM, baseUri: vscode.Uri, newSCM=false, enabled=true) {
+        const scmRecordKey = `${scmProto.label}:${baseUri.toString()}`;
         const existing = this.scms.find(item =>
             item.scm.baseUri.toString()===baseUri.toString()
             && (item.scm.constructor as any).label===scmProto.label
@@ -159,6 +163,10 @@ export class SCMCollectionProvider extends vscode.Disposable {
             let activated = false;
             if (enabled && (!existing.enabled || existing.triggers.length===0)) {
                 const persist = this.vfs.getProjectSCMPersist(existing.scm.scmKey);
+                if (!persist || persist.label!==scmProto.label) {
+                    this.removeSCM(existing);
+                    return undefined;
+                }
                 persist.enabled = true;
                 this.vfs.setProjectSCMPersist(existing.scm.scmKey, persist);
                 existing.enabled = true;
@@ -172,6 +180,23 @@ export class SCMCollectionProvider extends vscode.Disposable {
             return existing.scm;
         }
 
+        const pendingSCM = this.pendingSCMs.get(scmRecordKey);
+        if (pendingSCM) {
+            return pendingSCM;
+        }
+
+        const creation = this.createSCMRecord(scmProto, baseUri, newSCM, enabled);
+        this.pendingSCMs.set(scmRecordKey, creation);
+        try {
+            return await creation;
+        } finally {
+            if (this.pendingSCMs.get(scmRecordKey)===creation) {
+                this.pendingSCMs.delete(scmRecordKey);
+            }
+        }
+    }
+
+    private async createSCMRecord(scmProto: SupportedSCM, baseUri: vscode.Uri, newSCM=false, enabled=true) {
         const scm = new scmProto(this.vfs, baseUri);
         // insert into global state
         if (newSCM) {
@@ -185,13 +210,18 @@ export class SCMCollectionProvider extends vscode.Disposable {
         // insert into collection
         try {
             const triggers = enabled ? await scm.triggers : [];
+            const persist = this.vfs.getProjectSCMPersist(scm.scmKey);
+            if (!persist || persist.label!==scmProto.label || persist.baseUri!==scm.baseUri.toString()) {
+                triggers.forEach(trigger => trigger.dispose());
+                return undefined;
+            }
             this.scms.push({scm,enabled,triggers});
             this.updateStatus();
             return scm;
         } catch (error) {
-            // permanently remove failed scm
-            // this.vfs.setProjectSCMPersist(scm.scmKey, undefined);
-            const message = error instanceof Error ? error.message : String(error);
+            // Keep persisted configuration on failure. Reload/login can fail transiently,
+            // and losing the selected Local Replica path is worse than surfacing the error.
+            const message = formatUnknownError(error);
             console.error(`"${scmProto.label}" creation failed for ${baseUri.toString()}:`, error);
             vscode.window.showErrorMessage( vscode.l10n.t('"{scm}" creation failed: {message}', {scm:scmProto.label, message}) );
             return undefined;
@@ -208,6 +238,21 @@ export class SCMCollectionProvider extends vscode.Disposable {
             this.vfs.setProjectSCMPersist(item.scm.scmKey, undefined);
             this.updateStatus();
         }
+    }
+
+    private removeSCMsByLabel(label: string, keepBaseUri?: vscode.Uri) {
+        [...this.scms]
+            .filter(item => (item.scm.constructor as any).label===label)
+            .filter(item => keepBaseUri===undefined || item.scm.baseUri.toString()!==keepBaseUri.toString())
+            .forEach(item => this.removeSCM(item));
+
+        const scmPersists = GlobalStateManager.getServerProjectSCMPersists(this.context, this.vfs.serverName, this.vfs.projectId);
+        Object.entries(scmPersists)
+            .filter(([_scmKey, scmPersist]) => scmPersist.label===label)
+            .filter(([_scmKey, scmPersist]) => keepBaseUri===undefined || scmPersist.baseUri!==keepBaseUri.toString())
+            .forEach(([scmKey]) => this.vfs.setProjectSCMPersist(scmKey, undefined));
+
+        this.updateStatus();
     }
 
     private createNewSCM(scmProto: SupportedSCM, options?: CreateSCMOptions) {
@@ -237,6 +282,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
         })
         .then(async (baseUri) => {
             if (baseUri) {
+                if (options?.replaceExistingLabel) {
+                    this.removeSCMsByLabel(options.replaceExistingLabel);
+                }
                 const scm = await this.createSCM(scmProto, baseUri, true);
                 if (scm) {
                     vscode.window.showInformationMessage( vscode.l10n.t('"{scm}" created: {uri}.', {scm:scmProto.label, uri: decodeURI(scm.baseUri.toString()) }) );
