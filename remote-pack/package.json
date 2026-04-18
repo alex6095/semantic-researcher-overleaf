@@ -2,7 +2,7 @@
   "name": "semantic-researcher-overleaf-remote-pack",
   "displayName": "Semantic Researcher Overleaf Remote Pack",
   "description": "Local UI support pack for Semantic Researcher Overleaf in VS Code Remote windows.",
-  "version": "0.15.10",
+  "version": "0.15.11",
   "icon": "resources/icons/app_icon.png",
   "publisher": "alex6095",
   "license": "SEE LICENSE IN LICENSE",

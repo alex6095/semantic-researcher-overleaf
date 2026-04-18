@@ -12,6 +12,8 @@ type BrowserLoginResponse = {
 };
 
 const remotePackLoginCommand = 'semantic-researcher-overleaf-remote-pack.login';
+const remotePackExtensionId = 'alex6095.semantic-researcher-overleaf-remote-pack';
+const remotePackMarketplaceUrl = 'https://marketplace.visualstudio.com/items?itemName=alex6095.semantic-researcher-overleaf-remote-pack';
 
 class DataItem extends vscode.TreeItem {
     constructor(
@@ -247,10 +249,39 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             }
         } catch (error) {
             if (isRemoteWindow && this.isMissingRemotePackError(error)) {
-                vscode.window.showErrorMessage(vscode.l10n.t('Remote browser login requires the local Overleaf Remote Pack extension. Install it locally, then retry. You can still use Login with Cookies.'));
+                await this.showMissingRemotePackError();
             } else {
                 const message = error instanceof Error ? error.message : String(error);
                 vscode.window.showErrorMessage(message);
+            }
+        }
+    }
+
+    private async showMissingRemotePackError() {
+        const installRemotePack = vscode.l10n.t('Install Remote Pack');
+        const choice = await vscode.window.showErrorMessage(
+            vscode.l10n.t('Remote browser login requires the local Overleaf Remote Pack extension. Install it locally, then retry. You can still use Login with Cookies.'),
+            installRemotePack,
+        );
+
+        if (choice===installRemotePack) {
+            await this.installRemotePack();
+        }
+    }
+
+    private async installRemotePack() {
+        try {
+            await vscode.commands.executeCommand('workbench.extensions.installExtension', remotePackExtensionId);
+            vscode.window.showInformationMessage(vscode.l10n.t('Overleaf Remote Pack installed. Retry Login in Browser.'));
+        } catch (error) {
+            const openMarketplace = vscode.l10n.t('Open Marketplace');
+            const message = error instanceof Error ? error.message : String(error);
+            const choice = await vscode.window.showErrorMessage(
+                vscode.l10n.t('Could not install Overleaf Remote Pack: {message}', { message }),
+                openMarketplace,
+            );
+            if (choice===openMarketplace) {
+                await vscode.env.openExternal(vscode.Uri.parse(remotePackMarketplaceUrl));
             }
         }
     }

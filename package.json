@@ -2,7 +2,7 @@
   "name": "semantic-researcher-overleaf",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.10",
+  "version": "0.15.12",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
