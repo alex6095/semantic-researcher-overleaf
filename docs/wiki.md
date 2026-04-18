@@ -139,6 +139,8 @@ If you want to add a project to multiple tags, please manage the tags on the web
 The Overleaf Workshop extension by default will open you project in a [virtual workspace](https://code.visualstudio.com/api/extension-guides/virtual-workspaces), just like the [WSL Extension](https://marketplace.visualstudio.com/items?itemName=ms-vscode-remote.remote-wsl).
 You can choose to open the project in the current window or a new window. If you open the project in the current window, the current workspace will be replaced with the corresponding virtual workspace of the project.
 
+When you hover over a project in the extension sidebar, the default inline actions are shown on the project row: open in the current window, open in a new window, and select a local project folder. The local folder selection action is the rightmost inline action so you can quickly bind an existing or exact folder to the selected Overleaf project.
+
 However, due to the [limitation of the virtual workspace](https://github.com/microsoft/vscode/wiki/Virtual-Workspaces#signal-whether-your-extension-can-handle-virtual-workspaces), most of the existing VS Code extensions does not work in the virtual workspace. Meanwhile, the Overleaf Workshop extension is still under active development, and cannot compete with the matured [LaTeX Workshop Extension](https://github.com/James-Yu/LaTeX-Workshop) in terms of features and stability. In this case, you can choose to open the project locally.
 
 #### Open Project Locally
@@ -167,7 +169,7 @@ Please follow the steps below to setup a local replica and open the project loca
 
 #### Select Project Folder Locally
 
-If you already have a specific local folder that should become the replica root itself, right click on the project and select `Select Project Folder Locally ...`.
+If you already have a specific local folder that should become the replica root itself, hover over the project and click the rightmost inline `Select Project Folder Locally ...` action, or right click on the project and select `Select Project Folder Locally ...`.
 
 This command differs from `Open Project Locally ...` in two important ways:
 

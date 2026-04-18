@@ -745,6 +745,11 @@
           "group": "inline@4"
         },
         {
+          "command": "overleaf-workshop.projectManager.selectProjectFolderLocalReplica",
+          "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
+          "group": "inline@5"
+        },
+        {
           "command": "overleaf-workshop.projectManager.openProjectInCurrentWindow",
           "when": "view == overleaf-workshop.projectManager && viewItem == project || viewItem == project_in_tag",
           "group": "1_openActions@1"

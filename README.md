@@ -42,6 +42,8 @@ The upstream user guide is available at [GitHub Wiki](https://github.com/overlea
 
   Use `Open Project Locally ...` to create a replica under a parent folder, or `Select Project Folder Locally ...` to use an exact folder as the replica root while keeping the current VS Code window and activating local Overleaf features against that folder.
 
+  In the project list, hover over a project to use the default inline actions: open in the current window, open in a new window, or select an exact local folder for that project. The folder selection action is placed at the right edge for quick local-replica setup.
+
 ### How to Login in Browser
 
 Choose **Login in Browser** from the login method list. The extension opens a Chrome, Edge, or Chromium window and navigates to the Overleaf project page, which shows the login page when needed. Sign in there as usual, including Google, SSO, or two-factor authentication. Once Overleaf reaches the project page, the extension reads the browser session cookies and completes the same cookie login flow automatically.
