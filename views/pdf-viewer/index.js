@@ -291,13 +291,59 @@
                 if (spanRect.width === 0 || spanRect.height === 0) {
                     return false;
                 }
-                const sameLine = Math.abs(centerY(spanRect) - lineCenter) <= Math.max(spanRect.height, rect.height, 8) * 1.4;
+                // Require the span's vertical center to sit within the citation rect's
+                // own vertical extent (plus a small safety margin). Using a tight bound
+                // prevents text from the line above/below leaking in when line spacing
+                // is tight, which would otherwise pollute the label.
+                const verticalMargin = Math.max(rect.height * 0.35, 3);
+                const sameLine = centerY(spanRect) >= rect.top - verticalMargin
+                              && centerY(spanRect) <= rect.bottom + verticalMargin;
                 const nearHorizontally = spanRect.right >= rect.left - padding && spanRect.left <= rect.right + padding;
                 return sameLine && nearHorizontally;
             })
             .sort((a, b) => a.rect.left - b.rect.left)
             .map(({span}) => span.textContent || '')
             .join('');
+    }
+
+    // Extracts a short, clean citation label (e.g. "30", "30a", "Smith, 2024")
+    // from arbitrary text surrounding the anchor. Returns '' if no clean token found,
+    // so the caller can fall back to other sources instead of displaying garbage.
+    function deriveCleanCitationLabel(rawText, anchor) {
+        const candidates = [];
+        const anchorText = (anchor?.textContent || '').replace(/\s+/g, ' ').trim();
+        if (anchorText) { candidates.push(anchorText); }
+        const nearbyText = (rawText || '').replace(/\s+/g, ' ').trim();
+        if (nearbyText && nearbyText !== anchorText) { candidates.push(nearbyText); }
+
+        for (const candidate of candidates) {
+            // Case: bare numeric token ("30", "30a")
+            if (/^\[?\s*\d+[A-Za-z]?\s*\]?$/.test(candidate)) {
+                const m = candidate.match(/\d+[A-Za-z]?/);
+                if (m) { return m[0]; }
+            }
+            // Case: bracketed citation "[30]" or "[30, 31]" — take the first number
+            const bracket = candidate.match(/\[\s*(\d+[A-Za-z]?)(?:\s*[,;\-\u2013\u2014]\s*\d+[A-Za-z]?)*\s*\]/);
+            if (bracket) { return bracket[1]; }
+            // Case: author-year "Smith, 2024" or "(Smith et al., 2024)"
+            const author = candidate.match(/\(?\s*([A-Z][A-Za-z.'\-]{1,24}(?:\s+et\s+al\.?)?)\s*,?\s+((?:19|20)\d{2}[a-z]?)\s*\)?/);
+            if (author) {
+                return `${author[1].replace(/\s+/g, ' ').trim()}, ${author[2]}`;
+            }
+        }
+        return '';
+    }
+
+    // Extracts the citation number from the start of a resolved reference entry,
+    // e.g. "513 [30] Jingwu Tang..." -> "30",  "30. Author..." -> "30".
+    function extractLabelFromReferenceText(text) {
+        if (!text) { return ''; }
+        const normalized = text.replace(/\s+/g, ' ').trim();
+        const bracketMatch = normalized.match(/^\s*(?:\d+\s+)?\[\s*(\d+[A-Za-z]?)\s*\]/);
+        if (bracketMatch) { return bracketMatch[1]; }
+        const dotMatch = normalized.match(/^\s*(?:\d+\s+)?(\d+[A-Za-z]?)[.)]\s/);
+        if (dotMatch) { return dotMatch[1]; }
+        return '';
     }
 
     function extractCitationTokens(text) {
@@ -359,12 +405,15 @@
         const annotations = await getPageAnnotations(pageNumber);
         const annotation = annotationId ? annotations.find(item => item.id === annotationId) : undefined;
         const sourceRect = getSourceRect(anchor);
+        const nearbyText = textNearRect(pageElem, sourceRect, 2).trim();
+        const anchorText = anchor.textContent.trim();
         return {
             anchor,
             annotationId,
             dest: annotation?.dest,
             href: anchor.getAttribute('href') || anchor.href || '',
-            labelText: textNearRect(pageElem, sourceRect, 2).trim() || anchor.textContent.trim(),
+            labelText: nearbyText || anchorText,
+            displayLabel: deriveCleanCitationLabel(nearbyText, anchor),
             pageElem,
             sourcePageNumber: pageNumber,
             sourceRect,
@@ -422,7 +471,11 @@
             windowStart = Math.min(windowStart, items.length - wantedCount);
             items = items.slice(windowStart, windowStart + wantedCount);
             items.forEach((item, index) => {
-                item.labelText = tokens[index] || item.labelText;
+                const token = tokens[index];
+                if (token) {
+                    item.labelText = token;
+                    item.displayLabel = token;
+                }
             });
 	        } else if (!items.every(item => isLikelyCitationText(item.labelText)) && !isLikelyCitationText(clickedItem.labelText)) {
 	            return null;
@@ -641,7 +694,8 @@
         const columnLines = lines
             .filter(line => line.column === column)
             .sort((a, b) => a.y - b.y || a.x - b.x);
-        const startIndex = findReferenceStartIndex(columnLines, destination.targetPoint, item.labelText);
+        const hintLabel = item.displayLabel || item.labelText;
+        const startIndex = findReferenceStartIndex(columnLines, destination.targetPoint, hintLabel);
         if (startIndex < 0) {
             throw new Error('Reference text unavailable.');
         }
@@ -665,6 +719,7 @@
             dest: item.dest,
             marker: '',
             text,
+            label: extractLabelFromReferenceText(text),
             targetPoint: destination.targetPoint,
         };
     }
@@ -801,7 +856,11 @@
         labelGroup.className = 'citationPreviewLabelGroup';
         const badge = document.createElement('span');
         badge.className = 'citationPreviewBadge';
-        badge.textContent = item.labelText || '?';
+        const resolvedLabel = item.displayLabel || item.reference?.label || '';
+        badge.textContent = resolvedLabel || '?';
+        if (!resolvedLabel) {
+            badge.classList.add('citationPreviewBadge--placeholder');
+        }
         const kind = document.createElement('span');
         kind.className = 'citationPreviewKind';
         kind.textContent = 'Reference';
@@ -933,6 +992,9 @@
                     return;
                 }
                 item.reference = reference;
+                if (!item.displayLabel && reference?.label) {
+                    item.displayLabel = reference.label;
+                }
                 renderCitationPopover();
             })
             .catch(error => {
