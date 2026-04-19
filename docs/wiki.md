@@ -55,7 +55,7 @@ If you can login via email and password on the web browser, you can also login v
 #### Login in Browser
 Choose **Login in Browser** from the login method list. The extension opens a Chrome, Edge, or Chromium window and navigates to the Overleaf project page, which shows the login page when needed. Sign in there as usual, including Google, SSO, or two-factor authentication. Once Overleaf reaches the project page, the extension reads the browser session cookies and completes the same cookie login flow automatically.
 
-In a local VS Code window, no extra extension is needed. In a VS Code Remote window, install **Semantic Researcher Overleaf Remote Pack** locally so the remote extension can ask your desktop VS Code to open the local browser. For VSIX installs, install the main extension in the remote window and the Remote Pack VSIX in the local desktop VS Code. If the browser is not found automatically, set `overleaf-workshop.auth.browserPath` for the main extension or `semantic-researcher-overleaf-remote-pack.browserPath` for the Remote Pack.
+In a local VS Code window, no extra extension is needed. In a VS Code Remote window, install **Semantic Researcher Overleaf Remote Pack** locally so the remote extension can ask your desktop VS Code to open the local browser. For VSIX installs, install the main extension in the remote window and the Remote Pack VSIX in the local desktop VS Code. If the browser is not found automatically, set `semantic-researcher-overleaf.auth.browserPath` for the main extension or `semantic-researcher-overleaf-remote-pack.browserPath` for the Remote Pack.
 
 #### Login with Cookies
 As for the cases that Captcha is enabled on the server, or you want to login with SSO, you have to login with cookies from an already logged-in browser. The steps are as follows:
@@ -344,7 +344,7 @@ In the Local Replica configuration, you can choose to enable/disable the Local R
 The project-related metadata for local replica are located in `.overleaf/settings.json` in the following format:
 ```json
 {
-    "uri": "overleaf-workshop://overleaf.com/example-project?user%3D<user_id>%26project%3D<project_id>",
+    "uri": "semantic-researcher-overleaf://overleaf.com/example-project?user%3D<user_id>%26project%3D<project_id>",
     "serverName": "overleaf.com",
     "enableCompileNPreview": false,
     "projectName": "example-project",

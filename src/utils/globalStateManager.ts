@@ -2,9 +2,10 @@ import * as vscode from 'vscode';
 import { Identity, BaseAPI, ProjectPersist } from '../api/base';
 import { SocketIOAPI } from '../api/socketio';
 import { ExtendedBaseAPI } from '../api/extendedBase';
+import { STATE_PDF_VIEWERS_KEY, STATE_SERVERS_KEY } from '../consts';
 
-const keyServerPersists: string = 'overleaf-servers';
-const keyPdfViewPersists: string = 'overleaf-pdf-viewers';
+const keyServerPersists: string = STATE_SERVERS_KEY;
+const keyPdfViewPersists: string = STATE_PDF_VIEWERS_KEY;
 
 export interface ServerPersist {
     name: string;

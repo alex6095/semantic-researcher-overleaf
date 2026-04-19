@@ -59,7 +59,7 @@ export class LangIntellisenseProvider {
             this.status.text = '';
             this.status.tooltip = '';
         }
-        this.status.command = 'langIntellisense.settings';
+        this.status.command = `${ROOT_NAME}.langIntellisense.settings`;
         this.status.show();
         setTimeout(this.activate.bind(this), 200);
     }

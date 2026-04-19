@@ -65,11 +65,11 @@
     "configuration.auth.browserPath.markdownDescription": "Path to a Chrome, Edge, or Chromium executable used for browser login. Leave empty to auto-detect.",
     "configuration.auth.browserLogin.timeoutSeconds.markdownDescription": "Maximum time, in seconds, to wait for browser login to complete.",
 
-    "views.overleaf-workshop.projectManager.name": "Hosts",
-    "views.explorer.overleaf-workshop.projectHistory": "History",
-    "views.explorer.overleaf-workshop.contextualTitle": "Overleaf Project History",
-    "views.explorer.overleaf-workshop.chatWebview.name": "Chat",
-    "views.explorer.overleaf-workshop.chatWebview.contextualTitle": "Overleaf Chat",
+    "views.semantic-researcher-overleaf.projectManager.name": "Hosts",
+    "views.explorer.semantic-researcher-overleaf.projectHistory": "History",
+    "views.explorer.semantic-researcher-overleaf.contextualTitle": "Overleaf Project History",
+    "views.explorer.semantic-researcher-overleaf.chatWebview.name": "Chat",
+    "views.explorer.semantic-researcher-overleaf.chatWebview.contextualTitle": "Overleaf Chat",
 
-    "customEditors.overleaf-workshop.pdfViewer.displayName": "Overleaf Workshop PDF Viewer"
+    "customEditors.semantic-researcher-overleaf.pdfViewer.displayName": "Semantic Researcher Overleaf PDF Viewer"
 }

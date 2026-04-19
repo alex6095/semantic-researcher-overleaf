@@ -3,13 +3,13 @@ import * as vscode from 'vscode';
 import * as DiffMatchPatch from 'diff-match-patch';
 import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
-import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
+import { OUTPUT_FOLDER_NAME, PREFETCH_COMMAND, ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { ClientManager } from '../collaboration/clientManager';
 import { EventBus } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
-import { normalizeOverleafQuery, normalizeOverleafUri } from '../utils/overleafUri';
+import { canonicalizeOverleafUri, normalizeOverleafQuery } from '../utils/overleafUri';
 
 const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -94,7 +94,7 @@ export class File implements vscode.FileStat {
 }
 
 export function parseUri(uri: vscode.Uri) {
-    uri = normalizeOverleafUri(uri);
+    uri = canonicalizeOverleafUri(uri);
     const queryString = normalizeOverleafQuery(uri.query);
     const query:any = queryString.split('&').reduce((acc, v) => {
         const [key,value] = v.split('=');
@@ -143,7 +143,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             // this.socket.disconnect();
         });
 
-        uri = normalizeOverleafUri(uri);
+        uri = canonicalizeOverleafUri(uri);
         const {userId,projectId,serverName,projectName} = parseUri(uri);
         this.serverName = serverName;
         this.projectName = projectName;
@@ -1225,7 +1225,7 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     private getVFS(uri: vscode.Uri): Promise<VirtualFileSystem> {
-        uri = normalizeOverleafUri(uri);
+        uri = canonicalizeOverleafUri(uri);
         const vfs = this.vfss[ uri.query ];
         if (vfs) {
             return Promise.resolve(vfs);
@@ -1241,7 +1241,7 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     async activateProject(uri: vscode.Uri): Promise<VirtualFileSystem> {
-        uri = normalizeOverleafUri(uri);
+        uri = canonicalizeOverleafUri(uri);
         Object.entries(this.vfss).forEach(([query, vfs]) => {
             if (query!==uri.query) {
                 vfs.dispose();
@@ -1309,7 +1309,7 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
                     return this.prefetch(uri).then((vfs) => vfs.createLinkedFile(uri!));
                 }                
             }),
-            vscode.commands.registerCommand('remoteFileSystem.prefetch', (uri: vscode.Uri) => {
+            vscode.commands.registerCommand(PREFETCH_COMMAND, (uri: vscode.Uri) => {
                 return this.prefetch(uri);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.activateProject`, (uri: vscode.Uri) => {

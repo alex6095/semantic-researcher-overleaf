@@ -2,7 +2,7 @@
 import * as vscode from 'vscode';
 import { EventBus } from '../utils/eventBus';
 import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
-import { OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
+import { DIFF_SCHEME, OUTPUT_FOLDER_NAME, ROOT_NAME } from '../consts';
 import { ProjectLabelResponseSchema } from '../api/base';
 import { LocalReplicaSCMProvider } from './localReplicaSCM';
 
@@ -105,8 +105,8 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
             for (const change of diff) {
                 if (change.operation===undefined) { continue; }
                 const newPathname = change.newPathname || change.pathname;
-                let originUri: vscode.Uri | undefined = vscode.Uri.parse(`${ROOT_NAME}-diff:${change.pathname}?${originVersion}`);
-                let targetUri: vscode.Uri | undefined = vscode.Uri.parse(`${ROOT_NAME}-diff:${newPathname}?${targetVersion}`);
+                let originUri: vscode.Uri | undefined = vscode.Uri.parse(`${DIFF_SCHEME}:${change.pathname}?${originVersion}`);
+                let targetUri: vscode.Uri | undefined = vscode.Uri.parse(`${DIFF_SCHEME}:${newPathname}?${targetVersion}`);
                 let labelUri = targetUri;
                 // handle removed/added files
                 switch (change.operation) {
@@ -128,8 +128,8 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
             vscode.commands.executeCommand('vscode.changes', `v${originVersion} vs v${targetVersion}`, args);
         } else {
             vscode.commands.executeCommand('vscode.diff',
-                vscode.Uri.parse(`${ROOT_NAME}-diff:${this._path}?${originVersion}`),
-                vscode.Uri.parse(`${ROOT_NAME}-diff:${this._path}?${targetVersion}`),
+                vscode.Uri.parse(`${DIFF_SCHEME}:${this._path}?${originVersion}`),
+                vscode.Uri.parse(`${DIFF_SCHEME}:${this._path}?${targetVersion}`),
                 `${this._path} (v${originVersion} vs v${targetVersion})`,
             );
         }
@@ -168,7 +168,7 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
             }
             item.tooltip.supportThemeIcons = true;
             item.command = {
-                command: `projectHistory.comparePrevious`,
+                command: `${ROOT_NAME}.projectHistory.comparePrevious`,
                 title: vscode.l10n.t('Compare with Previous Version'),
                 arguments: [item],
             };
@@ -199,7 +199,7 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
 
     get triggers() {
         return [
-            vscode.workspace.registerTextDocumentContentProvider(`${ROOT_NAME}-diff`, this),
+            vscode.workspace.registerTextDocumentContentProvider(DIFF_SCHEME, this),
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.refresh`, async () => {
                 await this.refreshData(this._path, true);
@@ -237,9 +237,6 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
                     );
                     this.refresh();
                 }
-            }),
-            vscode.commands.registerCommand('projectHistory.comparePrevious', async (item: HistoryItem) => {
-                vscode.commands.executeCommand(`${ROOT_NAME}.projectHistory.comparePrevious`, item);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.comparePrevious`, async (item: HistoryItem) => {
                 this.openDiffEditor(item.prevVersion, item.version);

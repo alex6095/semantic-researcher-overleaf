@@ -222,7 +222,7 @@ The export `class ProjectManagerProvider` exposes features to vscode via `(get) 
 The export `class RemoteFileSystemProvider` exposes features to vscode via `(get) triggers` with:
 - **FileSystemProvider**: via `class RemoteFileSystemProvider`, the most important components of this extension.
 - **Commands**:
-  - "remoteFileSystem.prefetch": the command to access or warm-up the virtual filesystem anywhere in this extension.
+  - "${ROOT_NAME}.remoteFileSystem.prefetch": the command to access or warm-up the virtual filesystem anywhere in this extension.
 
 ### `src/intellisense`
 The standalone module for auto-completion, document formatting and symbol provider functions.

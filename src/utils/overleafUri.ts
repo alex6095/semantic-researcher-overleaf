@@ -1,5 +1,8 @@
 import * as vscode from 'vscode';
-import { ROOT_NAME } from '../consts';
+import {
+    LEGACY_REMOTE_FILE_SYSTEM_SCHEME,
+    REMOTE_FILE_SYSTEM_SCHEME,
+} from '../consts';
 
 export function normalizeOverleafQuery(query: string): string {
     if (query==='' || !/%(?:3d|26)/i.test(query)) {
@@ -13,15 +16,38 @@ export function normalizeOverleafQuery(query: string): string {
 }
 
 export function normalizeOverleafUri(uri: vscode.Uri): vscode.Uri {
-    if (uri.scheme!==ROOT_NAME) {
+    if (!isOverleafUri(uri)) {
         return uri;
     }
     return uri.with({query: normalizeOverleafQuery(uri.query)});
 }
 
+export function isCurrentOverleafUri(uri: vscode.Uri): boolean {
+    return uri.scheme===REMOTE_FILE_SYSTEM_SCHEME;
+}
+
+export function isLegacyOverleafUri(uri: vscode.Uri): boolean {
+    return uri.scheme===LEGACY_REMOTE_FILE_SYSTEM_SCHEME;
+}
+
+export function isOverleafUri(uri: vscode.Uri): boolean {
+    return isCurrentOverleafUri(uri) || isLegacyOverleafUri(uri);
+}
+
+export function canonicalizeOverleafUri(uri: vscode.Uri): vscode.Uri {
+    if (!isOverleafUri(uri)) {
+        return uri;
+    }
+    return normalizeOverleafUri(uri).with({scheme: REMOTE_FILE_SYSTEM_SCHEME});
+}
+
+export function canonicalizeOverleafUriString(uri: string): string {
+    return stringifyOverleafUri(canonicalizeOverleafUri(vscode.Uri.parse(uri)));
+}
+
 export function stringifyOverleafUri(uri: vscode.Uri): string {
-    const normalized = normalizeOverleafUri(uri);
-    if (normalized.scheme!==ROOT_NAME) {
+    const normalized = canonicalizeOverleafUri(uri);
+    if (!isCurrentOverleafUri(normalized)) {
         return normalized.toString();
     }
 

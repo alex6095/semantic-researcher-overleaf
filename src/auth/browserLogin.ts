@@ -56,7 +56,7 @@ export class BrowserLogin {
         const candidates = this.getBrowserCandidates();
 
         if (candidates.length===0) {
-            throw new Error(vscode.l10n.t('Could not find Chrome, Edge, or Chromium. Set overleaf-workshop.auth.browserPath and try again.'));
+            throw new Error(vscode.l10n.t('Could not find Chrome, Edge, or Chromium. Set semantic-researcher-overleaf.auth.browserPath and try again.'));
         }
 
         let browserContext: BrowserContext | undefined;

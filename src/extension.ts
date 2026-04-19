@@ -12,6 +12,7 @@ import {
     initializeLocalReplicaWorkspace,
     onDidChangeActiveReplicaRoot,
 } from './utils/localReplicaWorkspace';
+import { migrateLegacyNamespace } from './utils/namespaceMigration';
 
 type ActiveReplicaSyncTarget = {
     key: string,
@@ -19,7 +20,9 @@ type ActiveReplicaSyncTarget = {
     rootUri: vscode.Uri,
 };
 
-export function activate(context: vscode.ExtensionContext) {
+export async function activate(context: vscode.ExtensionContext) {
+    await migrateLegacyNamespace(context);
+
     // Register: [core] RemoteFileSystemProvider
     const remoteFileSystemProvider = new RemoteFileSystemProvider(context);
     context.subscriptions.push( ...remoteFileSystemProvider.triggers );

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { ROOT_NAME } from '../consts';
+import { PREFETCH_COMMAND, ROOT_NAME } from '../consts';
 import { ProjectTagsResponseSchema } from '../api/base';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { VirtualFileSystem, parseUri } from './remoteFileSystemProvider';
@@ -634,7 +634,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     openProjectInCurrentWindow(project: ProjectItem) {
         const uri = vscode.Uri.parse(project.uri);
-        vscode.commands.executeCommand('remoteFileSystem.prefetch', uri)
+        vscode.commands.executeCommand(PREFETCH_COMMAND, uri)
         .then(() => {
             vscode.commands.executeCommand('vscode.openFolder', uri, false);
             vscode.commands.executeCommand('workbench.view.explorer');
@@ -643,7 +643,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     openProjectInNewWindow(project: ProjectItem) {
         const uri = vscode.Uri.parse(project.uri);
-        vscode.commands.executeCommand('remoteFileSystem.prefetch', uri)
+        vscode.commands.executeCommand(PREFETCH_COMMAND, uri)
         .then(() => {
             vscode.commands.executeCommand('vscode.openFolder', uri, true);
             vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
@@ -666,7 +666,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         let replicas = Object.values(scmPersists).filter(scmPersist => scmPersist.label===LocalReplicaSCMProvider.label);
         // if not exist, create new one
         if (replicas.length===0) {
-            const vfs = (await (await vscode.commands.executeCommand('remoteFileSystem.prefetch', uri))) as VirtualFileSystem;
+            const vfs = (await (await vscode.commands.executeCommand(PREFETCH_COMMAND, uri))) as VirtualFileSystem;
             await vfs.init();
             const answer = await vscode.window.showWarningMessage( vscode.l10n.t('No local replica found, create one for project "{label}" ?', {label:project.label}), "Yes", "No");
             if (answer === "Yes") {

@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { ROOT_NAME } from '../consts';
+import { CONFIG_SECTION, PDF_VIEW_TYPE, ROOT_NAME } from '../consts';
 import { EventBus } from '../utils/eventBus';
 import { GlobalStateManager } from '../utils/globalStateManager';
 
@@ -92,7 +92,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     break;
                 case 'ready':
                     const state = GlobalStateManager.getPdfViewPersist(this.context, doc.uri.toString());
-                    const config = vscode.workspace.getConfiguration('overleaf-workshop.pdfViewer');
+                    const config = vscode.workspace.getConfiguration(`${CONFIG_SECTION}.pdfViewer`);
                     const colorThemes = config.get('themes', undefined);
                     const defaults = {
                         scrollMode: config.get('defaultScrollMode', 'vertical'),
@@ -109,7 +109,7 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
     public get triggers(): vscode.Disposable[] {
         return [
-            vscode.window.registerCustomEditorProvider(`${ROOT_NAME}.pdfViewer`, this, {
+            vscode.window.registerCustomEditorProvider(PDF_VIEW_TYPE, this, {
                 webviewOptions: {
                     retainContextWhenHidden: true,
                 },

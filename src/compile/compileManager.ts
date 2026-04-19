@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { RemoteFileSystemProvider, parseUri } from '../core/remoteFileSystemProvider';
-import { ROOT_NAME, ELEGANT_NAME, OUTPUT_FOLDER_NAME } from '../consts';
+import { ROOT_NAME, ELEGANT_NAME, OUTPUT_FOLDER_NAME, PDF_VIEW_TYPE } from '../consts';
 import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
 import { EventBus } from '../utils/eventBus';
@@ -263,7 +263,7 @@ export class CompileManager {
                 path: `/${rootPath}/${OUTPUT_FOLDER_NAME}/output.pdf`,
             });
             vscode.commands.executeCommand('vscode.openWith', pdfUri,
-                `${ROOT_NAME}.pdfViewer`,
+                PDF_VIEW_TYPE,
                 { preview: false, viewColumn: vscode.ViewColumn.Beside }
             );
         }

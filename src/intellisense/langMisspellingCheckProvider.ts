@@ -127,7 +127,7 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
         learnAction.diagnostics = [diagnostic];
         learnAction.command = {
             title: vscode.l10n.t('Add to Dictionary'),
-            command: 'langIntellisense.learnSpelling',
+            command: `${ROOT_NAME}.langIntellisense.learnSpelling`,
             arguments: [document.uri, diagnostic.code as string],
         };
         actions?.push(learnAction);
@@ -207,10 +207,10 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
             // the code action provider
             vscode.languages.registerCodeActionsProvider([{scheme: ROOT_NAME}, {scheme: 'file'}], this),
             // register learn spelling command
-            vscode.commands.registerCommand('langIntellisense.learnSpelling', (uri: vscode.Uri, word: string) => {
+            vscode.commands.registerCommand(`${ROOT_NAME}.langIntellisense.learnSpelling`, (uri: vscode.Uri, word: string) => {
                 this.learnSpelling(uri, word);
             }),
-            vscode.commands.registerCommand('langIntellisense.settings', () => {
+            vscode.commands.registerCommand(`${ROOT_NAME}.langIntellisense.settings`, () => {
                 this.spellCheckSettings();
             }),
             // reset diagnostics when spell check languages changed

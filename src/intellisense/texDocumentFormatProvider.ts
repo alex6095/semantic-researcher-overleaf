@@ -4,11 +4,12 @@ import * as Prettier from "prettier";
 import { prettierPluginLatex } from "@unified-latex/unified-latex-prettier";
 import { IntellisenseProvider } from '.';
 import { isSupportedReplicaDocument } from '../utils/localReplicaWorkspace';
+import { CONFIG_SECTION, ROOT_NAME } from '../consts';
 
 // https://github.com/siefkenj/latex-parser-playground/blob/master/src/async-worker/parsing-worker.ts#L35-L43
 async function prettierFormat(text: string, options: vscode.FormattingOptions ) {
 
-    const lineBreakEnabled = vscode.workspace.getConfiguration('overleaf-workshop.formatWithLineBreak').get<boolean>('enabled', true);
+    const lineBreakEnabled = vscode.workspace.getConfiguration(`${CONFIG_SECTION}.formatWithLineBreak`).get<boolean>('enabled', true);
     const printWidth = lineBreakEnabled ? 80 : 10000;
     return Prettier.format(text, {
         parser: "latex-parser",
@@ -45,7 +46,7 @@ export class TexDocumentFormatProvider extends IntellisenseProvider implements v
     get triggers() {
         const latexSelector = ['latex', 'latex-expl3', 'pweave', 'jlweave', 'rsweave']
             .flatMap((id) => {
-                return [{scheme:'overleaf-workshop', language:id}, {scheme:'file', language:id}];
+                return [{scheme: ROOT_NAME, language:id}, {scheme:'file', language:id}];
             });
 
         return[

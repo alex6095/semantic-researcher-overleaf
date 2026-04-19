@@ -10,6 +10,13 @@ import {
     pathToLocalUri,
     readReplicaSettings,
 } from '../utils/localReplicaWorkspace';
+import {
+    LEGACY_REPLICA_SETTINGS_BACKUP_FILE,
+    LEGACY_REPLICA_SETTINGS_DIR,
+    LEGACY_REPLICA_SETTINGS_FILE,
+    REPLICA_SETTINGS_DIR,
+    REPLICA_SETTINGS_FILE,
+} from '../consts';
 import { stringifyOverleafUri } from '../utils/overleafUri';
 import { formatUnknownError } from '../utils/errorMessage';
 
@@ -114,11 +121,39 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private get settingsUri(): vscode.Uri {
-        return vscode.Uri.joinPath(this.baseUri, '.overleaf/settings.json');
+        return vscode.Uri.joinPath(this.baseUri, REPLICA_SETTINGS_FILE);
+    }
+
+    private get legacySettingsUri(): vscode.Uri {
+        return vscode.Uri.joinPath(this.baseUri, LEGACY_REPLICA_SETTINGS_FILE);
     }
 
     private get settingsDirectoryUri(): vscode.Uri {
-        return vscode.Uri.joinPath(this.baseUri, '.overleaf');
+        return vscode.Uri.joinPath(this.baseUri, REPLICA_SETTINGS_DIR);
+    }
+
+    private async backupLegacySettings() {
+        if (!await LocalReplicaSCMProvider.pathExists(this.legacySettingsUri)) {
+            return;
+        }
+        try {
+            await vscode.workspace.fs.rename(
+                this.legacySettingsUri,
+                vscode.Uri.joinPath(this.baseUri, LEGACY_REPLICA_SETTINGS_BACKUP_FILE),
+                {overwrite: false},
+            );
+        } catch {
+            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+            try {
+                await vscode.workspace.fs.rename(
+                    this.legacySettingsUri,
+                    vscode.Uri.joinPath(this.baseUri, LEGACY_REPLICA_SETTINGS_DIR, `settings.${timestamp}.overleaf-workshop.json`),
+                    {overwrite: false},
+                );
+            } catch (error) {
+                console.warn(`Could not back up legacy local replica settings under ${this.baseUri.toString()}:`, error);
+            }
+        }
     }
 
     private async ensureLocalReplicaSettings() {
@@ -143,6 +178,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (shouldPersist) {
             await this.persistLocalReplicaSettings();
         }
+        await this.backupLegacySettings();
         return this.localReplicaSettings;
     }
 
@@ -151,7 +187,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             await vscode.workspace.fs.stat(this.settingsUri);
             return true;
         } catch {
-            return false;
+            return LocalReplicaSCMProvider.pathExists(this.legacySettingsUri);
         }
     }
 

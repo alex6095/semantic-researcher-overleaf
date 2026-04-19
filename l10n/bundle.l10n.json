@@ -54,7 +54,7 @@
   "Password": "Password",
   "Login failed.": "Login failed.",
   "Waiting for Overleaf browser login...": "Waiting for Overleaf browser login...",
-  "Could not find Chrome, Edge, or Chromium. Set overleaf-workshop.auth.browserPath and try again.": "Could not find Chrome, Edge, or Chromium. Set overleaf-workshop.auth.browserPath and try again.",
+  "Could not find Chrome, Edge, or Chromium. Set semantic-researcher-overleaf.auth.browserPath and try again.": "Could not find Chrome, Edge, or Chromium. Set semantic-researcher-overleaf.auth.browserPath and try again.",
   "Could not open a browser for login: {message}": "Could not open a browser for login: {message}",
   "Browser login cancelled.": "Browser login cancelled.",
   "Browser was closed before login completed.": "Browser was closed before login completed.",

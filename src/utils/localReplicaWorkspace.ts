@@ -1,6 +1,14 @@
 import * as vscode from 'vscode';
-import { ROOT_NAME } from '../consts';
-import { normalizeOverleafUri, stringifyOverleafUri } from './overleafUri';
+import {
+    LEGACY_EXTENSION_NAMESPACE,
+    LEGACY_REPLICA_SETTINGS_BACKUP_FILE,
+    LEGACY_REPLICA_SETTINGS_DIR,
+    LEGACY_REPLICA_SETTINGS_FILE,
+    REPLICA_SETTINGS_DIR,
+    REPLICA_SETTINGS_FILE,
+    ROOT_NAME,
+} from '../consts';
+import { canonicalizeOverleafUri, stringifyOverleafUri } from './overleafUri';
 
 export interface LocalReplicaSettings {
     uri: string,
@@ -10,6 +18,7 @@ export interface LocalReplicaSettings {
 }
 
 const ACTIVE_REPLICA_ROOT_KEY = `${ROOT_NAME}.activeReplicaRoot`;
+const LEGACY_ACTIVE_REPLICA_ROOT_KEY = `${LEGACY_EXTENSION_NAMESPACE}.activeReplicaRoot`;
 
 let extensionContext: vscode.ExtensionContext | undefined;
 let activeReplicaRoot: vscode.Uri | undefined;
@@ -39,16 +48,19 @@ async function pathExists(uri: vscode.Uri) {
     }
 }
 
-async function readSettingsFromRoot(rootUri: vscode.Uri): Promise<LocalReplicaSettings | undefined> {
-    const settingsUri = vscode.Uri.joinPath(rootUri, '.overleaf/settings.json');
+function normalizeSettings(settings: LocalReplicaSettings): LocalReplicaSettings {
+    return {
+        ...settings,
+        uri: stringifyOverleafUri(canonicalizeOverleafUri(vscode.Uri.parse(settings.uri))),
+        enableCompileNPreview: true,
+    };
+}
+
+async function readSettingsFile(settingsUri: vscode.Uri): Promise<LocalReplicaSettings | undefined> {
     try {
         const content = await vscode.workspace.fs.readFile(settingsUri);
         const settings = JSON.parse(new TextDecoder().decode(content)) as LocalReplicaSettings;
-        const normalizedSettings = {
-            ...settings,
-            uri: stringifyOverleafUri(vscode.Uri.parse(settings.uri)),
-            enableCompileNPreview: true,
-        };
+        const normalizedSettings = normalizeSettings(settings);
         if (JSON.stringify(settings)!==JSON.stringify(normalizedSettings)) {
             await vscode.workspace.fs.writeFile(
                 settingsUri,
@@ -59,6 +71,48 @@ async function readSettingsFromRoot(rootUri: vscode.Uri): Promise<LocalReplicaSe
     } catch {
         return undefined;
     }
+}
+
+async function backupLegacySettings(rootUri: vscode.Uri) {
+    const legacySettingsUri = vscode.Uri.joinPath(rootUri, LEGACY_REPLICA_SETTINGS_FILE);
+    const backupUri = vscode.Uri.joinPath(rootUri, LEGACY_REPLICA_SETTINGS_BACKUP_FILE);
+    try {
+        await vscode.workspace.fs.rename(legacySettingsUri, backupUri, {overwrite: false});
+    } catch {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        const fallbackBackupUri = vscode.Uri.joinPath(
+            rootUri,
+            LEGACY_REPLICA_SETTINGS_DIR,
+            `settings.${timestamp}.overleaf-workshop.json`,
+        );
+        try {
+            await vscode.workspace.fs.rename(legacySettingsUri, fallbackBackupUri, {overwrite: false});
+        } catch (error) {
+            console.warn(`Could not back up legacy local replica settings under ${rootUri.toString()}:`, error);
+        }
+    }
+}
+
+async function readSettingsFromRoot(rootUri: vscode.Uri): Promise<LocalReplicaSettings | undefined> {
+    const settingsUri = vscode.Uri.joinPath(rootUri, REPLICA_SETTINGS_FILE);
+    const settings = await readSettingsFile(settingsUri);
+    if (settings) {
+        return settings;
+    }
+
+    const legacySettingsUri = vscode.Uri.joinPath(rootUri, LEGACY_REPLICA_SETTINGS_FILE);
+    const legacySettings = await readSettingsFile(legacySettingsUri);
+    if (!legacySettings) {
+        return undefined;
+    }
+
+    await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(rootUri, REPLICA_SETTINGS_DIR));
+    await vscode.workspace.fs.writeFile(
+        settingsUri,
+        Buffer.from(JSON.stringify(legacySettings, null, 4)),
+    );
+    await backupLegacySettings(rootUri);
+    return legacySettings;
 }
 
 async function syncContexts(settings?: LocalReplicaSettings) {
@@ -76,8 +130,9 @@ async function discoverDirectReplicaRoots() {
     const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
     const matches: vscode.Uri[] = [];
     for (const folder of workspaceFolders) {
-        const settingsUri = vscode.Uri.joinPath(folder.uri, '.overleaf/settings.json');
-        if (await pathExists(settingsUri)) {
+        const settingsUri = vscode.Uri.joinPath(folder.uri, REPLICA_SETTINGS_FILE);
+        const legacySettingsUri = vscode.Uri.joinPath(folder.uri, LEGACY_REPLICA_SETTINGS_FILE);
+        if (await pathExists(settingsUri) || await pathExists(legacySettingsUri)) {
             matches.push(folder.uri);
         }
     }
@@ -99,9 +154,14 @@ export function configureLocalReplicaWorkspace(context: vscode.ExtensionContext)
 export async function initializeLocalReplicaWorkspace() {
     let rootUri: vscode.Uri | undefined;
     const savedRoot = extensionContext?.workspaceState.get<string>(ACTIVE_REPLICA_ROOT_KEY);
-    if (savedRoot) {
-        const parsed = parsePersistedLocalRoot(savedRoot);
-        if (await pathExists(vscode.Uri.joinPath(parsed, '.overleaf/settings.json'))) {
+    const legacySavedRoot = extensionContext?.workspaceState.get<string>(LEGACY_ACTIVE_REPLICA_ROOT_KEY);
+    if (savedRoot || legacySavedRoot) {
+        const persistedRoot = savedRoot ?? legacySavedRoot!;
+        const parsed = parsePersistedLocalRoot(persistedRoot);
+        if (
+            await pathExists(vscode.Uri.joinPath(parsed, REPLICA_SETTINGS_FILE))
+            || await pathExists(vscode.Uri.joinPath(parsed, LEGACY_REPLICA_SETTINGS_FILE))
+        ) {
             rootUri = parsed;
         }
     }
@@ -183,7 +243,10 @@ export function isLocalReplicaMetadataUri(uri: vscode.Uri, rootUri = activeRepli
     }
 
     const relativePath = uri.path.slice(rootUri.path.length).replace(/^\/+/, '');
-    return relativePath==='.overleaf' || relativePath.startsWith('.overleaf/');
+    return relativePath===REPLICA_SETTINGS_DIR
+        || relativePath.startsWith(`${REPLICA_SETTINGS_DIR}/`)
+        || relativePath===LEGACY_REPLICA_SETTINGS_DIR
+        || relativePath.startsWith(`${LEGACY_REPLICA_SETTINGS_DIR}/`);
 }
 
 export function isSupportedReplicaDocument(uri: vscode.Uri) {
@@ -244,11 +307,11 @@ export async function toVirtualUri(uri: vscode.Uri): Promise<vscode.Uri | undefi
         return undefined;
     }
 
-    return vscode.Uri.joinPath(normalizeOverleafUri(vscode.Uri.parse(activeReplicaSettings.uri)), relativePath.replace(/^\/+/, ''));
+    return vscode.Uri.joinPath(canonicalizeOverleafUri(vscode.Uri.parse(activeReplicaSettings.uri)), relativePath.replace(/^\/+/, ''));
 }
 
 export function getActiveReplicaOriginUri() {
-    return activeReplicaSettings?.uri ? normalizeOverleafUri(vscode.Uri.parse(activeReplicaSettings.uri)) : undefined;
+    return activeReplicaSettings?.uri ? canonicalizeOverleafUri(vscode.Uri.parse(activeReplicaSettings.uri)) : undefined;
 }
 
 export const onDidChangeActiveReplicaRoot = onDidChangeActiveReplicaEmitter.event;
