@@ -245,6 +245,10 @@ The SyncTeX and Reverse SyncTeX are supported in the Overleaf PDF viewer.
 
 ![demo03-syntex.gif](assets/demo03-synctex.gif)
 
+#### Citation Preview
+
+Clicking a citation link in the PDF viewer opens an inline reference preview near the citation instead of immediately jumping to the bibliography. When multiple citation links share one bracketed citation group, each number remains individually clickable in the PDF, and the preview shows a carousel such as `1 / 2` for moving between those references. Use the `Go` button in the preview to jump to the bibliography entry.
+
 #### Change the Themes
 
 There are three themes supported in the Overleaf PDF viewer: `default`, `light`, and `dark`. You can change the theme via clicking the theme button on the title bar in the Overleaf PDF viewer. You can also add or change the supported themes in the [vscode settings](#configurations).

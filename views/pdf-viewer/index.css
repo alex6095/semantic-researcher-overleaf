@@ -23,3 +23,330 @@ html, body {
 #secondaryDownload {
     display: none;
 }
+
+/* =========================================================
+   Citation Preview Popover
+   ========================================================= */
+
+.citationPreviewPopover {
+    position: fixed;
+    z-index: 10000;
+    box-sizing: border-box;
+    width: min(540px, calc(100vw - 24px));
+    max-height: min(380px, calc(100vh - 72px));
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    border: 1px solid var(--vscode-editorWidget-border, rgba(0, 0, 0, 0.10));
+    border-radius: 12px;
+    background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background, #ffffff));
+    color: var(--vscode-editorWidget-foreground, #1f1f1f);
+    box-shadow:
+        0 1px 2px rgba(0, 0, 0, 0.06),
+        0 12px 32px rgba(0, 0, 0, 0.18),
+        0 20px 48px rgba(0, 0, 0, 0.12);
+    font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif);
+    font-size: 13px;
+    line-height: 1.55;
+    transform-origin: top left;
+    animation: citationPreviewEnter 160ms cubic-bezier(0.16, 1, 0.3, 1);
+    backdrop-filter: saturate(1.15);
+    -webkit-backdrop-filter: saturate(1.15);
+}
+
+@keyframes citationPreviewEnter {
+    from {
+        opacity: 0;
+        transform: translateY(-4px) scale(0.985);
+    }
+    to {
+        opacity: 1;
+        transform: translateY(0) scale(1);
+    }
+}
+
+/* ---------------- Header ---------------- */
+
+.citationPreviewHeader {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 10px 10px 10px 14px;
+    border-bottom: 1px solid var(--vscode-editorWidget-border, rgba(0, 0, 0, 0.08));
+    background: linear-gradient(
+        to bottom,
+        color-mix(in srgb, var(--vscode-editorWidget-background, #ffffff) 94%, var(--vscode-editorWidget-foreground, #000) 6%),
+        var(--vscode-editorWidget-background, #ffffff)
+    );
+}
+
+.citationPreviewLabelGroup {
+    flex: 1 1 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-width: 0;
+}
+
+.citationPreviewBadge {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 26px;
+    height: 22px;
+    padding: 0 8px;
+    border-radius: 999px;
+    background: var(--vscode-textLink-foreground, #2563eb);
+    color: var(--vscode-button-foreground, #ffffff);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.2px;
+    line-height: 1;
+    white-space: nowrap;
+}
+
+.citationPreviewKind {
+    min-width: 0;
+    flex: 1 1 auto;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--vscode-descriptionForeground, #6b7280);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.6px;
+}
+
+.citationPreviewControls {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 2px;
+}
+
+.citationPreviewCounter {
+    min-width: 42px;
+    padding: 0 4px;
+    color: var(--vscode-descriptionForeground, #6b7280);
+    font-variant-numeric: tabular-nums;
+    font-size: 11px;
+    text-align: center;
+    user-select: none;
+}
+
+.citationPreviewDivider {
+    width: 1px;
+    height: 18px;
+    margin: 0 4px;
+    background: var(--vscode-editorWidget-border, rgba(0, 0, 0, 0.10));
+}
+
+/* ---------------- Icon button ---------------- */
+
+.citationPreviewIconButton {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    border: 1px solid transparent;
+    border-radius: 6px;
+    background: transparent;
+    color: var(--vscode-icon-foreground, var(--vscode-editorWidget-foreground, #333));
+    cursor: pointer;
+    transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease, transform 80ms ease;
+}
+
+.citationPreviewIconButton:hover:not(:disabled) {
+    background: var(--vscode-toolbar-hoverBackground, rgba(0, 0, 0, 0.06));
+    color: var(--vscode-foreground, inherit);
+}
+
+.citationPreviewIconButton:active:not(:disabled) {
+    transform: scale(0.94);
+}
+
+.citationPreviewIconButton:focus-visible {
+    outline: none;
+    border-color: var(--vscode-focusBorder, #2563eb);
+}
+
+.citationPreviewIconButton:disabled {
+    cursor: default;
+    opacity: 0.35;
+}
+
+.citationPreviewIconButton svg {
+    width: 14px;
+    height: 14px;
+    display: block;
+    pointer-events: none;
+}
+
+/* ---------------- Body ---------------- */
+
+.citationPreviewBody {
+    flex: 1 1 auto;
+    overflow: auto;
+    padding: 14px 16px;
+    scrollbar-width: thin;
+}
+
+.citationPreviewBody::-webkit-scrollbar {
+    width: 8px;
+}
+
+.citationPreviewBody::-webkit-scrollbar-thumb {
+    background: var(--vscode-scrollbarSlider-background, rgba(100, 100, 100, 0.25));
+    border-radius: 4px;
+}
+
+.citationPreviewBody::-webkit-scrollbar-thumb:hover {
+    background: var(--vscode-scrollbarSlider-hoverBackground, rgba(100, 100, 100, 0.4));
+}
+
+.citationPreviewMarker {
+    margin-bottom: 6px;
+    color: var(--vscode-descriptionForeground, #6b7280);
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+}
+
+.citationPreviewText {
+    color: inherit;
+    font-size: 13.5px;
+    line-height: 1.6;
+    letter-spacing: 0.1px;
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+/* ---------------- Loading / Error states ---------------- */
+
+.citationPreviewStatus {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    color: var(--vscode-descriptionForeground, #6b7280);
+    font-size: 12.5px;
+}
+
+.citationPreviewStatus svg {
+    width: 14px;
+    height: 14px;
+    flex: 0 0 auto;
+}
+
+.citationPreviewSkeleton {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    margin-top: 10px;
+}
+
+.citationPreviewSkeleton span {
+    display: block;
+    height: 10px;
+    border-radius: 4px;
+    background: linear-gradient(
+        90deg,
+        var(--vscode-editorWidget-border, rgba(0, 0, 0, 0.08)) 0%,
+        color-mix(in srgb, var(--vscode-editorWidget-border, rgba(0, 0, 0, 0.08)) 60%, transparent) 50%,
+        var(--vscode-editorWidget-border, rgba(0, 0, 0, 0.08)) 100%
+    );
+    background-size: 200% 100%;
+    animation: citationPreviewShimmer 1.4s ease-in-out infinite;
+}
+
+.citationPreviewSkeleton span:nth-child(1) { width: 92%; }
+.citationPreviewSkeleton span:nth-child(2) { width: 78%; }
+.citationPreviewSkeleton span:nth-child(3) { width: 60%; }
+
+@keyframes citationPreviewShimmer {
+    from { background-position: 200% 0; }
+    to   { background-position: -200% 0; }
+}
+
+.citationPreviewError .citationPreviewStatus {
+    color: var(--vscode-errorForeground, #d94141);
+}
+
+/* ---------------- Footer / Actions ---------------- */
+
+.citationPreviewActions {
+    flex: 0 0 auto;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 10px 12px;
+    border-top: 1px solid var(--vscode-editorWidget-border, rgba(0, 0, 0, 0.08));
+    background: color-mix(in srgb, var(--vscode-editorWidget-background, #ffffff) 96%, var(--vscode-editorWidget-foreground, #000) 4%);
+}
+
+.citationPreviewActions .citationPreviewSpacer {
+    flex: 1 1 auto;
+}
+
+.citationPreviewActionButton {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    height: 28px;
+    padding: 0 12px;
+    border-radius: 6px;
+    border: 1px solid transparent;
+    font: inherit;
+    font-size: 12.5px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background-color 120ms ease, color 120ms ease, border-color 120ms ease, transform 80ms ease;
+}
+
+.citationPreviewActionButton svg {
+    width: 13px;
+    height: 13px;
+}
+
+.citationPreviewActionButton--primary {
+    background: var(--vscode-button-background, #2563eb);
+    color: var(--vscode-button-foreground, #ffffff);
+    border-color: var(--vscode-button-background, #2563eb);
+}
+
+.citationPreviewActionButton--primary:hover:not(:disabled) {
+    background: var(--vscode-button-hoverBackground, #1d4ed8);
+    border-color: var(--vscode-button-hoverBackground, #1d4ed8);
+}
+
+.citationPreviewActionButton--secondary {
+    background: transparent;
+    color: var(--vscode-foreground, inherit);
+    border-color: var(--vscode-editorWidget-border, rgba(0, 0, 0, 0.14));
+}
+
+.citationPreviewActionButton--secondary:hover:not(:disabled) {
+    background: var(--vscode-toolbar-hoverBackground, rgba(0, 0, 0, 0.06));
+}
+
+.citationPreviewActionButton:focus-visible {
+    outline: none;
+    box-shadow: 0 0 0 2px var(--vscode-focusBorder, #2563eb);
+}
+
+.citationPreviewActionButton:active:not(:disabled) {
+    transform: translateY(1px);
+}
+
+.citationPreviewActionButton:disabled {
+    cursor: default;
+    opacity: 0.45;
+}
+
+.citationPreviewActionButton .citationPreviewCopied {
+    color: var(--vscode-testing-iconPassed, #2ea043);
+}

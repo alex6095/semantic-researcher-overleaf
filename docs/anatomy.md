@@ -212,6 +212,7 @@ The standalone module which consists of the most important components of this ex
 #### `src/core/pdfViewEditorProvider.ts`
 The export `class PdfViewEditorProvider` exposes features to vscode via `(get) triggers` with:
 - **CustomEditorProvider**: PDF viewer powered by `pdf.js`, whose source code is located in [views/pdf-viewer](#viewspdf-viewer).
+- **PDF viewer script bridge**: injects custom PDF viewer behavior such as theme persistence, SyncTeX messages, and citation reference preview popovers.
 
 #### `src/core/projectManagerProvider.ts`
 The export `class ProjectManagerProvider` exposes features to vscode via `(get) triggers` with:

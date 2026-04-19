@@ -98,7 +98,13 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                         scrollMode: config.get('defaultScrollMode', 'vertical'),
                         spreadMode: config.get('defaultSpreadMode', 'none'),
                     };
-                    webviewPanel.webview.postMessage({type:'initState', content:state, colorThemes, defaults});
+                    const citationPreview = {
+                        enabled: config.get<boolean>('citationPreview.enabled', true),
+                        maxEntries: config.get<number>('citationPreview.maxEntries', 8),
+                        maxLines: config.get<number>('citationPreview.maxLines', 6),
+                        maxChars: config.get<number>('citationPreview.maxChars', 1200),
+                    };
+                    webviewPanel.webview.postMessage({type:'initState', content:state, colorThemes, defaults, citationPreview});
                     updateWebview();
                     break;
                 default:
