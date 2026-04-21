@@ -438,13 +438,13 @@
       {
         "command": "semantic-researcher-overleaf.agentReview.previousChange",
         "title": "%commands.agentReview.previousChange.title%",
-        "enablement": "semantic-researcher-overleaf.activeReplicaEditor",
+        "enablement": "resourceScheme == semantic-researcher-overleaf-agent-review || resourceScheme == semantic-researcher-overleaf-agent-review-base",
         "category": "%extension.displayName%"
       },
       {
         "command": "semantic-researcher-overleaf.agentReview.nextChange",
         "title": "%commands.agentReview.nextChange.title%",
-        "enablement": "semantic-researcher-overleaf.activeReplicaEditor",
+        "enablement": "resourceScheme == semantic-researcher-overleaf-agent-review || resourceScheme == semantic-researcher-overleaf-agent-review-base",
         "category": "%extension.displayName%"
       },
       {
@@ -456,13 +456,13 @@
       {
         "command": "semantic-researcher-overleaf.agentReview.acceptAllChangesInFile",
         "title": "%commands.agentReview.acceptAllChangesInFile.title%",
-        "enablement": "semantic-researcher-overleaf.activeReplicaEditor",
+        "enablement": "resourceScheme == semantic-researcher-overleaf-agent-review",
         "category": "%extension.displayName%"
       },
       {
         "command": "semantic-researcher-overleaf.agentReview.declineAllChangesInFile",
         "title": "%commands.agentReview.declineAllChangesInFile.title%",
-        "enablement": "semantic-researcher-overleaf.activeReplicaEditor",
+        "enablement": "resourceScheme == semantic-researcher-overleaf-agent-review",
         "category": "%extension.displayName%"
       },
       {
@@ -613,7 +613,7 @@
         },
         "semantic-researcher-overleaf.agentReview.enabled": {
           "type": "boolean",
-          "default": true,
+          "default": false,
           "scope": "machine",
           "markdownDescription": "%configuration.agentReview.enabled.markdownDescription%"
         },

@@ -31,11 +31,14 @@ directly. Create a review draft instead:
 2. Edit only files under the printed \`DRAFT_ROOT\`.
 3. Submit the draft with:
    \`"${registration.helperPath}" submit --draft "<DRAFT_ID>"\`
-4. After submit succeeds, reply naturally with a brief summary of what changed,
-   just as you would after an ordinary edit. Treat the draft workflow as
-   internal plumbing: do not mention Agent Review, draft IDs, helper paths,
-   DRAFT_ROOT, or submission mechanics unless the user explicitly asks for
-   debugging details.
+4. After submit succeeds, treat the requested edit as complete even though the
+   Local Replica source file still shows the pre-review content until the user
+   accepts the proposal in VS Code. Do not inspect the Local Replica and try to
+   "finish applying" the same edit there, and do not overwrite the source file
+   directly. Reply naturally with a brief summary of what changed, just as you
+   would after an ordinary edit. Treat the draft workflow as internal plumbing:
+   do not mention Agent Review, draft IDs, helper paths, DRAFT_ROOT, or
+   submission mechanics unless the user explicitly asks for debugging details.
 
 For files outside the registered Local Replica roots, work normally.
 

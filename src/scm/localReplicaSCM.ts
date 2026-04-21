@@ -36,7 +36,7 @@ function getOutputChannel() {
 // De-dupe warning notifications: remember the last error signature we surfaced.
 const lastWarnByRel = new Map<string, {signature: string, at: number}>();
 function maybeWarnSyncFailure(relPath: string, error: unknown) {
-    const signature = (error instanceof Error ? error.message : String(error));
+    const signature = formatUnknownError(error);
     const key = relPath;
     const previous = lastWarnByRel.get(key);
     const now = Date.now();
@@ -112,6 +112,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         '**/*.synctex.gz',
         '**/*.toc',
         '**/*.xdv',
+        '/*.pdf',
         '**/main.pdf',
         '**/output.pdf',
     ];
@@ -538,7 +539,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             await vscode.workspace.fs.writeFile(toUri, newContent);
                         }
                         this.baseCache[relPath] = newContent;
-                        if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
+                        if (action==='push') {
+                            try {
+                                await vscode.workspace.fs.readFile(toUri); // update remote cache
+                            } catch (cacheError) {
+                                getOutputChannel().appendLine(
+                                    `${new Date().toISOString()} [push cache refresh skipped] ${relPath}: ${formatUnknownError(cacheError)}`,
+                                );
+                            }
+                        }
                         if (action==='push') {
                             await getAgentReviewManager()?.afterLocalReplicaPush(pushChange!);
                         }
@@ -548,7 +557,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         // log to the shared output channel and surface one toast per
                         // (file × message) per 60s so the user is never left in the dark.
                         getOutputChannel().appendLine(
-                            `${new Date().toISOString()} [${action} ${type}] ${relPath}: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+                            `${new Date().toISOString()} [${action} ${type}] ${relPath}: ${formatUnknownError(error)}`,
                         );
                         if (action==='push') {
                             maybeWarnSyncFailure(relPath, error);

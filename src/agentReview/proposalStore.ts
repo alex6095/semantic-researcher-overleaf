@@ -83,6 +83,17 @@ function normalizeRootPath(rootPath: string) {
     return path.resolve(rootPath);
 }
 
+function textEol(text: string) {
+    return text.includes('\r\n') ? '\r\n' : '\n';
+}
+
+function splitLines(text: string): string[] {
+    if (text==='') {
+        return [];
+    }
+    return text.replace(/\r\n/g, '\n').replace(/\r/g, '\n').split('\n');
+}
+
 function rootContainsUri(uri: vscode.Uri, rootPath: string) {
     const normalizedRoot = normalizeRootPath(rootPath);
     const normalizedUri = path.resolve(uri.fsPath);
@@ -283,6 +294,22 @@ export class AgentReviewProposalStore {
         await this.persistOrCleanup(match.proposal);
     }
 
+    async markAcceptedHunksConflict(uri: vscode.Uri) {
+        const matches = this.pendingForUri(uri);
+        for (const {proposal, file} of matches) {
+            let changed = false;
+            for (const hunk of file.hunks) {
+                if (hunk.status==='saving') {
+                    hunk.status = 'conflict';
+                    changed = true;
+                }
+            }
+            if (changed) {
+                await this.persistOrCleanup(proposal);
+            }
+        }
+    }
+
     async importSubmittedDrafts(
         rootUri: vscode.Uri,
         drafts: AgentReviewDraftRecord[],
@@ -346,7 +373,22 @@ export class AgentReviewProposalStore {
         const proposalId = uri.authority;
         const filePath = decodeURIComponent(uri.path.replace(/^\/+/, ''));
         const proposal = this.proposals.get(proposalId);
-        return proposal?.files.find(file => file.path===normalizeReplicaPath(filePath))?.proposedText;
+        const file = proposal?.files.find(candidate => candidate.path===normalizeReplicaPath(filePath));
+        return file ? this.composeVisibleProposedContent(file) : undefined;
+    }
+
+    composeVisibleProposedContent(file: AgentReviewFileProposal): string {
+        const lines = splitLines(file.originalText);
+        const hunks = file.hunks
+            .filter(hunk => hunk.status!=='declined')
+            .sort((a, b) => b.startLine-a.startLine);
+
+        for (const hunk of hunks) {
+            const start = Math.max(0, Math.min(hunk.startLine, lines.length));
+            lines.splice(start, hunk.originalLines.length, ...hunk.proposedLines);
+        }
+
+        return lines.join(textEol(file.proposedText || file.originalText));
     }
 
     private createFileProposal(relPath: string, originalText: string, proposedText: string): AgentReviewFileProposal | undefined {

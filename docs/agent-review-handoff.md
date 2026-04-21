@@ -12,8 +12,8 @@ implementation after removing default terminal interception.
 - Human edits to Local Replica `.tex` files must save and sync as before.
 - AI agents should be guided through `AGENTS.md` and `CLAUDE.md` to create draft
   proposals instead of directly editing source Local Replica files.
-- Submitted proposals should appear in the normal VS Code editor as change-level
-  review UI.
+- Submitted proposals should open in a VS Code diff viewer with change-level
+  review UI on the proposed side.
 - Accepting a change should apply it, save the source file, and let the existing
   Local Replica SCM sync the accepted change to Overleaf.
 
@@ -26,9 +26,10 @@ The implementation now uses:
    `.semantic-researcher-overleaf/agent-review/bin/overleaf-agent-review`
 3. Draft copies under:
    `.semantic-researcher-overleaf/agent-review/drafts/<draft-id>/`
-4. Proposal JSON files under the Local Replica metadata directory:
-   `.semantic-researcher-overleaf/agent-proposals/`
-5. Editor CodeLens, hover actions, decorations, and native diff fallback.
+4. Proposal JSON files under extension global storage:
+   `agent-review/proposals/<replica-root-hash>/`
+5. A native VS Code inline diff viewer backed by virtual original/proposed
+   documents, with CodeLens and hover actions on the proposed side.
 
 No generated directory is prepended to integrated terminal `PATH`.
 
@@ -47,10 +48,12 @@ unchanged and shows a warning instead of recreating it.
 - `src/agentReview/proposalStore.ts`
   - Imports submitted helper drafts and legacy sessions.
   - Stores change proposals.
+- `src/agentReview/changeLocator.ts`
+  - Locates original hunk ranges in the current source file.
+  - Builds the source edit used when accepting a change.
 - `src/agentReview/editorReviewProvider.ts`
-  - Shows changes and performs accept/decline/open-diff/previous/next.
-  - Reveals the first pending change when a proposal imports for an open file,
-    or when a file with pending changes becomes active.
+  - Opens the aggregate diff viewer and performs accept/decline/previous/next.
+  - Reveals the first pending change when a proposal imports.
   - Accept applies the change and saves the document.
 - `src/agentReview/saveClassifier.ts`
   - Tracks explicit save intents for editor saves and agent-review accept saves.
@@ -136,8 +139,8 @@ Recommended manual pass:
 3. Confirm workspace-root `AGENTS.md` and `CLAUDE.md` contain the managed block.
 4. Confirm `which codex` does not point into `.semantic-researcher-overleaf`.
 5. Run the helper `begin`/`submit` flow manually or through Codex.
-6. Confirm submitted drafts import into editor changes.
-7. Confirm an already-open changed file moves focus to the first change.
+6. Confirm submitted drafts import and open the Agent Review diff viewer.
+7. Confirm the proposed side shows Accept/Decline CodeLens and hover actions.
 8. Confirm `Agent Review: Next Change` and `Agent Review: Previous Change`
-   cycle through pending changes in the active file.
+   cycle through pending changes in the active file/proposal.
 9. Accept one change and confirm the file is saved and synced through Local Replica.

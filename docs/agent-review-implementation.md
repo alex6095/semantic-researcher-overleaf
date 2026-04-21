@@ -8,10 +8,10 @@ Implement Local Replica Agent Review without globally intercepting normal
 `codex` or `claude` CLI usage.
 
 The extension should guide agents through `AGENTS.md` and `CLAUDE.md`, ask them
-to write proposed LaTeX edits into a managed draft copy, import those drafts as
-editor-visible changes, and only apply a change to the source Local Replica when
-the user accepts it. Accepting a change should apply, save, and then sync through the
-existing Local Replica SCM path.
+to write proposed LaTeX edits into a managed draft copy, import those drafts into
+a VS Code diff viewer, and only apply a change to the source Local Replica when
+the user accepts it. Accepting a change should apply, save, and then sync through
+the existing Local Replica SCM path.
 
 ## Core Decisions
 
@@ -87,8 +87,8 @@ existing Local Replica SCM path.
 - `AGENTS.md` and `CLAUDE.md` at the workspace root must contain one managed
   block listing registered Local Replica roots and the helper path.
 - Running the helper manually must create a draft copy without touching source.
-- Marking a draft submitted must create editor-visible proposal changes after
-  import.
+- Marking a draft submitted must open proposal changes in the Agent Review diff
+  viewer after import.
 - Accepting a change must modify the file, save it, and allow Local Replica sync.
 - Direct user edits and saves must continue to sync normally.
 - `npm run lint`

@@ -2,6 +2,7 @@ import * as vscode from 'vscode';
 import { CONFIG_SECTION, REPLICA_SETTINGS_DIR } from '../consts';
 
 export const AGENT_REVIEW_DIFF_SCHEME = `${CONFIG_SECTION}-agent-review`;
+export const AGENT_REVIEW_BASE_DIFF_SCHEME = `${CONFIG_SECTION}-agent-review-base`;
 
 export const PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS = [
     '**/AGENTS.md',
@@ -101,7 +102,7 @@ export function getAgentReviewConfig(_replicaSettings?: AgentReviewReplicaSettin
     // Single source of truth. Older per-replica `enableAgentReview` values are
     // treated as legacy metadata and migrated away by the settings readers.
     return {
-        enabled: config.get<boolean>('agentReview.enabled', true),
+        enabled: config.get<boolean>('agentReview.enabled', false),
     };
 }
 

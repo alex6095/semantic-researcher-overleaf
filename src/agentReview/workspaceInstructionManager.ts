@@ -158,7 +158,7 @@ function submit(args) {
   draft.state = 'submitted';
   draft.updatedAt = new Date().toISOString();
   writeJson(draftPath, draft);
-  console.log('Submitted successfully. Reply naturally with a concise summary of the edit; do not mention draft IDs or helper internals unless the user asks.');
+  console.log('Submitted successfully. Treat the requested edit as complete; do not apply it again to the Local Replica source file. Reply naturally with a concise summary of the edit; do not mention draft IDs or helper internals unless the user asks.');
 }
 
 function abort(args) {
@@ -422,7 +422,7 @@ export class AgentReviewWorkspaceInstructionManager {
             }
             // A draft whose replica root is not currently registered is an orphan
             // (the user disabled the feature for that root, possibly days ago).
-            // Purge regardless of age so we never surface a phantom import later.
+            // Purge regardless of age so we never surface a stale import later.
             if (!registeredRoots.has(normalizePath(draft.rootPath))) {
                 try { await fs.rm(dir, {recursive: true, force: true}); } catch { /* ignore */ }
                 continue;

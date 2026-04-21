@@ -138,17 +138,37 @@ export class AgentReviewManager {
     }
 
     async afterLocalReplicaPush(change: LocalReplicaPushChange): Promise<void> {
-        const saveIntent = this.saveClassifier.getRecentSaveIntent(change.localUri, change.content);
-        if (saveIntent?.kind==='agentReviewAccept' && saveIntent.proposalId && saveIntent.filePath && saveIntent.hunkId) {
-            await this.proposalStore.markHunkSaved(saveIntent.proposalId, saveIntent.filePath, saveIntent.hunkId);
+        const saveIntent = this.saveClassifier.getRecentSaveIntent(change.localUri, change.content, 60000);
+        if (saveIntent?.kind==='agentReviewAccept') {
+            const acceptedHunks = saveIntent.acceptedHunks
+                ?? (saveIntent.proposalId && saveIntent.filePath && saveIntent.hunkId
+                    ? [{proposalId: saveIntent.proposalId, filePath: saveIntent.filePath, hunkId: saveIntent.hunkId}]
+                    : []);
+            if (acceptedHunks.length===0) {
+                await this.proposalStore.markAcceptedHunksSaved(change.localUri);
+            } else {
+                for (const hunk of acceptedHunks) {
+                    await this.proposalStore.markHunkSaved(hunk.proposalId, hunk.filePath, hunk.hunkId);
+                }
+            }
             this.saveClassifier.clearSaveIntent(change.localUri);
         }
     }
 
     async afterLocalReplicaPushFailed(change: LocalReplicaPushChange): Promise<void> {
-        const saveIntent = this.saveClassifier.getRecentSaveIntent(change.localUri, change.content);
-        if (saveIntent?.kind==='agentReviewAccept' && saveIntent.proposalId && saveIntent.filePath && saveIntent.hunkId) {
-            await this.proposalStore.markHunkConflict(saveIntent.proposalId, saveIntent.filePath, saveIntent.hunkId);
+        const saveIntent = this.saveClassifier.getRecentSaveIntent(change.localUri, change.content, 60000);
+        if (saveIntent?.kind==='agentReviewAccept') {
+            const acceptedHunks = saveIntent.acceptedHunks
+                ?? (saveIntent.proposalId && saveIntent.filePath && saveIntent.hunkId
+                    ? [{proposalId: saveIntent.proposalId, filePath: saveIntent.filePath, hunkId: saveIntent.hunkId}]
+                    : []);
+            if (acceptedHunks.length===0) {
+                await this.proposalStore.markAcceptedHunksConflict(change.localUri);
+            } else {
+                for (const hunk of acceptedHunks) {
+                    await this.proposalStore.markHunkConflict(hunk.proposalId, hunk.filePath, hunk.hunkId);
+                }
+            }
             this.saveClassifier.clearSaveIntent(change.localUri);
         }
     }
@@ -275,16 +295,16 @@ export class AgentReviewManager {
                 this.editorProvider.acceptHunk(proposalId, filePath, hunkId)),
             vscode.commands.registerCommand(`${ROOT_NAME}.agentReview.declineHunk`, (proposalId: string, filePath: string, hunkId: string) =>
                 this.editorProvider.declineHunk(proposalId, filePath, hunkId)),
-            vscode.commands.registerCommand(`${ROOT_NAME}.agentReview.openDiff`, (proposalId: string, filePath: string) =>
-                this.editorProvider.openDiff(proposalId, filePath)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.agentReview.openDiff`, (proposalId: string, filePath: string, hunkId?: string) =>
+                this.editorProvider.openDiff(proposalId, filePath, hunkId)),
             vscode.commands.registerCommand(`${ROOT_NAME}.agentReview.nextChange`, () =>
                 this.editorProvider.revealAdjacentChange('next')),
             vscode.commands.registerCommand(`${ROOT_NAME}.agentReview.previousChange`, () =>
                 this.editorProvider.revealAdjacentChange('previous')),
-            vscode.commands.registerCommand(`${ROOT_NAME}.agentReview.acceptAllChangesInFile`, () =>
-                this.editorProvider.acceptAllInActiveFile()),
-            vscode.commands.registerCommand(`${ROOT_NAME}.agentReview.declineAllChangesInFile`, () =>
-                this.editorProvider.declineAllInActiveFile()),
+            vscode.commands.registerCommand(`${ROOT_NAME}.agentReview.acceptAllChangesInFile`, (proposalId?: string, filePath?: string) =>
+                this.editorProvider.acceptAllInActiveFile(proposalId, filePath)),
+            vscode.commands.registerCommand(`${ROOT_NAME}.agentReview.declineAllChangesInFile`, (proposalId?: string, filePath?: string) =>
+                this.editorProvider.declineAllInActiveFile(proposalId, filePath)),
             vscode.commands.registerCommand(`${ROOT_NAME}.agentReview.acceptAllChanges`, () =>
                 this.editorProvider.acceptAllChangesInWorkspace()),
             vscode.commands.registerCommand(`${ROOT_NAME}.agentReview.declineAllChanges`, () =>

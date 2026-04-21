@@ -10,6 +10,7 @@ export type SaveIntent = {
     proposalId?: string,
     filePath?: string,
     hunkId?: string,
+    acceptedHunks?: Array<{proposalId: string, filePath: string, hunkId: string}>,
 };
 
 function hashText(text: string): number {
@@ -42,13 +43,22 @@ export class SaveClassifier {
         filePath: string,
         hunkId: string,
     ) {
+        this.beginAgentReviewAcceptBatchSave(uri, content, [{proposalId, filePath, hunkId}]);
+    }
+
+    beginAgentReviewAcceptBatchSave(
+        uri: vscode.Uri,
+        content: string,
+        acceptedHunks: Array<{proposalId: string, filePath: string, hunkId: string}>,
+    ) {
         this.intents.set(uri.toString(), {
             kind: 'agentReviewAccept',
             time: Date.now(),
             hash: hashText(content),
-            proposalId,
-            filePath,
-            hunkId,
+            proposalId: acceptedHunks[0]?.proposalId,
+            filePath: acceptedHunks[0]?.filePath,
+            hunkId: acceptedHunks[0]?.hunkId,
+            acceptedHunks,
         });
     }
 
