@@ -14,6 +14,8 @@ export interface LocalReplicaSettings {
     uri: string,
     serverName: string,
     enableCompileNPreview: boolean,
+    /** Legacy; stripped on normalization. Use agentReview.enabled instead. */
+    enableAgentReview?: boolean,
     projectName: string,
 }
 
@@ -49,8 +51,9 @@ async function pathExists(uri: vscode.Uri) {
 }
 
 function normalizeSettings(settings: LocalReplicaSettings): LocalReplicaSettings {
+    const {enableAgentReview: _legacyEnableAgentReview, ...rest} = settings;
     return {
-        ...settings,
+        ...rest,
         uri: stringifyOverleafUri(canonicalizeOverleafUri(vscode.Uri.parse(settings.uri))),
         enableCompileNPreview: true,
     };
@@ -243,6 +246,18 @@ export function isLocalReplicaMetadataUri(uri: vscode.Uri, rootUri = activeRepli
     }
 
     const relativePath = uri.path.slice(rootUri.path.length).replace(/^\/+/, '');
+    if (
+        relativePath==='AGENTS.md'
+        || relativePath==='CLAUDE.md'
+        || relativePath==='.cursor'
+        || relativePath.startsWith('.cursor/')
+        || relativePath==='.codex'
+        || relativePath.startsWith('.codex/')
+        || relativePath==='.claude'
+        || relativePath.startsWith('.claude/')
+    ) {
+        return true;
+    }
     return relativePath===REPLICA_SETTINGS_DIR
         || relativePath.startsWith(`${REPLICA_SETTINGS_DIR}/`)
         || relativePath===LEGACY_REPLICA_SETTINGS_DIR

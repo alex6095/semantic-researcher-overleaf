@@ -2,10 +2,11 @@ import * as vscode from 'vscode';
 import { PREFETCH_COMMAND, ROOT_NAME } from '../consts';
 import { ProjectTagsResponseSchema } from '../api/base';
 import { GlobalStateManager } from '../utils/globalStateManager';
-import { VirtualFileSystem, parseUri } from './remoteFileSystemProvider';
+import { RemoteFileSystemProvider, VFSConnectionState, VirtualFileSystem, parseUri } from './remoteFileSystemProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
-import { setActiveReplicaRoot } from '../utils/localReplicaWorkspace';
+import { getActiveReplicaRoot, readReplicaSettings, setActiveReplicaRoot } from '../utils/localReplicaWorkspace';
 import { BrowserLogin } from '../auth/browserLogin';
+import { canonicalizeOverleafUri, stringifyOverleafUri } from '../utils/overleafUri';
 
 type BrowserLoginResponse = {
     cookies: string;
@@ -58,6 +59,7 @@ class ProjectItem extends DataItem {
     tag?: {name:string, tid:string};
     constructor(
         readonly api: any,
+        private readonly extensionUri: vscode.Uri,
         readonly uri: string,
         readonly parent: ServerItem,
         readonly pid: string,
@@ -71,7 +73,11 @@ class ProjectItem extends DataItem {
     }
 
     static clone(project: ProjectItem) {
-        return new ProjectItem(project.api, project.uri, project.parent, project.pid, project.label, project.status);
+        return new ProjectItem(project.api, project.extensionUri, project.uri, project.parent, project.pid, project.label, project.status);
+    }
+
+    private statusIcon(name: 'status-live.svg' | 'status-offline.svg' | 'status-reconnecting.svg') {
+        return vscode.Uri.joinPath(this.extensionUri, 'resources', 'icons', name);
     }
 
     setStatus(status:'normal' | 'archived' | 'trashed') {
@@ -89,11 +95,45 @@ class ProjectItem extends DataItem {
                 this.iconPath = new vscode.ThemeIcon('trash');
         }
     }
+
+    applyActiveConnection(state: VFSConnectionState | 'inactive') {
+        // Visually distinguish the *currently opened* replica + its live connection.
+        // "inactive" means this project is not the active replica.
+        switch (state) {
+            case 'inactive':
+                this.description = undefined;
+                this.resourceUri = undefined;
+                if (this.status==='normal') { this.iconPath = new vscode.ThemeIcon('notebook'); }
+                break;
+            case 'connected':
+                this.description = 'live';
+                this.iconPath = this.statusIcon('status-live.svg');
+                this.tooltip = `${this.label} — live (Overleaf connected)`;
+                break;
+            case 'reconnecting':
+                this.description = 'reconnecting';
+                this.iconPath = this.statusIcon('status-reconnecting.svg');
+                this.tooltip = `${this.label} — reconnecting to Overleaf`;
+                break;
+            case 'initial':
+                this.description = 'connecting';
+                this.iconPath = this.statusIcon('status-reconnecting.svg');
+                this.tooltip = `${this.label} — connecting to Overleaf`;
+                break;
+            case 'disconnected':
+                this.description = 'offline';
+                this.iconPath = this.statusIcon('status-offline.svg');
+                this.tooltip = `${this.label} — disconnected from Overleaf`;
+                break;
+        }
+    }
 }
 
 export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem> {
     constructor(
-        private context:vscode.ExtensionContext) {
+        private context:vscode.ExtensionContext,
+        private remoteFileSystem?: RemoteFileSystemProvider,
+    ) {
         this.context = context;
     }
 
@@ -101,7 +141,44 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     readonly onDidChangeTreeData: vscode.Event<DataItem | undefined | void> = this._onDidChangeTreeData.event;
 
+    // Identity of the currently-active Overleaf project (the one mapped to the local replica).
+    // Keyed as `${serverName}::${projectId}` to match ProjectItem construction.
+    private activeKey: string | undefined;
+    private activeState: VFSConnectionState | 'inactive' = 'inactive';
+    // Maps `${serverName}::${projectId}` to the most recently rendered ProjectItem
+    // so connection-state transitions can fire targeted tree refreshes instead of
+    // forcing a full re-fetch of every server's project list.
+    private readonly itemIndex = new Map<string, ProjectItem>();
+
+    setActiveProject(serverName: string, projectId: string | undefined, state: VFSConnectionState | 'inactive') {
+        const nextKey = projectId ? `${serverName}::${projectId}` : undefined;
+        if (this.activeKey===nextKey && this.activeState===state) { return; }
+        const previousItem = this.activeKey ? this.itemIndex.get(this.activeKey) : undefined;
+        this.activeKey = nextKey;
+        this.activeState = state;
+        if (previousItem && previousItem!==(nextKey ? this.itemIndex.get(nextKey) : undefined)) {
+            previousItem.applyActiveConnection('inactive');
+            this._onDidChangeTreeData.fire(previousItem);
+        }
+        const nextItem = nextKey ? this.itemIndex.get(nextKey) : undefined;
+        if (nextItem) {
+            nextItem.applyActiveConnection(state);
+            this._onDidChangeTreeData.fire(nextItem);
+        }
+    }
+
+    updateActiveConnectionState(state: VFSConnectionState | 'inactive') {
+        if (this.activeState===state) { return; }
+        this.activeState = state;
+        const item = this.activeKey ? this.itemIndex.get(this.activeKey) : undefined;
+        if (item) {
+            item.applyActiveConnection(state);
+            this._onDidChangeTreeData.fire(item);
+        }
+    }
+
     refresh(): void {
+        this.itemIndex.clear();
         this._onDidChangeTreeData.fire();
     }
 
@@ -140,7 +217,12 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
                     for (const project of projects) {
                         const uri = `${ROOT_NAME}://${element.name}/${encodeURIComponent(project.name)}?user=${project.userId}&project=${project.id}`;
                         const status = project.archived ? 'archived' : project.trashed ? 'trashed' : 'normal';
-                        const item = new ProjectItem(element.api, uri, element, project.id, project.name, status);
+                        const item = new ProjectItem(element.api, this.context.extensionUri, uri, element, project.id, project.name, status);
+                        const key = `${element.name}::${project.id}`;
+                        this.itemIndex.set(key, item);
+                        if (key===this.activeKey) {
+                            item.applyActiveConnection(this.activeState);
+                        }
                         switch (status) {
                             case 'normal': normalProjects.push(item); break;
                             case 'archived': archivedProjects.push(item); break;
@@ -159,6 +241,8 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
                                 item.tag = _tag; // for filter purpose
                                 _item.contextValue = 'project_in_tag';
                                 _item.tag = _tag;
+                                const key = `${element.name}::${item.pid}`;
+                                if (key===this.activeKey) { _item.applyActiveConnection(this.activeState); }
                                 return _item;
                             }
                         }).filter(item => item) as ProjectItem[];
@@ -320,7 +404,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             'Login with Cookies': () => {
                 vscode.window.showInputBox({
                     'placeHolder': vscode.l10n.t('Cookies, e.g., "sharelatex.sid=..." or "overleaf_session2=..."'),
-                    'prompt': vscode.l10n.t('README: [How to Login with Cookies](https://github.com/overleaf-workshop/overleaf-workshop#how-to-login-with-cookies)'),
+                    'prompt': vscode.l10n.t('README: [How to Login with Cookies](https://github.com/alex6095/semantic-researcher-overleaf#how-to-login-with-cookies)'),
                 })
                 .then(cookies => cookies ? Promise.resolve(cookies) : Promise.reject())
                 .then(cookies =>
@@ -739,6 +823,10 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         }
 
         const uri = vscode.Uri.parse(project.uri);
+        if (await this.hasConflictingLocalReplicaWorkspace(uri)) {
+            return;
+        }
+
         await vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.activateProject`, uri) as VirtualFileSystem;
 
         const scm = await vscode.commands.executeCommand(
@@ -754,6 +842,42 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             await setActiveReplicaRoot(scm.baseUri, {ensureWorkspaceFolder: true});
             vscode.commands.executeCommand('workbench.view.explorer');
         }
+    }
+
+    private async hasConflictingLocalReplicaWorkspace(projectUri: vscode.Uri) {
+        const targetProjectUri = stringifyOverleafUri(canonicalizeOverleafUri(projectUri));
+        const candidateRoots = new Map<string, vscode.Uri>();
+        const activeRoot = getActiveReplicaRoot();
+        if (activeRoot) {
+            candidateRoots.set(activeRoot.toString(), activeRoot);
+        }
+        for (const folder of vscode.workspace.workspaceFolders ?? []) {
+            if (folder.uri.scheme==='file') {
+                candidateRoots.set(folder.uri.toString(), folder.uri);
+            }
+        }
+
+        for (const rootUri of candidateRoots.values()) {
+            const settings = await readReplicaSettings(rootUri);
+            if (!settings?.uri) {
+                continue;
+            }
+            const existingProjectUri = stringifyOverleafUri(canonicalizeOverleafUri(vscode.Uri.parse(settings.uri)));
+            if (existingProjectUri===targetProjectUri) {
+                continue;
+            }
+
+            vscode.window.showWarningMessage(vscode.l10n.t(
+                'A different Local Replica project is already active in this workspace: "{projectName}" at {path}. Open a separate VS Code window before selecting another project folder.',
+                {
+                    projectName: settings.projectName,
+                    path: rootUri.fsPath || rootUri.toString(),
+                },
+            ));
+            return true;
+        }
+
+        return false;
     }
 
     get triggers() {

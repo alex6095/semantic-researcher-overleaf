@@ -2,7 +2,7 @@
   "name": "semantic-researcher-overleaf",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.15",
+  "version": "0.15.16",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -411,6 +411,71 @@
         "title": "%commands.collaboration.jumpToUser.title%",
         "enablement": "resourceScheme == semantic-researcher-overleaf || semantic-researcher-overleaf.activate",
         "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.agentReview.enable",
+        "title": "%commands.agentReview.enable.title%",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.agentReview.disable",
+        "title": "%commands.agentReview.disable.title%",
+        "enablement": "semantic-researcher-overleaf.agentReviewActive",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.agentReview.repairInstructions",
+        "title": "%commands.agentReview.repairInstructions.title%",
+        "enablement": "semantic-researcher-overleaf.activate",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.agentReview.importProposalDrafts",
+        "title": "%commands.agentReview.importProposalDrafts.title%",
+        "enablement": "semantic-researcher-overleaf.agentReviewActive",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.agentReview.previousChange",
+        "title": "%commands.agentReview.previousChange.title%",
+        "enablement": "semantic-researcher-overleaf.activeReplicaEditor",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.agentReview.nextChange",
+        "title": "%commands.agentReview.nextChange.title%",
+        "enablement": "semantic-researcher-overleaf.activeReplicaEditor",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.agentReview.showStatus",
+        "title": "%commands.agentReview.showStatus.title%",
+        "enablement": "semantic-researcher-overleaf.activate",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.agentReview.acceptAllChangesInFile",
+        "title": "%commands.agentReview.acceptAllChangesInFile.title%",
+        "enablement": "semantic-researcher-overleaf.activeReplicaEditor",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.agentReview.declineAllChangesInFile",
+        "title": "%commands.agentReview.declineAllChangesInFile.title%",
+        "enablement": "semantic-researcher-overleaf.activeReplicaEditor",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.agentReview.acceptAllChanges",
+        "title": "%commands.agentReview.acceptAllChanges.title%",
+        "enablement": "semantic-researcher-overleaf.agentReviewActive",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.agentReview.declineAllChanges",
+        "title": "%commands.agentReview.declineAllChanges.title%",
+        "enablement": "semantic-researcher-overleaf.agentReviewActive",
+        "category": "%extension.displayName%"
       }
     ],
     "keybindings": [
@@ -545,6 +610,12 @@
           "maximum": 5000,
           "scope": "machine",
           "markdownDescription": "%configuration.pdfViewer.citationPreview.maxChars.markdownDescription%"
+        },
+        "semantic-researcher-overleaf.agentReview.enabled": {
+          "type": "boolean",
+          "default": true,
+          "scope": "machine",
+          "markdownDescription": "%configuration.agentReview.enabled.markdownDescription%"
         },
         "semantic-researcher-overleaf.invisibleMode.historyRefreshInterval": {
           "type": "number",

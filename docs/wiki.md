@@ -40,17 +40,14 @@ Notice that if you have logged in to the server, the login information will be r
 
 ![screenshot-login-to-server](assets/screenshot-login-to-server.png)
 
-There are currently two ways to login to the server: login with email and password, and login with cookies.
+There are currently three ways to login to the server: login in browser, login with email and password, and login with cookies. **Login in Browser** is the recommended default because it lets you use the same Overleaf sign-in flow you already trust in your desktop browser.
 
 > [!WARNING]
 > According to the [open-source `passportLogin` design](https://github.com/overleaf/overleaf/blob/5fc2535842b2727cb1ec33ed5543ca614b4fc25b/services/web/app/src/Features/Authentication/AuthenticationController.js#L79) and observation of the login process, the email and password are sent to the server in ***plain text***, which implies that the server can ***see your password*** even if the connection is encrypted.
 > We highly suggest you aware of this risk and use a ***separate password*** for the server, or use [SSO login](https://www.overleaf.com/learn/how-to/Managing_your_Overleaf_emails_and_login_options#Logging_in_with_institutional_or_organizational_single_sign-on_(SSO)) instead.
 
-> [!NOTE]
-> We are working on the webview-based login feature (to be appeared in `v1.0.0`). Please stay tuned.
-
 #### Login with Email and Password
-If you can login via email and password on the web browser, you can also login via email and password in VS Code. The exception is that Captcha is enabled on the server, then you have to [login with cookies](#login-with-cookies) instead.
+If you can login via email and password on the web browser, you can also login via email and password in VS Code. For SSO, two-factor authentication, captcha-enabled servers, or `https://www.overleaf.com`, use [Login in Browser](#login-in-browser) first.
 
 #### Login in Browser
 Choose **Login in Browser** from the login method list. The extension opens a Chrome, Edge, or Chromium window and navigates to the Overleaf project page, which shows the login page when needed. Sign in there as usual, including Google, SSO, or two-factor authentication. Once Overleaf reaches the project page, the extension reads the browser session cookies and completes the same cookie login flow automatically.
@@ -58,7 +55,7 @@ Choose **Login in Browser** from the login method list. The extension opens a Ch
 In a local VS Code window, no extra extension is needed. In a VS Code Remote window, install **Semantic Researcher Overleaf Remote Pack** locally so the remote extension can ask your desktop VS Code to open the local browser. For VSIX installs, install the main extension in the remote window and the Remote Pack VSIX in the local desktop VS Code. If the browser is not found automatically, set `semantic-researcher-overleaf.auth.browserPath` for the main extension or `semantic-researcher-overleaf-remote-pack.browserPath` for the Remote Pack.
 
 #### Login with Cookies
-As for the cases that Captcha is enabled on the server, or you want to login with SSO, you have to login with cookies from an already logged-in browser. The steps are as follows:
+Use Login with Cookies as a fallback when Login in Browser is unavailable in your environment. The steps are as follows:
 
 ![screenshot-login-with-cookies](assets/login_with_cookie.png)
 
@@ -173,8 +170,13 @@ If you already have a specific local folder that should become the replica root 
 
 This command differs from `Open Project Locally ...` in two important ways:
 
-1. the selected folder is used directly as the replica root, so `.overleaf/settings.json` and the synced project files will be created inside that exact folder;
+1. the selected folder is used directly as the replica root, so `.semantic-researcher-overleaf/settings.json` and the synced project files will be created inside that exact folder;
 2. the selected folder becomes the active local replica root for the current VS Code window, so local history, chat, collaboration helpers, compile / preview actions, and intellisense-related features resolve against that exact folder without replacing the current window.
+
+> [!WARNING]
+> Do not select local folders for two different Overleaf projects in the same VS Code window. The extension currently keeps one active local replica root per window; selecting a folder for another project changes that active root and can cause collaboration, history, compile, or sync operations to resolve against the wrong local LaTeX folder.
+>
+> If you need to work on two local replicas at once, open each project in a separate VS Code window. Avoid editing both local LaTeX folders from one workspace.
 
 ## Basic Usage
 
@@ -345,7 +347,7 @@ In the Local Replica configuration, you can choose to enable/disable the Local R
 
 ![screenshot-config-local-replica](assets/screenshot-config-local-replica.png)
 
-The project-related metadata for local replica are located in `.overleaf/settings.json` in the following format:
+The project-related metadata for local replica are located in `.semantic-researcher-overleaf/settings.json` in the following format:
 ```json
 {
     "uri": "semantic-researcher-overleaf://overleaf.com/example-project?user%3D<user_id>%26project%3D<project_id>",
@@ -354,7 +356,7 @@ The project-related metadata for local replica are located in `.overleaf/setting
     "projectName": "example-project",
 }
 ```
-Most of the items are immutable, except for `enableCompileNPreview`, which is used to enable/disable the compile and preview feature in local folder. The default value is `false`.
+Most of the items are immutable, except for `enableCompileNPreview`, which is used to enable/disable the compile and preview feature in local folder. Agent Review is controlled by the VS Code setting `semantic-researcher-overleaf.agentReview.enabled`; older per-replica `enableAgentReview` metadata is ignored and removed during settings normalization.
 
 ### Invisible Mode
 > [!WARNING]
@@ -419,6 +421,7 @@ The project-irrelevant configurations of the extension can be found in the VS Co
     ```
 - **PDF Viewer: Default Scroll Mode**: This configuration controls the default scroll mode for the PDF viewer when there is no saved viewer state for the PDF. Allowed values are `vertical`, `horizontal`, `wrapped`, and `page`. The default value is `vertical`.
 - **PDF Viewer: Default Spread Mode**: This configuration controls the default spread mode for the PDF viewer when there is no saved viewer state for the PDF. Allowed values are `none`, `odd`, and `even`. The default value is `none`.
+- **Agent Review**: Local Replica workspaces can guide Codex and Claude edits through a review flow without changing the normal `codex` or `claude` executable path. When enabled, the extension writes managed Agent Review blocks to the workspace `AGENTS.md` and `CLAUDE.md`, plus a global-storage `overleaf-agent-review` helper. Agents use that helper to create draft copies and submit proposals. Submitted drafts appear as editor-visible changes with Accept, Decline, Open Diff, Previous Change, and Next Change actions. Opening a file with pending changes reveals the first change, and accepting a change applies it to the source editor and saves it so the normal Local Replica sync path can push the accepted change to Overleaf. Agent Review is enabled by default and can be disabled with `semantic-researcher-overleaf.agentReview.enabled`; disabling it removes the managed instructions and allows direct edits.
 - **Formatter: Line break**: The formatter will restrict line length as 80 characters in default. Toggle the following option will disable this feature.
 
     ![alt text](assets/screenshot-formatter-linebreak.png)

@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { ROOT_NAME } from './consts';
-import { RemoteFileSystemProvider } from './core/remoteFileSystemProvider';
+import { RemoteFileSystemProvider, VFSConnectionState, parseUri } from './core/remoteFileSystemProvider';
 import { ProjectManagerProvider } from './core/projectManagerProvider';
 import { PdfViewEditorProvider } from './core/pdfViewEditorProvider';
 import { CompileManager } from './compile/compileManager';
@@ -13,6 +13,7 @@ import {
     onDidChangeActiveReplicaRoot,
 } from './utils/localReplicaWorkspace';
 import { migrateLegacyNamespace } from './utils/namespaceMigration';
+import { initializeAgentReviewManager } from './agentReview';
 
 type ActiveReplicaSyncTarget = {
     key: string,
@@ -29,8 +30,73 @@ export async function activate(context: vscode.ExtensionContext) {
     configureLocalReplicaWorkspace(context);
 
     // Register: [core] ProjectManagerProvider on Activitybar
-    const projectManagerProvider = new ProjectManagerProvider(context);
+    const projectManagerProvider = new ProjectManagerProvider(context, remoteFileSystemProvider);
     context.subscriptions.push( ...projectManagerProvider.triggers );
+
+    // Register: global Overleaf connection status bar so the user is never left
+    // with "selected" as a false proxy for "live". Event-driven, no polling.
+    const overleafStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
+    overleafStatusItem.command = 'workbench.action.output.toggleOutput';
+    context.subscriptions.push(overleafStatusItem);
+
+    const applyConnectionState = (state: VFSConnectionState, projectName?: string) => {
+        const label = projectName ?? 'Overleaf';
+        switch (state) {
+            case 'connected':
+                overleafStatusItem.text = `$(cloud) ${label}`;
+                overleafStatusItem.tooltip = 'Overleaf connected (changes sync live)';
+                overleafStatusItem.color = undefined;
+                overleafStatusItem.backgroundColor = undefined;
+                overleafStatusItem.show();
+                projectManagerProvider.updateActiveConnectionState('connected');
+                break;
+            case 'reconnecting':
+                overleafStatusItem.text = `$(sync~spin) ${label}`;
+                overleafStatusItem.tooltip = 'Reconnecting to Overleaf';
+                overleafStatusItem.color = new vscode.ThemeColor('statusBarItem.warningForeground');
+                overleafStatusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
+                overleafStatusItem.show();
+                projectManagerProvider.updateActiveConnectionState('reconnecting');
+                break;
+            case 'initial':
+                overleafStatusItem.text = `$(sync~spin) ${label}`;
+                overleafStatusItem.tooltip = 'Connecting to Overleaf';
+                overleafStatusItem.color = undefined;
+                overleafStatusItem.backgroundColor = undefined;
+                overleafStatusItem.show();
+                projectManagerProvider.updateActiveConnectionState('initial');
+                break;
+            case 'disconnected':
+                overleafStatusItem.text = `$(cloud-offline) ${label}`;
+                overleafStatusItem.tooltip = 'Overleaf disconnected — edits will not reach the server until reconnected';
+                overleafStatusItem.color = new vscode.ThemeColor('statusBarItem.errorForeground');
+                overleafStatusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
+                overleafStatusItem.show();
+                projectManagerProvider.updateActiveConnectionState('disconnected');
+                break;
+        }
+    };
+
+    const projectIdOfUri = (uri: vscode.Uri | undefined) => {
+        if (!uri) { return undefined; }
+        try {
+            return parseUri(uri);
+        } catch {
+            return undefined;
+        }
+    };
+
+    context.subscriptions.push(
+        remoteFileSystemProvider.onDidChangeActiveConnection(({vfs, state}) => {
+            if (vfs) {
+                projectManagerProvider.setActiveProject(vfs.serverName, vfs.projectId, state);
+                applyConnectionState(state, vfs.projectName);
+            } else {
+                projectManagerProvider.setActiveProject('', undefined, 'inactive');
+                overleafStatusItem.hide();
+            }
+        }),
+    );
 
     // Register: [core] PdfViewEditorProvider
     const pdfViewEditorProvider = new PdfViewEditorProvider(context);
@@ -43,6 +109,9 @@ export async function activate(context: vscode.ExtensionContext) {
     // Register: [intellisense] LangIntellisenseProvider
     const langIntellisenseProvider = new LangIntellisenseProvider(context, remoteFileSystemProvider);
     context.subscriptions.push( ...langIntellisenseProvider.triggers );
+
+    // Register: [agent review] Local Replica agent proposal workflow
+    const agentReviewManager = initializeAgentReviewManager(context);
 
     let activeReplicaSyncPromise: Promise<void> | undefined;
     let activeReplicaSyncKey: string | undefined;
@@ -107,11 +176,13 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         onDidChangeActiveReplicaRoot(() => {
+            void agentReviewManager.activate(getActiveReplicaRoot());
             void syncActiveReplicaProject();
         }),
     );
 
     void initializeLocalReplicaWorkspace().then(async () => {
+        await agentReviewManager.activate(getActiveReplicaRoot());
         await syncActiveReplicaProject();
     });
 }

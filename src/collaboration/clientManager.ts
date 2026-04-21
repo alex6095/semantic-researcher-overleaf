@@ -59,6 +59,8 @@ export class ClientManager {
     private readonly onlineUsers: {[K:string]:ExtendedUpdateUserSchema} = {};
     private connectedFlag: boolean = true;
     private readonly chatViewer: ChatViewProvider;
+    private disposed = false;
+    private statusTimer?: NodeJS.Timeout;
 
     constructor(
         private readonly vfs: VirtualFileSystem,
@@ -234,6 +236,7 @@ export class ClientManager {
     }
 
     private updateStatus() {
+        if (this.disposed) { return; }
         const count = Object.keys(this.onlineUsers).length;
         switch (this.connectedFlag) {
             case false:
@@ -296,7 +299,7 @@ export class ClientManager {
         }
         
         this.status.show();
-        setTimeout(this.updateStatus.bind(this), 500);
+        this.statusTimer = setTimeout(this.updateStatus.bind(this), 500);
     }
 
     setStatusActive(clientId:string, timeout:number=10) {
@@ -354,6 +357,7 @@ export class ClientManager {
 
     get triggers() {
         return [
+            this as vscode.Disposable,
             this.status,
             // register commands
             vscode.commands.registerCommand(`${ROOT_NAME}.collaboration.insertText`, (text) => {
@@ -395,5 +399,13 @@ export class ClientManager {
                 this.refreshDecorations(e);
             }),
         ];
+    }
+
+    dispose() {
+        this.disposed = true;
+        if (this.statusTimer) {
+            clearTimeout(this.statusTimer);
+            this.statusTimer = undefined;
+        }
     }
 }

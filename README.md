@@ -11,22 +11,22 @@ This extension is a fork of [Overleaf Workshop](https://github.com/overleaf-work
 
 ### User Guide
 
-The upstream user guide is available at [GitHub Wiki](https://github.com/overleaf-workshop/Overleaf-Workshop/wiki).
+The user guide is available in [docs/wiki.md](./docs/wiki.md).
 
 ### Features
 
 > [!NOTE]
-> For SSO login or captcha enabled servers like `https://www.overleaf.com`, please use "**Login with Cookies**" method.
-> For more details, please refer to [How to Login with Cookies](#how-to-login-with-cookies).
+> **Login in Browser** is the recommended default, especially for `https://www.overleaf.com`, SSO, two-factor authentication, or captcha-enabled servers.
+> It lets you sign in normally in your desktop browser, then imports the session automatically. Use [Login with Cookies](#how-to-login-with-cookies) only as a fallback when browser login is unavailable.
 
 - Login Server, Open Projects and Edit Files
 
-    <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo01-login.gif" height=400px/>
+    <img src="https://raw.githubusercontent.com/alex6095/semantic-researcher-overleaf/master/docs/assets/demo01-login.gif" height=400px/>
 
 - On-the-fly Compiling and Previewing
   > <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>B</kbd> to compile, <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>V</kbd> preview.
 
-    <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo03-synctex.gif" height=400px/>
+    <img src="https://raw.githubusercontent.com/alex6095/semantic-researcher-overleaf/master/docs/assets/demo03-synctex.gif" height=400px/>
 
 - SyncTeX and Reverse SyncTeX
   > <kbd>Ctrl</kbd>+<kbd>Alt</kbd>+<kbd>J</kbd> to jump to PDF.
@@ -34,15 +34,18 @@ The upstream user guide is available at [GitHub Wiki](https://github.com/overlea
 
 - Chat with Collaborators
 
-    <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo06-chat.gif" height=400px/>
+    <img src="https://raw.githubusercontent.com/alex6095/semantic-researcher-overleaf/master/docs/assets/demo06-chat.gif" height=400px/>
 
 - Open Project Locally, Compile/Preview with [LaTeX-Workshop](https://github.com/James-Yu/LaTeX-Workshop)
 
-    <img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/demo07-local.gif" height=400px/>
+    <img src="https://raw.githubusercontent.com/alex6095/semantic-researcher-overleaf/master/docs/assets/demo07-local.gif" height=400px/>
 
   Use `Open Project Locally ...` to create a replica under a parent folder, or `Select Project Folder Locally ...` to use an exact folder as the replica root while keeping the current VS Code window and activating local Overleaf features against that folder.
 
   In the project list, hover over a project to use the default inline actions: open in the current window, open in a new window, or select an exact local folder for that project. The folder selection action is placed at the right edge for quick local-replica setup.
+
+  > [!WARNING]
+  > Do not use one VS Code window to edit two different Overleaf projects as local LaTeX folders at the same time. Selecting a folder for a second project can switch the active local replica and may leave collaboration or sync state attached to the wrong project. Open each local replica in a separate VS Code window instead.
 
 ### How to Login in Browser
 
@@ -52,7 +55,7 @@ In a local VS Code window, no extra extension is needed. In a VS Code Remote win
 
 ### How to Login with Cookies
 
-<img src="https://raw.githubusercontent.com/overleaf-workshop/Overleaf-Workshop/master/docs/assets/login_with_cookie.png" height=400px/>
+<img src="https://raw.githubusercontent.com/alex6095/semantic-researcher-overleaf/master/docs/assets/login_with_cookie.png" height=400px/>
 
 In an already logged-in browser (Firefox for example):
 

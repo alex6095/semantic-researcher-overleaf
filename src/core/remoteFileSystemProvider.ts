@@ -109,6 +109,8 @@ export function parseUri(uri: vscode.Uri) {
     return {userId, projectId, serverName, projectName, identifier, pathParts};
 }
 
+export type VFSConnectionState = 'initial' | 'connected' | 'reconnecting' | 'disconnected';
+
 export class VirtualFileSystem extends vscode.Disposable {
     private root?: ProjectEntity;
     private currentVersion?: number;
@@ -124,6 +126,13 @@ export class VirtualFileSystem extends vscode.Disposable {
     private notify: (events:vscode.FileChangeEvent[])=>void;
     private clientManagerItem?: {manager: ClientManager, triggers: vscode.Disposable[]};
     private scmCollectionItem?: {collection: SCMCollectionProvider, triggers: vscode.Disposable[]};
+    private disposed = false;
+
+    // Connection state is useful for SCM and UI layers: we don't want to trust
+    // "selected" as a proxy for "live".
+    private _connectionState: VFSConnectionState = 'initial';
+    private readonly _onDidChangeConnectionEmitter = new vscode.EventEmitter<VFSConnectionState>();
+    public readonly onDidChangeConnection = this._onDidChangeConnectionEmitter.event;
 
     public readonly origin: vscode.Uri;
     public readonly projectName: string;
@@ -133,6 +142,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     constructor(context: vscode.ExtensionContext, uri: vscode.Uri, notify: (events:vscode.FileChangeEvent[])=>void) {
         // define the dispose behavior
         super(() => {
+            if (this.disposed) { return; }
+            this.disposed = true;
             // dispose all triggers of clientManager
             this.clientManagerItem?.triggers.forEach((trigger) => trigger.dispose());
             this.clientManagerItem = undefined;
@@ -140,7 +151,12 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
             this.scmCollectionItem = undefined;
             // disconnect socketio
-            // this.socket.disconnect();
+            try {
+                this.socket.disconnect();
+            } catch (error) {
+                console.warn(`Could not disconnect socket for ${this.origin.toString()}:`, error);
+            }
+            this._onDidChangeConnectionEmitter.dispose();
         });
 
         uri = canonicalizeOverleafUri(uri);
@@ -166,6 +182,39 @@ export class VirtualFileSystem extends vscode.Disposable {
         return this.userId;
     }
 
+    get isDisposed() {
+        return this.disposed;
+    }
+
+    get connectionState(): VFSConnectionState {
+        return this._connectionState;
+    }
+
+    async reconnect(reason = 'manual reconnect'): Promise<ProjectEntity> {
+        if (this.disposed) {
+            throw new Error(`Cannot reconnect disposed Overleaf project ${this.origin.toString()}`);
+        }
+        console.log(`Reconnecting Overleaf project ${this.origin.toString()}: ${reason}`);
+        this.setConnectionState('reconnecting');
+        this.retryConnection = Math.max(this.retryConnection, 1);
+        this.root = undefined;
+        this.initializing = undefined;
+        return this.init();
+    }
+
+    async ensureConnectedForWrite(): Promise<void> {
+        if (this.connectionState==='connected') {
+            return;
+        }
+        await this.reconnect('before remote write');
+    }
+
+    private setConnectionState(next: VFSConnectionState) {
+        if (this._connectionState===next) { return; }
+        this._connectionState = next;
+        this._onDidChangeConnectionEmitter.fire(next);
+    }
+
     async init() : Promise<ProjectEntity> {
         if (this.root) {
             return Promise.resolve(this.root);
@@ -181,6 +230,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         // if retry connection failed 3 times, throw error
         if (this.retryConnection >= 3) {
             this.retryConnection = 0;
+            this.setConnectionState('disconnected');
             vscode.window.showErrorMessage( vscode.l10n.t('Connection lost: {serverName}', {serverName:this.serverName}), vscode.l10n.t('Reload')).then((choice) => {
                 if (choice==='Reload') {
                     vscode.commands.executeCommand("workbench.action.reloadWindow");
@@ -193,6 +243,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
         // if evert connection failed, reset socketio
         if (this.retryConnection > 0) {
+            this.setConnectionState('reconnecting');
             this.socket.init();
         }
 
@@ -203,6 +254,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
             project.settings = (await this.api.getProjectSettings(identity, this.projectId)).settings!;
             this.root = project;
+            this.retryConnection = 0;
+            this.setConnectionState('connected');
             const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
             // Register: [collaboration] ClientManager on Statusbar
             if (activeCondition) {
@@ -366,14 +419,17 @@ export class VirtualFileSystem extends vscode.Disposable {
     private remoteWatch(): void {
         this.socket.updateEventHandlers({
             onDisconnected: () => {
+                if (this.disposed) { return; }
                 if (this.root===undefined) { return; } // bypass the first initialization
                 console.log("Disconnected");
+                this.setConnectionState('reconnecting');
                 this.retryConnection += 1;
                 this.initializing = this.initializingPromise;
             },
             onConnectionAccepted: (publicId:string) => {
                 this.retryConnection = 0;
                 this.publicId = publicId;
+                this.setConnectionState('connected');
             },
             onFileCreated: (parentFolderId:string, type:FileType, entity:FileEntity) => {
                 const res = this._resolveById(parentFolderId);
@@ -726,6 +782,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async writeFile(uri: vscode.Uri, content:Uint8Array, create:boolean, overwrite:boolean) {
+        await this.ensureConnectedForWrite();
         const {fileType, fileEntity} = await this._resolveUri(uri);
 
         // if non-exists --> create it
@@ -1213,26 +1270,62 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 }
 
+export interface ActiveConnectionChange {
+    vfs: VirtualFileSystem | undefined,
+    state: VFSConnectionState,
+}
+
 export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     private _emitter = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
     readonly onDidChangeFile: vscode.Event<vscode.FileChangeEvent[]> = this._emitter.event;
 
     private vfss: {[key:string]:VirtualFileSystem};
 
+    private _activeVFS: VirtualFileSystem | undefined;
+    private _activeConnectionSubscription?: vscode.Disposable;
+    private readonly _onDidChangeActiveConnectionEmitter = new vscode.EventEmitter<ActiveConnectionChange>();
+    public readonly onDidChangeActiveConnection = this._onDidChangeActiveConnectionEmitter.event;
+
     constructor(private context: vscode.ExtensionContext) {
         this.context = context;
         this.vfss = {};
     }
 
+    getActiveVFS(): VirtualFileSystem | undefined {
+        return this._activeVFS?.isDisposed ? undefined : this._activeVFS;
+    }
+
+    getActiveConnectionState(): VFSConnectionState {
+        const vfs = this.getActiveVFS();
+        return vfs ? vfs.connectionState : 'disconnected';
+    }
+
+    private setActiveVFS(vfs: VirtualFileSystem | undefined) {
+        if (this._activeVFS===vfs) { return; }
+        this._activeConnectionSubscription?.dispose();
+        this._activeVFS = vfs;
+        if (vfs) {
+            this._activeConnectionSubscription = vfs.onDidChangeConnection(state => {
+                this._onDidChangeActiveConnectionEmitter.fire({vfs, state});
+            });
+        } else {
+            this._activeConnectionSubscription = undefined;
+        }
+        this._onDidChangeActiveConnectionEmitter.fire({vfs, state: vfs?.connectionState ?? 'disconnected'});
+    }
+
     private getVFS(uri: vscode.Uri): Promise<VirtualFileSystem> {
         uri = canonicalizeOverleafUri(uri);
         const vfs = this.vfss[ uri.query ];
-        if (vfs) {
+        if (vfs && !vfs.isDisposed) {
             return Promise.resolve(vfs);
         } else {
-            const vfs = new VirtualFileSystem(this.context, uri, this.notify.bind(this));
-            this.vfss[ uri.query ] = vfs;
-            return Promise.resolve(vfs);
+            if (vfs?.isDisposed) {
+                delete this.vfss[uri.query];
+            }
+            const newVfs = new VirtualFileSystem(this.context, uri, this.notify.bind(this));
+            this.vfss[ uri.query ] = newVfs;
+            return Promise.resolve(newVfs);
         }
     }
 
@@ -1244,12 +1337,14 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
         uri = canonicalizeOverleafUri(uri);
         Object.entries(this.vfss).forEach(([query, vfs]) => {
             if (query!==uri.query) {
+                if (this._activeVFS===vfs) { this.setActiveVFS(undefined); }
                 vfs.dispose();
                 delete this.vfss[query];
             }
         });
 
         const vfs = await this.prefetch(uri);
+        this.setActiveVFS(vfs);
         await vfs.init();
         return vfs;
     }

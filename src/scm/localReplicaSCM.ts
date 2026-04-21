@@ -19,8 +19,37 @@ import {
 } from '../consts';
 import { stringifyOverleafUri } from '../utils/overleafUri';
 import { formatUnknownError } from '../utils/errorMessage';
+import { PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS, getAgentReviewManager } from '../agentReview';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
+const ECHO_WINDOW_MS = 500;
+
+// Single shared output channel for Local Replica sync diagnostics. Lazy-created.
+let sharedOutput: vscode.OutputChannel | undefined;
+function getOutputChannel() {
+    if (!sharedOutput) {
+        sharedOutput = vscode.window.createOutputChannel('Semantic Researcher Overleaf');
+    }
+    return sharedOutput;
+}
+
+// De-dupe warning notifications: remember the last error signature we surfaced.
+const lastWarnByRel = new Map<string, {signature: string, at: number}>();
+function maybeWarnSyncFailure(relPath: string, error: unknown) {
+    const signature = (error instanceof Error ? error.message : String(error));
+    const key = relPath;
+    const previous = lastWarnByRel.get(key);
+    const now = Date.now();
+    // One toast per (file × message) in any 60s window — stops spam on disconnected sockets.
+    if (previous && previous.signature===signature && now-previous.at<60_000) { return; }
+    lastWarnByRel.set(key, {signature, at: now});
+    vscode.window.showWarningMessage(
+        vscode.l10n.t('Overleaf sync failed for {relPath}: {message}', {relPath, message: signature}),
+        vscode.l10n.t('Show Output'),
+    ).then((choice) => {
+        if (choice==='Show Output') { getOutputChannel().show(true); }
+    });
+}
 
 type FileCache = {date:number, hash:number};
 
@@ -54,6 +83,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private bypassCache: Map<string, [FileCache,FileCache]> = new Map();
     private baseCache: {[key:string]: Uint8Array} = {};
+    private syncQueues: Map<string, Promise<void>> = new Map();
     private localReplicaSettings?: {
         uri: string,
         serverName: string,
@@ -167,10 +197,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         try {
             const content = await vscode.workspace.fs.readFile(this.settingsUri);
             const storedSettings = JSON.parse(new TextDecoder().decode(content));
+            const {enableAgentReview: _legacyEnableAgentReview, ...storedWithoutLegacyAgentReview} = storedSettings;
             this.localReplicaSettings = {
                 ...canonicalSettings,
             };
-            shouldPersist = JSON.stringify(storedSettings)!==JSON.stringify(this.localReplicaSettings);
+            shouldPersist = JSON.stringify(storedWithoutLegacyAgentReview)!==JSON.stringify(this.localReplicaSettings);
         } catch (error) {
             this.localReplicaSettings = canonicalSettings;
             shouldPersist = true;
@@ -258,7 +289,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private matchIgnorePatterns(path: string): boolean {
         const ignorePatterns = this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns;
-        for (const pattern of ignorePatterns) {
+        for (const pattern of [...PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS, ...ignorePatterns]) {
             if (minimatch(path, pattern, {dot:true})) {
                 return true;
             }
@@ -290,20 +321,33 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const cache = this.bypassCache.get(relPath);
         if (cache) {
             const thisHash = hashCode(content);
-            // console.log(action, relPath, `[${cache[0].hash}, ${cache[1].hash}]`, thisHash);
-            if (action==='push' && cache[0].hash===thisHash) { return false; }
-            if (action==='pull' && cache[1].hash===thisHash) { return false; }
-            if (cache[0].hash!==cache[1].hash) {
-                if (action==='push' && now-cache[0].date<500 || action==='pull' && now-cache[1].date<500) {
-                    this.setBypassCache(relPath, content, action);
-                    return true;
-                }
+            const ownCache = action==='push' ? cache[0] : cache[1];
+            const oppositeCache = action==='push' ? cache[1] : cache[0];
+            if (ownCache.hash===thisHash) { return false; }
+            // Only suppress a cross-direction echo while it is fresh. A stale
+            // divergent cache must not swallow a later undo/redo save.
+            if (oppositeCache.hash===thisHash && now-oppositeCache.date<ECHO_WINDOW_MS) {
                 this.setBypassCache(relPath, content, action);
                 return false;
             }
         }
         this.setBypassCache(relPath, content, action);
         return true;
+    }
+
+    private enqueueSync(relPath: string, task: () => Promise<void>): Promise<void> {
+        const previous = this.syncQueues.get(relPath) ?? Promise.resolve();
+        const next = previous
+            .catch(() => undefined)
+            .then(task)
+            .catch(error => console.error(error))
+            .finally(() => {
+                if (this.syncQueues.get(relPath)===next) {
+                    this.syncQueues.delete(relPath);
+                }
+            });
+        this.syncQueues.set(relPath, next);
+        return next;
     }
 
     private async overwrite(root: string='/'): Promise<boolean|undefined> {
@@ -404,6 +448,38 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return false;
     }
 
+    // Up to 3 attempts with short backoff so a stale or reconnecting socket
+    // doesn't drop the edit silently. The error surfacing happens in the
+    // outer catch if every attempt fails.
+    private async pushWithRetry(relPath: string, toUri: vscode.Uri, content: Uint8Array) {
+        const delays = [0, 200, 700];
+        let lastError: unknown;
+        for (let attempt = 0; attempt<delays.length; attempt++) {
+            const delay = delays[attempt];
+            if (delay>0) { await new Promise(resolve => setTimeout(resolve, delay)); }
+            try {
+                await this.vfs.ensureConnectedForWrite();
+                await vscode.workspace.fs.writeFile(toUri, content);
+                if (lastError) {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [push recovered] ${relPath} after retry`,
+                    );
+                }
+                return;
+            } catch (error) {
+                lastError = error;
+                if (attempt<delays.length-1) {
+                    try {
+                        await this.vfs.reconnect(`retry push for ${relPath}`);
+                    } catch (reconnectError) {
+                        lastError = reconnectError;
+                    }
+                }
+            }
+        }
+        throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    }
+
     private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
         this.status = {status: action, message: `${type}: ${relPath}`};
 
@@ -411,8 +487,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (type==='delete') {
                 const newContent = undefined;
                 if (this.bypassSync(action, type, relPath, newContent)) { return; }
+                if (action==='push') {
+                    const decision = await getAgentReviewManager()?.beforeLocalReplicaPush({
+                        rootUri: this.baseUri,
+                        localUri: fromUri,
+                        relPath,
+                        type,
+                        content: newContent,
+                    });
+                    if (decision?.kind==='block') { return; }
+                }
                 delete this.baseCache[relPath];
                 await vscode.workspace.fs.delete(toUri, {recursive:true});
+                if (action==='push') {
+                    await getAgentReviewManager()?.afterLocalReplicaPush({
+                        rootUri: this.baseUri,
+                        localUri: fromUri,
+                        relPath,
+                        type,
+                        content: newContent,
+                    });
+                }
             } else {
                 const stat = await vscode.workspace.fs.stat(fromUri);
                 if (stat.type===vscode.FileType.Directory) {
@@ -424,10 +519,47 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     try {
                         const newContent = await vscode.workspace.fs.readFile(fromUri);
                         if (this.bypassSync(action, type, relPath, newContent)) { return; }
-                        await vscode.workspace.fs.writeFile(toUri, newContent);
+                        const pushChange = action==='push' ? {
+                            rootUri: this.baseUri,
+                            localUri: fromUri,
+                            relPath,
+                            type,
+                            content: newContent,
+                        } : undefined;
+                        if (action==='push') {
+                            const decision = await getAgentReviewManager()?.beforeLocalReplicaPush(pushChange!);
+                            if (decision?.kind==='block') { return; }
+                        }
+                        if (action==='push') {
+                            // Push with bounded retry so a transient socket blip doesn't
+                            // silently lose the accepted edit.
+                            await this.pushWithRetry(relPath, toUri, newContent);
+                        } else {
+                            await vscode.workspace.fs.writeFile(toUri, newContent);
+                        }
                         this.baseCache[relPath] = newContent;
                         if (action==='push') { await vscode.workspace.fs.readFile(toUri); } // update remote cache
+                        if (action==='push') {
+                            await getAgentReviewManager()?.afterLocalReplicaPush(pushChange!);
+                        }
                     } catch (error) {
+                        // Previously this swallowed every error silently, so an accepted
+                        // change could land on disk yet never reach Overleaf. Now we
+                        // log to the shared output channel and surface one toast per
+                        // (file × message) per 60s so the user is never left in the dark.
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [${action} ${type}] ${relPath}: ${error instanceof Error ? (error.stack ?? error.message) : String(error)}`,
+                        );
+                        if (action==='push') {
+                            maybeWarnSyncFailure(relPath, error);
+                            await getAgentReviewManager()?.afterLocalReplicaPushFailed({
+                                rootUri: this.baseUri,
+                                localUri: fromUri,
+                                relPath,
+                                type,
+                                content: await Promise.resolve(vscode.workspace.fs.readFile(fromUri)).catch(() => undefined),
+                            });
+                        }
                         console.error(error);
                     }
                 }
@@ -445,7 +577,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         pathParts.at(-1)==='' && pathParts.pop(); // remove the last empty string
         const relPath = ('/' + pathParts.join('/'));
         const localUri = this.localUri(relPath);
-        this.applySync('pull', type, relPath, vfsUri, localUri);
+        await this.enqueueSync(relPath, () => this.applySync('pull', type, relPath, vfsUri, localUri));
     }
 
     private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete') {
@@ -460,7 +592,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const basePath = this.baseUri.path;
         const relPath = localUri.path.slice(basePath.length);
         const vfsUri = this.vfs.pathToUri(relPath);
-        this.applySync('push', type, relPath, localUri, vfsUri);
+        await this.enqueueSync(relPath, () => this.applySync('push', type, relPath, localUri, vfsUri));
     }
 
     public async initializeLocalReplica() {
