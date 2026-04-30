@@ -1,0 +1,26 @@
+diff --git a/node_modules/ws/lib/Extensions.js b/node_modules/ws/lib/Extensions.js
+index 8f6d2f2..1b6e63d 100644
+--- a/node_modules/ws/lib/Extensions.js
++++ b/node_modules/ws/lib/Extensions.js
+@@ -1,5 +1,3 @@
+-
+-var util = require('util');
+ 
+ /**
+  * Module exports.
+@@ -65,13 +63,13 @@ function parse(value) {
+ function format(value) {
+   return Object.keys(value).map(function(token) {
+     var paramsList = value[token];
+-    if (!util.isArray(paramsList)) {
++    if (!Array.isArray(paramsList)) {
+       paramsList = [paramsList];
+     }
+     return paramsList.map(function(params) {
+       return [token].concat(Object.keys(params).map(function(k) {
+         var p = params[k];
+-        if (!util.isArray(p)) p = [p];
++        if (!Array.isArray(p)) p = [p];
+         return p.map(function(v) {
+           return v === true ? k : k + '=' + v;
+         }).join('; ');

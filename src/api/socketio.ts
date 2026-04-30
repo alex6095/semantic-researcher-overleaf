@@ -8,6 +8,8 @@ function decodePackedUtf8(text: string): string {
     return Buffer.from(text, 'latin1').toString('utf-8');
 }
 
+const SOCKET_ACK_TIMEOUT_MS = 20_000;
+
 export interface UpdateUserSchema {
     id: string,
     user_id: string,
@@ -73,11 +75,15 @@ export interface EventsHandler {
 }
 
 type ConnectionScheme = 'Alt' | 'v1' | 'v2';
+type SocketConnectionError = Error & { retryable?: boolean };
+type SocketErrorHandler = (error: SocketConnectionError) => void;
 
 export class SocketIOAPI {
     private scheme: ConnectionScheme = 'v1';
     private record?: Promise<ProjectEntity>;
     private _handlers: Array<EventsHandler> = [];
+    private socketErrorHandlers = new Set<SocketErrorHandler>();
+    private recordErrorHandler?: SocketErrorHandler;
 
     private socket?: any;
     private emit: any;
@@ -91,6 +97,9 @@ export class SocketIOAPI {
     }
 
     init() {
+        this.disconnectSocket();
+        this.socketErrorHandlers.clear();
+        this.recordErrorHandler = undefined;
         // connect
         switch(this.scheme) {
             case 'Alt':
@@ -110,8 +119,8 @@ export class SocketIOAPI {
         (this.socket.emit)[require('util').promisify.custom] = (event:string, ...args:any[]) => {
             const timeoutPromise = new Promise((_, reject) => {
                 setTimeout(() => {
-                    reject('timeout');
-                }, 5000);
+                    reject(new Error('timeout'));
+                }, SOCKET_ACK_TIMEOUT_MS);
             });
             const waitPromise = new Promise((resolve, reject) => {
                 this.socket.emit(event, ...args, (err:any, ...data:any[]) => {
@@ -130,26 +139,105 @@ export class SocketIOAPI {
         // this.resumeEventHandlers(this._handlers);
     }
 
+    private normalizeSocketError(error:any, retryable = true): SocketConnectionError {
+        let normalizedError: SocketConnectionError;
+        if (error instanceof Error) {
+            normalizedError = error;
+        } else if (error?.message) {
+            normalizedError = new Error(error.message);
+        } else {
+            normalizedError = new Error(String(error));
+        }
+        normalizedError.retryable = retryable;
+        return normalizedError;
+    }
+
+    private isHandshakeFallbackError(error: Error): boolean {
+        return error.message==='client not handshaken';
+    }
+
+    private isKnownFallbackError(error: Error): boolean {
+        return this.isHandshakeFallbackError(error)
+            || error.message==='invalid session'
+            || error.message==='connect_failed';
+    }
+
+    private disconnectSocket() {
+        try {
+            this.socket?.removeAllListeners?.();
+            this.socket?.disconnect();
+        } catch {
+            // Ignore cleanup errors from already-closing transports.
+        }
+    }
+
+    private notifySocketError(error: SocketConnectionError) {
+        if (this.socketErrorHandlers.size===0) {
+            if (!this.isKnownFallbackError(error)) {
+                console.error('SocketIOAPI: error', error);
+            }
+            return;
+        }
+
+        for (const handler of [...this.socketErrorHandlers]) {
+            handler(error);
+        }
+    }
+
+    private handleSocketError(error:any) {
+        const normalizedError = this.normalizeSocketError(error);
+        if (this.scheme==='v1' && this.isHandshakeFallbackError(normalizedError)) {
+            this.scheme = 'v2';
+            this.disconnectSocket();
+        }
+
+        this.notifySocketError(normalizedError);
+    }
+
     private initInternalHandlers() {
         this.socket.on('connect', () => {
             console.log('SocketIOAPI: connected');
         });
         this.socket.on('connect_failed', () => {
-            console.log('SocketIOAPI: connect_failed');
+            const error = this.normalizeSocketError('connect_failed');
+            if (this.socketErrorHandlers.size>0) {
+                console.log('SocketIOAPI: connect_failed');
+                this.notifySocketError(error);
+            }
         });
         this.socket.on('forceDisconnect', (message:string, delay=10) => {
             console.log('SocketIOAPI: forceDisconnect', message);
+            this.notifySocketError(this.normalizeSocketError(message));
         });
         this.socket.on('connectionRejected', (err:any) => {
-            console.log('SocketIOAPI: connectionRejected.', err.message);
+            const error = this.normalizeSocketError(err, this.scheme==='v1');
+            console.log('SocketIOAPI: connectionRejected.', error.message);
+            if (this.scheme==='v1') {
+                this.scheme = 'v2';
+                this.disconnectSocket();
+            }
+            this.notifySocketError(error);
         });
         this.socket.on('error', (err:any) => {
-            throw new Error(err);
+            this.handleSocketError(err);
         });
 
         if (this.scheme==='v2') {
-            this.record = new Promise(resolve => {
+            this.record = new Promise((resolve, reject) => {
+                const socketErrorHandler: SocketErrorHandler = (error) => {
+                    this.socketErrorHandlers.delete(socketErrorHandler);
+                    if (this.recordErrorHandler===socketErrorHandler) {
+                        this.recordErrorHandler = undefined;
+                    }
+                    reject(error);
+                };
+                this.recordErrorHandler = socketErrorHandler;
+                this.socketErrorHandlers.add(socketErrorHandler);
                 this.socket.on('joinProjectResponse', (res:any) => {
+                    this.socketErrorHandlers.delete(socketErrorHandler);
+                    if (this.recordErrorHandler===socketErrorHandler) {
+                        this.recordErrorHandler = undefined;
+                    }
                     const publicId = res.publicId as string;
                     const project = res.project as ProjectEntity;
                     EventBus.fire('socketioConnectedEvent', {publicId});
@@ -291,8 +379,8 @@ export class SocketIOAPI {
     async joinProject(project_id:string): Promise<ProjectEntity> {
         const timeoutPromise: Promise<ProjectEntity> = new Promise((_, reject) => {
             setTimeout(() => {
-                reject('timeout');
-            }, 5000);
+                reject(new Error('timeout'));
+            }, SOCKET_ACK_TIMEOUT_MS);
         });
 
         switch(this.scheme) {
@@ -304,15 +392,25 @@ export class SocketIOAPI {
                     this.record = Promise.resolve(project);
                     return project;
                 });
+                let socketErrorHandler: SocketErrorHandler | undefined;
                 const rejectPromise = new Promise((_, reject) => {
-                    this.socket.on('connectionRejected', (err:any) => {
-                        this.scheme = 'v2';
-                        reject(err.message);
-                    });
+                    socketErrorHandler = (error: SocketConnectionError) => {
+                        reject(error);
+                    };
+                    this.socketErrorHandlers.add(socketErrorHandler);
                 });
-                return Promise.race([joinPromise, rejectPromise, timeoutPromise]);
+                return Promise.race([joinPromise, rejectPromise, timeoutPromise]).finally(() => {
+                    if (socketErrorHandler) {
+                        this.socketErrorHandlers.delete(socketErrorHandler);
+                    }
+                }) as Promise<ProjectEntity>;
             case 'v2':
-                return Promise.race([this.record!, timeoutPromise]);
+                return Promise.race([this.record!, timeoutPromise]).finally(() => {
+                    if (this.recordErrorHandler) {
+                        this.socketErrorHandlers.delete(this.recordErrorHandler);
+                        this.recordErrorHandler = undefined;
+                    }
+                }) as Promise<ProjectEntity>;
         }
     }
 

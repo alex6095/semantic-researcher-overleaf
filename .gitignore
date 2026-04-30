@@ -5,3 +5,5 @@ out
 *.vsix
 
 **/vendor/**
+
+**/test/*

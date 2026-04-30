@@ -22,9 +22,9 @@ This workspace has Overleaf Local Replica roots registered for review:
 
 ${roots}
 
-When asked to modify supported LaTeX project files under one of these roots
-(.tex, .ltx, .ctx, .bib, .sty, .cls, .bbx, .cbx), do not edit the source file
-directly. Create a review draft instead:
+When asked to make plain text edits inside existing supported LaTeX project
+files under one of these roots (.tex, .ltx, .ctx, .bib, .sty, .cls, .bbx,
+.cbx), do not edit the source file directly. Create a review draft instead:
 
 1. Start a draft with:
    \`"${registration.helperPath}" begin --root "<LOCAL_REPLICA_ROOT>"\`
@@ -39,6 +39,16 @@ directly. Create a review draft instead:
    would after an ordinary edit. Treat the draft workflow as internal plumbing:
    do not mention Agent Review, draft IDs, helper paths, DRAFT_ROOT, or
    submission mechanics unless the user explicitly asks for debugging details.
+
+Use the draft workflow only for edits to existing files. If the request requires
+creating, deleting, moving, or renaming files or directories, apply the complete
+request directly to the Local Replica source instead of using a draft. Do not
+split one request between direct edits and a draft. If the user explicitly wants
+file creation/deletion to follow Agent Review accept/decline semantics (for
+example, keep a new file only after at least one related change is accepted,
+cancel it if all related changes are declined, or delete a file only when its
+deletion change is accepted), explain that prompt-only Agent Review cannot model
+that; extension support is required.
 
 For files outside the registered Local Replica roots, work normally.
 
@@ -89,6 +99,10 @@ function prependManagedBlock(block: string, preserved: string) {
     return `${block}${separator}${preserved}`;
 }
 
+function utf8Bytes(text: string) {
+    return new TextEncoder().encode(text);
+}
+
 async function writeManagedBlock(uri: vscode.Uri, block: string) {
     const existing = await readTextIfReadable(uri);
     if (existing===undefined) {
@@ -100,7 +114,7 @@ async function writeManagedBlock(uri: vscode.Uri, block: string) {
     const next = prependManagedBlock(block, preserved);
 
     if (next!==existing) {
-        await vscode.workspace.fs.writeFile(uri, Buffer.from(next));
+        await vscode.workspace.fs.writeFile(uri, utf8Bytes(next));
     }
 }
 
@@ -112,7 +126,7 @@ async function writeManagedBlockToExistingOrCreate(uri: vscode.Uri, block: strin
             return;
         }
     } catch {
-        await vscode.workspace.fs.writeFile(uri, Buffer.from(block));
+        await vscode.workspace.fs.writeFile(uri, utf8Bytes(block));
         return;
     }
     await writeManagedBlock(uri, block);
@@ -137,7 +151,7 @@ async function removeManagedBlock(uri: vscode.Uri) {
         }
         return;
     }
-    await vscode.workspace.fs.writeFile(uri, Buffer.from(next));
+    await vscode.workspace.fs.writeFile(uri, utf8Bytes(next));
 }
 
 export class AgentReviewInstructionFiles {

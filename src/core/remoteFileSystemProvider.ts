@@ -122,6 +122,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private isDirty: boolean = true;
     private initializing?: Promise<ProjectEntity>;
     private retryConnection: number = 0;
+    private lastConnectionError?: Error;
     private outputBuildId?: string;
     private notify: (events:vscode.FileChangeEvent[])=>void;
     private clientManagerItem?: {manager: ClientManager, triggers: vscode.Disposable[]};
@@ -226,12 +227,28 @@ export class VirtualFileSystem extends vscode.Disposable {
         return this.initializing;
     }
 
+    private getConnectionFailureMessage(error?: unknown): string {
+        const reason = error instanceof Error ? error.message : typeof error==='string' ? error : undefined;
+        if (reason && reason!=='timeout' && reason!=='connect_failed') {
+            return vscode.l10n.t(
+                'Connection lost: {serverName} ({reason})',
+                {serverName:this.serverName, reason},
+            );
+        }
+        return vscode.l10n.t('Connection lost: {serverName}', {serverName:this.serverName});
+    }
+
+    private isRetryableConnectionError(error: unknown): boolean {
+        return (error as {retryable?: boolean})?.retryable!==false;
+    }
+
     private get initializingPromise(): Promise<ProjectEntity> {
         // if retry connection failed 3 times, throw error
         if (this.retryConnection >= 3) {
+            const message = this.getConnectionFailureMessage(this.lastConnectionError);
             this.retryConnection = 0;
             this.setConnectionState('disconnected');
-            vscode.window.showErrorMessage( vscode.l10n.t('Connection lost: {serverName}', {serverName:this.serverName}), vscode.l10n.t('Reload')).then((choice) => {
+            vscode.window.showErrorMessage(message, vscode.l10n.t('Reload')).then((choice) => {
                 if (choice==='Reload') {
                     vscode.commands.executeCommand("workbench.action.reloadWindow");
                 };
@@ -239,7 +256,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             // reset retry connection
             this.retryConnection = 0;
             this.initializing = undefined;
-            throw new Error( vscode.l10n.t('Connection lost') );
+            this.lastConnectionError = undefined;
+            throw new Error(message);
         }
         // if evert connection failed, reset socketio
         if (this.retryConnection > 0) {
@@ -255,6 +273,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             project.settings = (await this.api.getProjectSettings(identity, this.projectId)).settings!;
             this.root = project;
             this.retryConnection = 0;
+            this.lastConnectionError = undefined;
             this.setConnectionState('connected');
             const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
             // Register: [collaboration] ClientManager on Statusbar
@@ -285,6 +304,16 @@ export class VirtualFileSystem extends vscode.Disposable {
             vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
             return project;
         }).catch((err) => {
+            this.lastConnectionError = err instanceof Error ? err : new Error(String(err));
+            if (!this.isRetryableConnectionError(err)) {
+                const message = this.getConnectionFailureMessage(err);
+                this.retryConnection = 0;
+                this.setConnectionState('disconnected');
+                this.initializing = undefined;
+                this.lastConnectionError = undefined;
+                vscode.window.showErrorMessage(message);
+                throw new Error(message);
+            }
             this.retryConnection += 1;
             return this.initializingPromise;
         });
@@ -800,7 +829,10 @@ export class VirtualFileSystem extends vscode.Disposable {
             const doc = fileEntity as DocumentEntity;
             const _content = new TextDecoder().decode(content);
             if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
-                return;
+                await this.openFile(uri);
+            }
+            if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
+                throw new Error(`Remote document cache is not initialized for ${uri.toString()}`);
             }
             const dmp = new DiffMatchPatch();
             const patches = dmp.patch_make(doc.localCache,  doc.remoteCache);

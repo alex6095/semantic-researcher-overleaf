@@ -51,6 +51,7 @@ interface SCMRecord {
 interface CreateSCMOptions {
     exactBaseUri?: boolean;
     replaceExistingLabel?: string;
+    preserveExistingLocalFiles?: boolean;
 }
 
 function parsePersistedBaseUri(baseUri: string): vscode.Uri {
@@ -153,13 +154,24 @@ export class SCMCollectionProvider extends vscode.Disposable {
         });
     }
 
-    private async createSCM(scmProto: SupportedSCM, baseUri: vscode.Uri, newSCM=false, enabled=true) {
+    private async createSCM(
+        scmProto: SupportedSCM,
+        baseUri: vscode.Uri,
+        newSCM=false,
+        enabled=true,
+        options?: CreateSCMOptions,
+    ) {
         const scmRecordKey = `${scmProto.label}:${baseUri.toString()}`;
         const existing = this.scms.find(item =>
             item.scm.baseUri.toString()===baseUri.toString()
             && (item.scm.constructor as any).label===scmProto.label
         );
         if (existing) {
+            if (existing.scm instanceof LocalReplicaSCMProvider) {
+                existing.scm.setInitializationOptions({
+                    preserveExistingLocalFiles: options?.preserveExistingLocalFiles,
+                });
+            }
             let activated = false;
             if (enabled && (!existing.enabled || existing.triggers.length===0)) {
                 const persist = this.vfs.getProjectSCMPersist(existing.scm.scmKey);
@@ -175,7 +187,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
                 this.updateStatus();
             }
             if (!activated && existing.scm instanceof LocalReplicaSCMProvider) {
-                await existing.scm.initializeLocalReplica();
+                await existing.scm.initializeLocalReplica({
+                    preserveExistingLocalFiles: options?.preserveExistingLocalFiles,
+                });
             }
             return existing.scm;
         }
@@ -185,7 +199,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
             return pendingSCM;
         }
 
-        const creation = this.createSCMRecord(scmProto, baseUri, newSCM, enabled);
+        const creation = this.createSCMRecord(scmProto, baseUri, newSCM, enabled, options);
         this.pendingSCMs.set(scmRecordKey, creation);
         try {
             return await creation;
@@ -196,8 +210,19 @@ export class SCMCollectionProvider extends vscode.Disposable {
         }
     }
 
-    private async createSCMRecord(scmProto: SupportedSCM, baseUri: vscode.Uri, newSCM=false, enabled=true) {
+    private async createSCMRecord(
+        scmProto: SupportedSCM,
+        baseUri: vscode.Uri,
+        newSCM=false,
+        enabled=true,
+        options?: CreateSCMOptions,
+    ) {
         const scm = new scmProto(this.vfs, baseUri);
+        if (scm instanceof LocalReplicaSCMProvider) {
+            scm.setInitializationOptions({
+                preserveExistingLocalFiles: options?.preserveExistingLocalFiles,
+            });
+        }
         // insert into global state
         if (newSCM) {
             this.vfs.setProjectSCMPersist(scm.scmKey, {
@@ -285,7 +310,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
                 if (options?.replaceExistingLabel) {
                     this.removeSCMsByLabel(options.replaceExistingLabel);
                 }
-                const scm = await this.createSCM(scmProto, baseUri, true);
+                const scm = await this.createSCM(scmProto, baseUri, true, true, options);
                 if (scm) {
                     vscode.window.showInformationMessage( vscode.l10n.t('"{scm}" created: {uri}.', {scm:scmProto.label, uri: decodeURI(scm.baseUri.toString()) }) );
                     return scm;
@@ -346,7 +371,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
     }
 
     private async ensureLocalReplicaSCM(baseUri: vscode.Uri) {
-        return this.createSCM(LocalReplicaSCMProvider, baseUri, true, true);
+        return this.createSCM(LocalReplicaSCMProvider, baseUri, true, true, {
+            preserveExistingLocalFiles: true,
+        });
     }
 
     showSCMConfiguration() {

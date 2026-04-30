@@ -53,6 +53,10 @@ function maybeWarnSyncFailure(relPath: string, error: unknown) {
 
 type FileCache = {date:number, hash:number};
 
+interface InitializeLocalReplicaOptions {
+    preserveExistingLocalFiles?: boolean;
+}
+
 /**
  * Returns a hash code from a string
  * @param  {String} str The string to hash.
@@ -92,6 +96,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     };
     private vfsWatcher?: vscode.FileSystemWatcher;
     private localWatcher?: vscode.FileSystemWatcher;
+    private initializationOptions: InitializeLocalReplicaOptions = {};
     private ignorePatterns: string[] = [
         '**/.*',
         '**/.*/**',
@@ -149,6 +154,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         } catch {
             return false;
         }
+    }
+
+    public setInitializationOptions(options?: InitializeLocalReplicaOptions) {
+        this.initializationOptions = {
+            ...this.initializationOptions,
+            ...options,
+        };
+        return this;
     }
 
     private get settingsUri(): vscode.Uri {
@@ -351,12 +364,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return next;
     }
 
-    private async overwrite(root: string='/'): Promise<boolean|undefined> {
+    private async overwrite(root: string='/', options: InitializeLocalReplicaOptions = {}): Promise<boolean|undefined> {
         return await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: vscode.l10n.t('Sync Files'),
             cancellable: true,
         }, async (progress, token) => {
+            const preserveExistingLocalFiles = options.preserveExistingLocalFiles ?? false;
             // breadth-first search for the files
             const files: [string,string][] = [];
             const queue: string[] = [root];
@@ -400,11 +414,28 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 //
                 const baseContent = this.baseCache[relPath];
                 const localContent = await this.readFile(relPath);
-                const remoteContent = await this.withFileSystemContext(
-                    'Read remote file',
-                    vfsUri,
-                    () => vscode.workspace.fs.readFile(vfsUri),
-                );
+                if (preserveExistingLocalFiles && localContent!==undefined) {
+                    this.baseCache[relPath] = localContent;
+                    this.setBypassCache(relPath, localContent);
+                    continue;
+                }
+
+                let remoteContent: Uint8Array;
+                try {
+                    remoteContent = await this.withFileSystemContext(
+                        'Read remote file',
+                        vfsUri,
+                        () => vscode.workspace.fs.readFile(vfsUri),
+                    );
+                } catch (error) {
+                    if (preserveExistingLocalFiles) {
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [initial pull skipped] ${relPath}: ${formatUnknownError(error)}`,
+                        );
+                        continue;
+                    }
+                    throw error;
+                }
                 if (baseContent===undefined || localContent===undefined) {
                     this.setBypassCache(relPath, remoteContent);
                     await this.writeFile(relPath, remoteContent);
@@ -604,9 +635,33 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         await this.enqueueSync(relPath, () => this.applySync('push', type, relPath, localUri, vfsUri));
     }
 
-    public async initializeLocalReplica() {
+    public async initializeLocalReplica(options?: InitializeLocalReplicaOptions) {
+        const initializationOptions = {
+            ...this.initializationOptions,
+            ...options,
+        };
         await this.ensureLocalReplicaSettings();
-        await this.overwrite();
+        try {
+            await this.overwrite('/', initializationOptions);
+        } catch (error) {
+            this.status = {
+                status: 'need-attention',
+                message: vscode.l10n.t('initial pull failed'),
+            };
+            const message = formatUnknownError(error);
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [initial pull failed] ${message}`,
+            );
+            vscode.window.showWarningMessage(
+                vscode.l10n.t(
+                    'Local Replica is attached, but the initial remote pull failed: {message}',
+                    {message},
+                ),
+                vscode.l10n.t('Show Output'),
+            ).then((choice) => {
+                if (choice==='Show Output') { getOutputChannel().show(true); }
+            });
+        }
     }
 
     private async initWatch() {

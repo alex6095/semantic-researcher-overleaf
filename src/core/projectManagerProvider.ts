@@ -718,7 +718,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     openProjectInCurrentWindow(project: ProjectItem) {
         const uri = vscode.Uri.parse(project.uri);
-        vscode.commands.executeCommand(PREFETCH_COMMAND, uri)
+        return vscode.commands.executeCommand(PREFETCH_COMMAND, uri)
         .then(() => {
             vscode.commands.executeCommand('vscode.openFolder', uri, false);
             vscode.commands.executeCommand('workbench.view.explorer');
@@ -727,7 +727,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     openProjectInNewWindow(project: ProjectItem) {
         const uri = vscode.Uri.parse(project.uri);
-        vscode.commands.executeCommand(PREFETCH_COMMAND, uri)
+        return vscode.commands.executeCommand(PREFETCH_COMMAND, uri)
         .then(() => {
             vscode.commands.executeCommand('vscode.openFolder', uri, true);
             vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
@@ -835,6 +835,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             {
                 exactBaseUri: true,
                 replaceExistingLabel: LocalReplicaSCMProvider.label,
+                preserveExistingLocalFiles: true,
             },
         ) as LocalReplicaSCMProvider | undefined;
 
@@ -943,16 +944,16 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             }),
             // register open project commands
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectInCurrentWindow`, (item) => {
-                this.openProjectInCurrentWindow(item);
+                return this.openProjectInCurrentWindow(item);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectInNewWindow`, (item) => {
-                this.openProjectInNewWindow(item);
+                return this.openProjectInNewWindow(item);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectLocalReplica`, (item) => {
-                this.openProjectLocalReplica(item);
+                return this.openProjectLocalReplica(item);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.selectProjectFolderLocalReplica`, (item) => {
-                this.selectProjectFolderLocalReplica(item);
+                return this.selectProjectFolderLocalReplica(item);
             }),
         ];
     }
