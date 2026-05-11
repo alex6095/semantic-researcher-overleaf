@@ -548,8 +548,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (state==='connected') { settle(true); }
                 else if (state==='disconnected') { settle(false); }
             });
-            // Re-check after subscribing to close the listener-installation gap.
+            // Re-check after subscribing to close the listener-installation
+            // gap in both directions: a transition to 'connected' OR
+            // 'disconnected' between our initial check and the .event()
+            // subscription would otherwise stick us on the 5s timeout.
             if (this.vfs.connectionState==='connected') { settle(true); }
+            else if (this.vfs.connectionState==='disconnected') { settle(false); }
         });
     }
 
