@@ -931,6 +931,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             );
         }
 
+        // Auto-recover on reconnect: a transient socket drop that left files
+        // in failedInitialPulls is the typical case, and the connection is now
+        // available again. Try once per (re)connect.
+        const connSub = this.vfs.onDidChangeConnection(state => {
+            if (state==='connected' && this.failedInitialPulls.size>0) {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [pull retry on reconnect] ${this.failedInitialPulls.size} files`,
+                );
+                void this.retryFailedInitialPulls();
+            }
+        });
+        disposables.push(connSub);
+
         // Dispose-sentinel for the dynamic list so trigger teardown cleans up.
         disposables.push({
             dispose: () => {
