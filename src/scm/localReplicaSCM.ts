@@ -72,6 +72,15 @@ function contentDigest(content?: Uint8Array): string {
     return crypto.createHash('sha1').update(content).digest('hex');
 }
 
+function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
+    if (a === b) { return true; }
+    if (a.length !== b.length) { return false; }
+    for (let i = 0; i < a.length; i++) {
+        if (a[i] !== b[i]) { return false; }
+    }
+    return true;
+}
+
 /**
  * A SCM which tracks exact the changes from the vfs.
  * It keeps no history versions.
@@ -709,6 +718,24 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         const newContent = action==='pull'
                             ? await this.pullRemoteFile(relPath, fromUri)
                             : await vscode.workspace.fs.readFile(fromUri);
+                        // Content-equality short-circuit for pull. The bypass
+                        // cache already suppresses this case via its sha1
+                        // digest, but doing the explicit byte compare here
+                        // (a) keeps the optimisation honest if the bypass
+                        // cache is ever evicted/cleared, (b) lets us avoid
+                        // the agentReview hooks entirely when nothing
+                        // changed, and (c) emits a forensic [pull noop] log
+                        // line that makes "VFS is noisy but content is
+                        // stable" diagnosable.
+                        if (action==='pull') {
+                            const existing = this.baseCache[relPath];
+                            if (existing && bytesEqual(existing, newContent)) {
+                                getOutputChannel().appendLine(
+                                    `${new Date().toISOString()} [pull noop] ${relPath} (${newContent.length} bytes, content unchanged)`,
+                                );
+                                return;
+                            }
+                        }
                         if (this.bypassSync(action, type, relPath, newContent)) { return; }
                         const pushChange = action==='push' ? {
                             rootUri: this.baseUri,
