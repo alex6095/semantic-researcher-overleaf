@@ -87,6 +87,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // relPath that isn't in here AND isn't in baseCache is treated as an echo,
     // not a user-driven delete, and is refused in the delete-guard layer.
     private seenLocalEntities: Set<string> = new Set();
+    // Files whose initial pull failed even after Layer 1 retries. These are
+    // present on the remote but never landed locally, so a watcher event for
+    // them must NEVER propagate to the remote. Cleared by retryFailedInitialPulls
+    // or by ignoreFailedInitialPulls.
+    private failedInitialPulls: Set<string> = new Set();
+    private initialPullStatus: 'pending' | 'complete' | 'partial' = 'pending';
+    private partialPullToastShown = false;
     private syncQueues: Map<string, Promise<void>> = new Map();
     private localReplicaSettings?: {
         uri: string,
@@ -425,19 +432,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
                 let remoteContent: Uint8Array;
                 try {
-                    remoteContent = await this.withFileSystemContext(
-                        'Read remote file',
-                        vfsUri,
-                        () => vscode.workspace.fs.readFile(vfsUri),
-                    );
+                    remoteContent = await this.pullRemoteFile(relPath, vfsUri);
                 } catch (error) {
-                    if (preserveExistingLocalFiles) {
-                        getOutputChannel().appendLine(
-                            `${new Date().toISOString()} [initial pull skipped] ${relPath}: ${formatUnknownError(error)}`,
-                        );
-                        continue;
-                    }
-                    throw error;
+                    // Even after Layer 1 retries the read failed. Record the
+                    // failed path so the rest of the system refuses to act on
+                    // any local event for it (the delete-guard layers and the
+                    // deferred-local-watcher layer key off this set), then
+                    // continue the BFS so other files still get pulled.
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [initial pull failed] ${relPath}: ${formatUnknownError(error)}`,
+                    );
+                    this.failedInitialPulls.add(relPath);
+                    continue;
                 }
                 if (baseContent===undefined || localContent===undefined) {
                     this.setBypassCache(relPath, remoteContent);
@@ -532,6 +538,38 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }, { reconnect: true, reconnectReason: `retry push for ${relPath}` });
     }
 
+    // Pull binary files with a wider backoff. Binary VFS reads occasionally
+    // return Unknown / zero bytes during socket reconnects; surface those as
+    // failures the outer code can retry rather than silently writing empty
+    // files into the replica.
+    private static readonly PULL_RETRY_DELAYS = [0, 300, 900, 2400];
+
+    private isLikelyBinaryRelPath(relPath: string): boolean {
+        return /\.(pdf|png|jpe?g|gif|svg|webp|bmp|tiff?|eps|ps|zip|tar|gz|bz2|7z|rar|mp[34]|wav|ogg|woff2?|ttf|otf|ico)$/i.test(relPath);
+    }
+
+    private async pullRemoteFile(relPath: string, vfsUri: vscode.Uri): Promise<Uint8Array> {
+        return this.withRetry('pull', relPath, async () => {
+            const content = await this.withFileSystemContext(
+                'Read remote file',
+                vfsUri,
+                () => vscode.workspace.fs.readFile(vfsUri),
+            );
+            // A 0-byte payload for a binary is almost certainly a transient
+            // failure rather than a genuinely empty file (no real PDF/PNG is
+            // 0 bytes). Throw so the retry loop tries again; if all attempts
+            // come back empty we let the caller decide what to do.
+            if (this.isLikelyBinaryRelPath(relPath) && content.length===0) {
+                throw new Error(`empty binary payload for ${relPath}`);
+            }
+            return content;
+        }, {
+            delays: LocalReplicaSCMProvider.PULL_RETRY_DELAYS,
+            reconnect: true,
+            reconnectReason: `retry pull for ${relPath}`,
+        });
+    }
+
     private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
         this.status = {status: action, message: `${type}: ${relPath}`};
 
@@ -570,7 +608,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 }
                 else if (stat.type===vscode.FileType.File) {
                     try {
-                        const newContent = await vscode.workspace.fs.readFile(fromUri);
+                        // Pull reads go through the retrying helper since
+                        // transient binary failures are the trigger for the
+                        // whole cascade we are guarding against. Push reads
+                        // are local-disk and need no retry.
+                        const newContent = action==='pull'
+                            ? await this.pullRemoteFile(relPath, fromUri)
+                            : await vscode.workspace.fs.readFile(fromUri);
                         if (this.bypassSync(action, type, relPath, newContent)) { return; }
                         const pushChange = action==='push' ? {
                             rootUri: this.baseUri,
@@ -665,9 +709,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             ...options,
         };
         await this.ensureLocalReplicaSettings();
+        this.initialPullStatus = 'pending';
+        // Per-file failures accumulate in failedInitialPulls; reset before each
+        // attempt so a fresh init starts from a clean slate.
+        this.failedInitialPulls.clear();
         try {
             await this.overwrite('/', initializationOptions);
         } catch (error) {
+            this.initialPullStatus = 'partial';
             this.status = {
                 status: 'need-attention',
                 message: vscode.l10n.t('initial pull failed'),
@@ -685,7 +734,101 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             ).then((choice) => {
                 if (choice==='Show Output') { getOutputChannel().show(true); }
             });
+            return;
         }
+        if (this.failedInitialPulls.size>0) {
+            this.initialPullStatus = 'partial';
+            this.status = {
+                status: 'need-attention',
+                message: vscode.l10n.t('{count} files failed to download', {count: this.failedInitialPulls.size}),
+            };
+            this.surfacePartialPullToast();
+        } else {
+            this.initialPullStatus = 'complete';
+            this.partialPullToastShown = false;
+        }
+    }
+
+    private surfacePartialPullToast() {
+        if (this.partialPullToastShown) { return; }
+        this.partialPullToastShown = true;
+        const count = this.failedInitialPulls.size;
+        const retry = vscode.l10n.t('Retry Pull');
+        const ignore = vscode.l10n.t('Ignore These Files');
+        const showOutput = vscode.l10n.t('Show Output');
+        vscode.window.showWarningMessage(
+            vscode.l10n.t(
+                '{count} files failed to download from Overleaf. Local edits will NOT sync until you Retry Pull or Ignore These Files.',
+                {count},
+            ),
+            retry, ignore, showOutput,
+        ).then(async (choice) => {
+            if (choice===retry) {
+                this.partialPullToastShown = false;
+                await this.retryFailedInitialPulls();
+            } else if (choice===ignore) {
+                this.ignoreFailedInitialPulls();
+            } else if (choice===showOutput) {
+                this.partialPullToastShown = false;
+                getOutputChannel().show(true);
+            } else {
+                this.partialPullToastShown = false;
+            }
+        });
+    }
+
+    public async retryFailedInitialPulls(): Promise<{recovered: string[]; stillFailed: string[]}> {
+        const recovered: string[] = [];
+        const stillFailed: string[] = [];
+        const targets = [...this.failedInitialPulls];
+        for (const relPath of targets) {
+            const vfsUri = this.vfs.pathToUri(relPath);
+            try {
+                const content = await this.pullRemoteFile(relPath, vfsUri);
+                this.setBypassCache(relPath, content);
+                await this.writeFile(relPath, content);
+                this.baseCache[relPath] = content;
+                this.seenLocalEntities.add(relPath);
+                this.failedInitialPulls.delete(relPath);
+                recovered.push(relPath);
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [pull recovered] ${relPath} via retryFailedInitialPulls`,
+                );
+            } catch (error) {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [pull retry failed] ${relPath}: ${formatUnknownError(error)}`,
+                );
+                stillFailed.push(relPath);
+            }
+        }
+        if (this.failedInitialPulls.size===0) {
+            this.initialPullStatus = 'complete';
+            this.status = {status: 'idle', message: ''};
+            this.partialPullToastShown = false;
+        } else {
+            this.status = {
+                status: 'need-attention',
+                message: vscode.l10n.t('{count} files failed to download', {count: this.failedInitialPulls.size}),
+            };
+        }
+        return {recovered, stillFailed};
+    }
+
+    public ignoreFailedInitialPulls() {
+        if (this.failedInitialPulls.size===0) { return; }
+        const ignorePatterns = (this.getSetting<string[]>(IGNORE_SETTING_KEY) || [...this.ignorePatterns]).slice();
+        for (const relPath of this.failedInitialPulls) {
+            // Exact path patterns; minimatch with dot:true treats these as literal.
+            if (!ignorePatterns.includes(relPath)) { ignorePatterns.push(relPath); }
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [failed pull ignored] ${relPath}`,
+            );
+        }
+        this.setSetting(IGNORE_SETTING_KEY, ignorePatterns);
+        this.failedInitialPulls.clear();
+        this.initialPullStatus = 'complete';
+        this.status = {status: 'idle', message: ''};
+        this.partialPullToastShown = false;
     }
 
     private async initWatch() {
