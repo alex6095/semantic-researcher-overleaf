@@ -103,6 +103,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     };
     private vfsWatcher?: vscode.FileSystemWatcher;
     private localWatcher?: vscode.FileSystemWatcher;
+    // Lazily-armable trigger for the local-watcher subscriptions. When the
+    // initial pull is partial we never invoke this, so the push direction is
+    // physically impossible until retryFailedInitialPulls / ignoreFailedInitialPulls
+    // recovers cleanly.
+    private armLocalWatcher?: () => void;
+    private dynamicLocalDisposables: vscode.Disposable[] = [];
     private initializationOptions: InitializeLocalReplicaOptions = {};
     private ignorePatterns: string[] = [
         '**/.*',
@@ -850,6 +856,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.initialPullStatus = 'complete';
             this.status = {status: 'idle', message: ''};
             this.partialPullToastShown = false;
+            // Initial pull is now complete — arm the local watcher if it was
+            // deferred. This is the unique recovery edge that flips us from
+            // 'partial' to 'complete' at runtime.
+            this.armLocalWatcher?.();
         } else {
             this.status = {
                 status: 'need-attention',
@@ -874,27 +884,64 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.initialPullStatus = 'complete';
         this.status = {status: 'idle', message: ''};
         this.partialPullToastShown = false;
+        // User opted in: the failed paths are now ignored, so it is safe to
+        // arm the local watcher for the rest of the project.
+        this.armLocalWatcher?.();
     }
 
-    private async initWatch() {
+    private async initWatch(): Promise<vscode.Disposable[]> {
         await this.initializeLocalReplica();
         this.vfsWatcher = vscode.workspace.createFileSystemWatcher(
             new vscode.RelativePattern( this.vfs.origin, '**/*' )
         );
-        this.localWatcher = vscode.workspace.createFileSystemWatcher(
-            new vscode.RelativePattern( this.baseUri.path, '**/*' )
-        );
 
-        return [
-            // sync from vfs to local
+        const disposables: vscode.Disposable[] = [
+            // sync from vfs to local (always armed — pull-delete is gated by Layer 3)
             this.vfsWatcher.onDidChange(async uri => await this.syncFromVFS(uri, 'update')),
             this.vfsWatcher.onDidCreate(async uri => await this.syncFromVFS(uri, 'update')),
             this.vfsWatcher.onDidDelete(async uri => await this.syncFromVFS(uri, 'delete')),
-            // sync from local to vfs
-            this.localWatcher.onDidChange(async uri => await this.syncToVFS(uri, 'update')),
-            this.localWatcher.onDidCreate(async uri => await this.syncToVFS(uri, 'update')),
-            this.localWatcher.onDidDelete(async uri => await this.syncToVFS(uri, 'delete')),
         ];
+
+        // The local watcher is the dangerous direction (local→remote). Defer
+        // its creation until the initial pull is fully complete; while pull is
+        // partial there is literally no listener to fire syncToVFS, so a stray
+        // local FS event can never be translated into a remote mutation.
+        this.armLocalWatcher = () => {
+            if (this.localWatcher) { return; }
+            this.localWatcher = vscode.workspace.createFileSystemWatcher(
+                new vscode.RelativePattern( this.baseUri.path, '**/*' )
+            );
+            this.dynamicLocalDisposables.push(
+                this.localWatcher,
+                this.localWatcher.onDidChange(async uri => await this.syncToVFS(uri, 'update')),
+                this.localWatcher.onDidCreate(async uri => await this.syncToVFS(uri, 'update')),
+                this.localWatcher.onDidDelete(async uri => await this.syncToVFS(uri, 'delete')),
+            );
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [localWatcher armed]`,
+            );
+        };
+
+        if (this.initialPullStatus==='complete') {
+            this.armLocalWatcher();
+        } else {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [localWatcher deferred] initialPullStatus=${this.initialPullStatus}; ` +
+                `${this.failedInitialPulls.size} files pending. Local edits will NOT push until retry/ignore.`,
+            );
+        }
+
+        // Dispose-sentinel for the dynamic list so trigger teardown cleans up.
+        disposables.push({
+            dispose: () => {
+                for (const d of this.dynamicLocalDisposables) { d.dispose(); }
+                this.dynamicLocalDisposables = [];
+                this.localWatcher = undefined;
+                this.armLocalWatcher = undefined;
+            },
+        });
+
+        return disposables;
     }
 
     private localUri(relPath: string): vscode.Uri {
@@ -948,15 +995,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     get triggers(): Promise<vscode.Disposable[]> {
         return this.initWatch().then((watches) => {
-            if (this.vfsWatcher!==undefined && this.localWatcher!==undefined) {
-                return [
-                    this.vfsWatcher,
-                    this.localWatcher,
-                    ...watches,
-                ];
-            } else {
+            if (this.vfsWatcher===undefined) {
+                // initWatch should always create the vfsWatcher; if not, bail.
                 return [];
             }
+            return [this.vfsWatcher, ...watches];
         });
     }
 
