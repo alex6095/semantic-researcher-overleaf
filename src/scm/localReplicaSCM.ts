@@ -83,6 +83,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private bypassCache: Map<string, [FileCache,FileCache]> = new Map();
     private baseCache: {[key:string]: Uint8Array} = {};
+    // Files we have written locally at least once. A push-delete arriving for a
+    // relPath that isn't in here AND isn't in baseCache is treated as an echo,
+    // not a user-driven delete, and is refused in the delete-guard layer.
+    private seenLocalEntities: Set<string> = new Set();
     private syncQueues: Map<string, Promise<void>> = new Map();
     private localReplicaSettings?: {
         uri: string,
@@ -414,6 +418,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 const localContent = await this.readFile(relPath);
                 if (preserveExistingLocalFiles && localContent!==undefined) {
                     this.baseCache[relPath] = localContent;
+                    this.seenLocalEntities.add(relPath);
                     this.setBypassCache(relPath, localContent);
                     continue;
                 }
@@ -437,6 +442,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (baseContent===undefined || localContent===undefined) {
                     this.setBypassCache(relPath, remoteContent);
                     await this.writeFile(relPath, remoteContent);
+                    this.baseCache[relPath] = remoteContent;
+                    this.seenLocalEntities.add(relPath);
                 } else {
                     const dmp = new DiffMatchPatch();
                     const baseContentStr = new TextDecoder().decode(baseContent);
@@ -449,6 +456,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     // write the merged content to local
                     const mergedContent = new TextEncoder().encode(mergedContentStr);
                     await this.writeFile(relPath, mergedContent);
+                    this.baseCache[relPath] = mergedContent;
+                    this.seenLocalEntities.add(relPath);
                     // write the merged content to remote
                     if (localPatches.length!==0) {
                         await this.withFileSystemContext(
@@ -541,6 +550,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     if (decision?.kind==='block') { return; }
                 }
                 delete this.baseCache[relPath];
+                this.seenLocalEntities.delete(relPath);
                 await vscode.workspace.fs.delete(toUri, {recursive:true});
                 if (action==='push') {
                     await getAgentReviewManager()?.afterLocalReplicaPush({
@@ -581,6 +591,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             await vscode.workspace.fs.writeFile(toUri, newContent);
                         }
                         this.baseCache[relPath] = newContent;
+                        this.seenLocalEntities.add(relPath);
                         if (action==='push') {
                             try {
                                 await vscode.workspace.fs.readFile(toUri); // update remote cache
