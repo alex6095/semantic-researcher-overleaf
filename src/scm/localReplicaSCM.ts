@@ -480,29 +480,35 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return false;
     }
 
-    // Up to 3 attempts with short backoff so a stale or reconnecting socket
-    // doesn't drop the edit silently. The error surfacing happens in the
-    // outer catch if every attempt fails.
-    private async pushWithRetry(relPath: string, toUri: vscode.Uri, content: Uint8Array) {
-        const delays = [0, 200, 700];
+    // Generic bounded-retry helper. Used by both push and pull paths so a stale
+    // or reconnecting socket doesn't drop an operation silently. Errors are
+    // surfaced in the caller's outer catch only if every attempt fails.
+    private async withRetry<T>(
+        label: 'push' | 'pull',
+        relPath: string,
+        task: () => Promise<T>,
+        opts?: { delays?: number[]; reconnect?: boolean; reconnectReason?: string },
+    ): Promise<T> {
+        const delays = opts?.delays ?? [0, 200, 700];
+        const reconnect = opts?.reconnect ?? false;
+        const reconnectReason = opts?.reconnectReason ?? `retry ${label} for ${relPath}`;
         let lastError: unknown;
         for (let attempt = 0; attempt<delays.length; attempt++) {
             const delay = delays[attempt];
             if (delay>0) { await new Promise(resolve => setTimeout(resolve, delay)); }
             try {
-                await this.vfs.ensureConnectedForWrite();
-                await vscode.workspace.fs.writeFile(toUri, content);
+                const result = await task();
                 if (lastError) {
                     getOutputChannel().appendLine(
-                        `${new Date().toISOString()} [push recovered] ${relPath} after retry`,
+                        `${new Date().toISOString()} [${label} recovered] ${relPath} after retry`,
                     );
                 }
-                return;
+                return result;
             } catch (error) {
                 lastError = error;
-                if (attempt<delays.length-1) {
+                if (attempt<delays.length-1 && reconnect) {
                     try {
-                        await this.vfs.reconnect(`retry push for ${relPath}`);
+                        await this.vfs.reconnect(reconnectReason);
                     } catch (reconnectError) {
                         lastError = reconnectError;
                     }
@@ -510,6 +516,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
         }
         throw lastError instanceof Error ? lastError : new Error(String(lastError));
+    }
+
+    private async pushWithRetry(relPath: string, toUri: vscode.Uri, content: Uint8Array) {
+        return this.withRetry('push', relPath, async () => {
+            await this.vfs.ensureConnectedForWrite();
+            await vscode.workspace.fs.writeFile(toUri, content);
+        }, { reconnect: true, reconnectReason: `retry push for ${relPath}` });
     }
 
     private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
