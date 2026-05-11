@@ -57,6 +57,13 @@ type FileCache = {date:number, hash:string};
 
 const DELETE_DIGEST = '\0';
 
+interface PendingEvent {
+    timer: ReturnType<typeof setTimeout>;
+    firstEventAt: number;
+    latestType: 'update' | 'delete';
+    latestUri: vscode.Uri;
+}
+
 interface InitializeLocalReplicaOptions {
     preserveExistingLocalFiles?: boolean;
 }
@@ -118,6 +125,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // recovers cleanly.
     private armLocalWatcher?: () => void;
     private dynamicLocalDisposables: vscode.Disposable[] = [];
+    // Per-path event coalescers. The VFS fires Change events for every
+    // compile-cycle touch (often 4× the same .tex file in a 30s span with
+    // identical content). Debouncing per-path collapses these into a single
+    // applySync call; MAX_WAIT_MS caps the worst case so a continuous stream
+    // can't starve the path indefinitely.
+    private pendingVfsEvents: Map<string, PendingEvent> = new Map();
+    private pendingLocalEvents: Map<string, PendingEvent> = new Map();
+    private static readonly EVENT_COALESCE_MS = 250;
+    private static readonly EVENT_MAX_WAIT_MS = 2000;
     private initializationOptions: InitializeLocalReplicaOptions = {};
     private ignorePatterns: string[] = [
         '**/.*',
@@ -799,7 +815,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.status = {status: 'idle', message: ''};
     }
 
-    private async syncFromVFS(vfsUri: vscode.Uri, type: 'update'|'delete') {
+    // Compute the debounce delay for the next firing of a path's pending
+    // event. Returns the smaller of EVENT_COALESCE_MS and the remaining
+    // budget under EVENT_MAX_WAIT_MS, clamped to 0. Returning 0 means "fire
+    // on the next tick" — the queueing through setTimeout(_, 0) is still
+    // serialised against further inflight events for the same path because
+    // the `pending` map entry is the source of truth.
+    private computeDebounceDelay(firstEventAt: number): number {
+        const elapsed = Date.now() - firstEventAt;
+        const remainingBudget = LocalReplicaSCMProvider.EVENT_MAX_WAIT_MS - elapsed;
+        return Math.max(0, Math.min(LocalReplicaSCMProvider.EVENT_COALESCE_MS, remainingBudget));
+    }
+
+    private syncFromVFS(vfsUri: vscode.Uri, type: 'update'|'delete') {
         const {pathParts} = parseUri(vfsUri);
         pathParts.at(-1)==='' && pathParts.pop(); // remove the last empty string
         const relPath = normalizeReplicaPath('/' + pathParts.join('/'));
@@ -809,8 +837,23 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // bypassSync check rejects them — wasting socket traffic and adding
         // retry/reconnect pressure during compile cycles.
         if (this.matchIgnorePatterns(relPath)) { return; }
-        const localUri = this.localUri(relPath);
-        await this.enqueueSync(relPath, () => this.applySync('pull', type, relPath, vfsUri, localUri));
+
+        // Coalesce rapid-fire VFS events for the same path. Overleaf's VFS
+        // fires Change events for every compile touch even when bytes are
+        // unchanged; without debouncing we readFile the same file 3-4 times
+        // per second during a compile cycle.
+        const existing = this.pendingVfsEvents.get(relPath);
+        if (existing) { clearTimeout(existing.timer); }
+        const firstEventAt = existing?.firstEventAt ?? Date.now();
+        const delay = this.computeDebounceDelay(firstEventAt);
+        const timer = setTimeout(() => {
+            const pending = this.pendingVfsEvents.get(relPath);
+            if (!pending) { return; } // disposed or already drained
+            this.pendingVfsEvents.delete(relPath);
+            const localUri = this.localUri(relPath);
+            void this.enqueueSync(relPath, () => this.applySync('pull', pending.latestType, relPath, pending.latestUri, localUri));
+        }, delay);
+        this.pendingVfsEvents.set(relPath, { timer, firstEventAt, latestType: type, latestUri: vfsUri });
     }
 
     private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete') {
@@ -829,8 +872,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // Same early-ignore short-circuit as syncFromVFS — no point enqueueing
         // work that bypassSync would reject anyway.
         if (this.matchIgnorePatterns(relPath)) { return; }
-        const vfsUri = this.vfs.pathToUri(relPath);
-        await this.enqueueSync(relPath, () => this.applySync('push', type, relPath, localUri, vfsUri));
+
+        // Debounce local watcher events too. Editors save by write-temp+
+        // rename which can fire Change+Create+Change for the same file in
+        // milliseconds; coalescing means one applySync per intent.
+        const existing = this.pendingLocalEvents.get(relPath);
+        if (existing) { clearTimeout(existing.timer); }
+        const firstEventAt = existing?.firstEventAt ?? Date.now();
+        const delay = this.computeDebounceDelay(firstEventAt);
+        const timer = setTimeout(() => {
+            const pending = this.pendingLocalEvents.get(relPath);
+            if (!pending) { return; }
+            this.pendingLocalEvents.delete(relPath);
+            const vfsUri = this.vfs.pathToUri(relPath);
+            void this.enqueueSync(relPath, () => this.applySync('push', pending.latestType, relPath, pending.latestUri, vfsUri));
+        }, delay);
+        this.pendingLocalEvents.set(relPath, { timer, firstEventAt, latestType: type, latestUri: localUri });
     }
 
     public async initializeLocalReplica(options?: InitializeLocalReplicaOptions) {
@@ -976,9 +1033,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
         const disposables: vscode.Disposable[] = [
             // sync from vfs to local (always armed — pull-delete is gated by Layer 3)
-            this.vfsWatcher.onDidChange(async uri => await this.syncFromVFS(uri, 'update')),
-            this.vfsWatcher.onDidCreate(async uri => await this.syncFromVFS(uri, 'update')),
-            this.vfsWatcher.onDidDelete(async uri => await this.syncFromVFS(uri, 'delete')),
+            // Synchronous handlers — syncFromVFS now schedules a debounce
+            // timer rather than awaiting the full applySync chain.
+            this.vfsWatcher.onDidChange(uri => this.syncFromVFS(uri, 'update')),
+            this.vfsWatcher.onDidCreate(uri => this.syncFromVFS(uri, 'update')),
+            this.vfsWatcher.onDidDelete(uri => this.syncFromVFS(uri, 'delete')),
         ];
 
         // The local watcher is the dangerous direction (local→remote). Defer
@@ -992,9 +1051,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             );
             this.dynamicLocalDisposables.push(
                 this.localWatcher,
-                this.localWatcher.onDidChange(async uri => await this.syncToVFS(uri, 'update')),
-                this.localWatcher.onDidCreate(async uri => await this.syncToVFS(uri, 'update')),
-                this.localWatcher.onDidDelete(async uri => await this.syncToVFS(uri, 'delete')),
+                this.localWatcher.onDidChange(uri => { void this.syncToVFS(uri, 'update'); }),
+                this.localWatcher.onDidCreate(uri => { void this.syncToVFS(uri, 'update'); }),
+                this.localWatcher.onDidDelete(uri => { void this.syncToVFS(uri, 'delete'); }),
             );
             getOutputChannel().appendLine(
                 `${new Date().toISOString()} [localWatcher armed]`,
@@ -1024,12 +1083,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         disposables.push(connSub);
 
         // Dispose-sentinel for the dynamic list so trigger teardown cleans up.
+        // Also drops any pending debounce timers — without this a fire-after-
+        // dispose would call applySync against a torn-down SCM. The map
+        // .get() check inside the timer callback handles in-flight timers
+        // that fire between clearTimeout and our Map.clear() (the entry is
+        // gone, so the callback bails).
         disposables.push({
             dispose: () => {
                 for (const d of this.dynamicLocalDisposables) { d.dispose(); }
                 this.dynamicLocalDisposables = [];
                 this.localWatcher = undefined;
                 this.armLocalWatcher = undefined;
+                for (const pending of this.pendingVfsEvents.values()) { clearTimeout(pending.timer); }
+                this.pendingVfsEvents.clear();
+                for (const pending of this.pendingLocalEvents.values()) { clearTimeout(pending.timer); }
+                this.pendingLocalEvents.clear();
             },
         });
 
