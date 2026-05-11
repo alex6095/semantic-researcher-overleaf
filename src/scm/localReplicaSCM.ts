@@ -576,6 +576,51 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         await (async () => {
             if (type==='delete') {
                 const newContent = undefined;
+
+                // Layer 3 — suppress a pull-delete for a path we never
+                // authoritatively replicated. The cascade starts here: a VFS
+                // Deleted event for a file that wasn't pulled locally would
+                // otherwise call workspace.fs.delete(localUri), which fires
+                // the local watcher and echoes back as a remote delete. We
+                // refuse to act on it and seed the bypass cache so any
+                // spurious echo gets suppressed too.
+                if (action==='pull') {
+                    const localExists = await LocalReplicaSCMProvider.pathExists(toUri);
+                    const everReplicated = relPath in this.baseCache;
+                    if (!localExists || !everReplicated || this.failedInitialPulls.has(relPath)) {
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [pull delete suppressed] ${relPath}: ` +
+                            `localExists=${localExists} everReplicated=${everReplicated} ` +
+                            `failedInitialPull=${this.failedInitialPulls.has(relPath)}`,
+                        );
+                        this.setBypassCache(relPath, undefined);
+                        this.failedInitialPulls.delete(relPath);
+                        return;
+                    }
+                }
+
+                // Layer 4 — refuse a push-delete without local-write
+                // provenance. If we never wrote this file locally (no entry in
+                // baseCache and no seenLocalEntities trace), the local-watcher
+                // event is an echo, not user intent.
+                if (action==='push') {
+                    if (this.failedInitialPulls.has(relPath)) {
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [push delete blocked] ${relPath}: initial pull failed; refusing to mutate remote`,
+                        );
+                        maybeWarnSyncFailure(relPath, new Error(
+                            'Remote delete blocked: initial pull failed for this file. Use "Retry Pull" before deleting.',
+                        ));
+                        return;
+                    }
+                    if (!this.seenLocalEntities.has(relPath) && !(relPath in this.baseCache)) {
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [push delete blocked] ${relPath}: no local-write trace; treating as echo`,
+                        );
+                        return;
+                    }
+                }
+
                 if (this.bypassSync(action, type, relPath, newContent)) { return; }
                 if (action==='push') {
                     const decision = await getAgentReviewManager()?.beforeLocalReplicaPush({
