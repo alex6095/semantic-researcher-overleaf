@@ -499,18 +499,48 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return false;
     }
 
+    // Wait until the VFS is back to 'connected', or give up after a timeout.
+    // Used between pull-retry attempts INSTEAD of forcing a reconnect:
+    // forcing a reconnect from every per-file retry causes a storm because
+    // VirtualFileSystem.reconnect() clears the entire project state on each
+    // call. Multiple parallel pulls each calling reconnect cascade-destroy
+    // each other's init. Awaiting the existing connection-state machine is
+    // race-free (we re-check after subscribing).
+    private async waitForConnectedOrTimeout(timeoutMs: number): Promise<boolean> {
+        if (this.vfs.connectionState==='connected') { return true; }
+        if (this.vfs.connectionState==='disconnected') { return false; }
+        return new Promise<boolean>(resolve => {
+            let settled = false;
+            const settle = (value: boolean) => {
+                if (settled) { return; }
+                settled = true;
+                clearTimeout(timer);
+                sub.dispose();
+                resolve(value);
+            };
+            const timer = setTimeout(() => settle(false), timeoutMs);
+            const sub = this.vfs.onDidChangeConnection(state => {
+                if (state==='connected') { settle(true); }
+                else if (state==='disconnected') { settle(false); }
+            });
+            // Re-check after subscribing to close the listener-installation gap.
+            if (this.vfs.connectionState==='connected') { settle(true); }
+        });
+    }
+
     // Generic bounded-retry helper. Used by both push and pull paths so a stale
-    // or reconnecting socket doesn't drop an operation silently. Errors are
-    // surfaced in the caller's outer catch only if every attempt fails.
+    // or reconnecting socket doesn't drop an operation silently. The optional
+    // `betweenAttempts` callback runs between failed attempts — push uses it
+    // to force a reconnect, pull uses it to passively await the existing
+    // connection state machine (no own reconnect — see waitForConnectedOrTimeout).
     private async withRetry<T>(
         label: 'push' | 'pull',
         relPath: string,
         task: () => Promise<T>,
-        opts?: { delays?: number[]; reconnect?: boolean; reconnectReason?: string },
+        opts?: { delays?: number[]; betweenAttempts?: () => Promise<void> },
     ): Promise<T> {
         const delays = opts?.delays ?? [0, 200, 700];
-        const reconnect = opts?.reconnect ?? false;
-        const reconnectReason = opts?.reconnectReason ?? `retry ${label} for ${relPath}`;
+        const betweenAttempts = opts?.betweenAttempts;
         let lastError: unknown;
         for (let attempt = 0; attempt<delays.length; attempt++) {
             const delay = delays[attempt];
@@ -525,11 +555,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 return result;
             } catch (error) {
                 lastError = error;
-                if (attempt<delays.length-1 && reconnect) {
+                if (attempt<delays.length-1 && betweenAttempts) {
                     try {
-                        await this.vfs.reconnect(reconnectReason);
-                    } catch (reconnectError) {
-                        lastError = reconnectError;
+                        await betweenAttempts();
+                    } catch (cbError) {
+                        lastError = cbError;
                     }
                 }
             }
@@ -541,7 +571,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return this.withRetry('push', relPath, async () => {
             await this.vfs.ensureConnectedForWrite();
             await vscode.workspace.fs.writeFile(toUri, content);
-        }, { reconnect: true, reconnectReason: `retry push for ${relPath}` });
+        }, {
+            // Push genuinely needs a fresh connection — if the socket is dead,
+            // there is nothing else that will repair it for us before the next
+            // attempt. ensureConnectedForWrite() is itself a no-op when
+            // already connected so this is not a forced re-init.
+            betweenAttempts: () => this.vfs.ensureConnectedForWrite(),
+        });
     }
 
     // Pull binary files with a wider backoff. Binary VFS reads occasionally
@@ -549,6 +585,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // failures the outer code can retry rather than silently writing empty
     // files into the replica.
     private static readonly PULL_RETRY_DELAYS = [0, 300, 900, 2400];
+    private static readonly PULL_RECONNECT_WAIT_MS = 5000;
 
     private isLikelyBinaryRelPath(relPath: string): boolean {
         return /\.(pdf|png|jpe?g|gif|svg|webp|bmp|tiff?|eps|ps|zip|tar|gz|bz2|7z|rar|mp[34]|wav|ogg|woff2?|ttf|otf|ico)$/i.test(relPath);
@@ -571,8 +608,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return content;
         }, {
             delays: LocalReplicaSCMProvider.PULL_RETRY_DELAYS,
-            reconnect: true,
-            reconnectReason: `retry pull for ${relPath}`,
+            // Critical: do NOT call vfs.reconnect() between attempts. Parallel
+            // pulls each issuing reconnect() cascade-clear the project state
+            // and produce a socket storm severe enough that Overleaf rate-limits
+            // us. Instead, wait passively for the existing reconnect cycle to
+            // resolve (it does on its own via the VFS's internal logic).
+            betweenAttempts: async () => {
+                await this.waitForConnectedOrTimeout(LocalReplicaSCMProvider.PULL_RECONNECT_WAIT_MS);
+            },
         });
     }
 
