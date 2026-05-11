@@ -776,6 +776,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const {pathParts} = parseUri(vfsUri);
         pathParts.at(-1)==='' && pathParts.pop(); // remove the last empty string
         const relPath = normalizeReplicaPath('/' + pathParts.join('/'));
+        // Early ignore-pattern short-circuit. Without this, ignored paths
+        // (compile artifacts under /.output/*, .aux, .log, etc.) still flow
+        // through enqueueSync + applySync's stat + readFile before the
+        // bypassSync check rejects them — wasting socket traffic and adding
+        // retry/reconnect pressure during compile cycles.
+        if (this.matchIgnorePatterns(relPath)) { return; }
         const localUri = this.localUri(relPath);
         await this.enqueueSync(relPath, () => this.applySync('pull', type, relPath, vfsUri, localUri));
     }
@@ -793,6 +799,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // shape that disagrees with the pull side and defeats the bypass cache.
         const basePath = this.baseUri.path.replace(/\/+$/, '');
         const relPath = normalizeReplicaPath(localUri.path.slice(basePath.length));
+        // Same early-ignore short-circuit as syncFromVFS — no point enqueueing
+        // work that bypassSync would reject anyway.
+        if (this.matchIgnorePatterns(relPath)) { return; }
         const vfsUri = this.vfs.pathToUri(relPath);
         await this.enqueueSync(relPath, () => this.applySync('push', type, relPath, localUri, vfsUri));
     }
