@@ -1,8 +1,10 @@
+import * as crypto from 'crypto';
 import * as vscode from 'vscode';
 import * as DiffMatchPatch from 'diff-match-patch';
 import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
+import { normalizeReplicaPath } from '../agentReview/types';
 import {
     getActiveReplicaRoot,
     isLocalReplicaMetadataUri,
@@ -51,29 +53,23 @@ function maybeWarnSyncFailure(relPath: string, error: unknown) {
     });
 }
 
-type FileCache = {date:number, hash:number};
+type FileCache = {date:number, hash:string};
+
+const DELETE_DIGEST = '\0';
 
 interface InitializeLocalReplicaOptions {
     preserveExistingLocalFiles?: boolean;
 }
 
-/**
- * Returns a hash code from a string
- * @param  {String} str The string to hash.
- * @return {Number}    A 32bit integer
- * @see http://werxltd.com/wp/2010/05/13/javascript-implementation-of-javas-string-hashcode-method/
- */
-function hashCode(content?: Uint8Array): number {
-    if (content===undefined) { return -1; }
-    const str = new TextDecoder().decode(content);
-
-    let hash = 0;
-    for (let i = 0, len = str.length; i < len; i++) {
-        const chr = str.charCodeAt(i);
-        hash = (hash << 5) - hash + chr;
-        hash |= 0; // Convert to 32bit integer
-    }
-    return hash;
+// Byte-true digest used to detect echoes in the bypass cache. The previous
+// implementation went through TextDecoder which mangles arbitrary byte
+// sequences into U+FFFD and was lossy for binaries (different PDFs could
+// collapse to the same 32-bit hash, defeating echo suppression for media
+// files). sha1 over raw bytes is collision-safe and matches the form
+// already used by proposalStore for content addressing.
+function contentDigest(content?: Uint8Array): string {
+    if (content===undefined) { return DELETE_DIGEST; }
+    return crypto.createHash('sha1').update(content).digest('hex');
 }
 
 /**
@@ -312,9 +308,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private setBypassCache(relPath: string, content?: Uint8Array, action?: 'push'|'pull') {
+        const key = normalizeReplicaPath(relPath);
         const date = Date.now();
-        const hash = hashCode(content);
-        const cache = this.bypassCache.get(relPath) || [undefined,undefined];
+        const hash = contentDigest(content);
+        const cache = this.bypassCache.get(key) || [undefined,undefined];
         // update the push/pull cache
         if (action==='push') {
             cache[0] = {date, hash};
@@ -327,25 +324,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             cache[1] = {date, hash};
         }
         // write back to the cache
-        this.bypassCache.set(relPath, cache as [FileCache,FileCache]);
+        this.bypassCache.set(key, cache as [FileCache,FileCache]);
     }
 
     private shouldPropagate(action: 'push'|'pull', relPath: string, content?: Uint8Array): boolean {
+        const key = normalizeReplicaPath(relPath);
         const now = Date.now();
-        const cache = this.bypassCache.get(relPath);
+        const cache = this.bypassCache.get(key);
         if (cache) {
-            const thisHash = hashCode(content);
+            const thisHash = contentDigest(content);
             const ownCache = action==='push' ? cache[0] : cache[1];
             const oppositeCache = action==='push' ? cache[1] : cache[0];
             if (ownCache.hash===thisHash) { return false; }
             // Only suppress a cross-direction echo while it is fresh. A stale
             // divergent cache must not swallow a later undo/redo save.
             if (oppositeCache.hash===thisHash && now-oppositeCache.date<ECHO_WINDOW_MS) {
-                this.setBypassCache(relPath, content, action);
+                this.setBypassCache(key, content, action);
                 return false;
             }
         }
-        this.setBypassCache(relPath, content, action);
+        this.setBypassCache(key, content, action);
         return true;
     }
 
@@ -628,7 +626,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async syncFromVFS(vfsUri: vscode.Uri, type: 'update'|'delete') {
         const {pathParts} = parseUri(vfsUri);
         pathParts.at(-1)==='' && pathParts.pop(); // remove the last empty string
-        const relPath = ('/' + pathParts.join('/'));
+        const relPath = normalizeReplicaPath('/' + pathParts.join('/'));
         const localUri = this.localUri(relPath);
         await this.enqueueSync(relPath, () => this.applySync('pull', type, relPath, vfsUri, localUri));
     }
@@ -641,9 +639,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             console.warn(`Local replica settings missing under "${this.baseUri.toString()}"; local change was not propagated.`);
             return;
         }
-        // get relative path to baseUri
-        const basePath = this.baseUri.path;
-        const relPath = localUri.path.slice(basePath.length);
+        // Compute the path relative to baseUri. Trailing-slash normalisation on
+        // baseUri can otherwise drop the leading slash, producing a relPath
+        // shape that disagrees with the pull side and defeats the bypass cache.
+        const basePath = this.baseUri.path.replace(/\/+$/, '');
+        const relPath = normalizeReplicaPath(localUri.path.slice(basePath.length));
         const vfsUri = this.vfs.pathToUri(relPath);
         await this.enqueueSync(relPath, () => this.applySync('push', type, relPath, localUri, vfsUri));
     }
