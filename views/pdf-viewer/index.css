@@ -358,3 +358,80 @@ html, body {
 .citationPreviewActionButton .citationPreviewCopied {
     color: var(--vscode-testing-iconPassed, #2ea043);
 }
+
+/* =========================================================
+   Compile Status Badge (top-right of PDF viewer)
+   ========================================================= */
+
+.compileBadge {
+    position: fixed;
+    top: 10px;
+    right: 14px;
+    z-index: 9999;
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px 6px 10px;
+    border-radius: 999px;
+    background: var(--vscode-editorHoverWidget-background, var(--vscode-editorWidget-background, rgba(30, 30, 30, 0.94)));
+    color: var(--vscode-editorWidget-foreground, #f0f0f0);
+    border: 1px solid var(--vscode-editorWidget-border, rgba(255, 255, 255, 0.14));
+    box-shadow:
+        0 1px 2px rgba(0, 0, 0, 0.10),
+        0 8px 20px rgba(0, 0, 0, 0.22);
+    font-family: var(--vscode-font-family, -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif);
+    font-size: 12px;
+    line-height: 1;
+    font-weight: 500;
+    letter-spacing: 0.1px;
+    pointer-events: none;
+    opacity: 0;
+    transform: translateY(-4px);
+    transition: opacity 160ms ease, transform 160ms ease;
+}
+
+.compileBadge--visible {
+    opacity: 1;
+    transform: translateY(0);
+}
+
+.compileBadgeIcon {
+    flex: 0 0 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 14px;
+    height: 14px;
+    font-size: 12px;
+    line-height: 1;
+}
+
+/* Spinner: a rotating ring shown only while compiling. The icon char is left
+   empty during compiling — the ring itself is the visual. */
+.compileBadge--compiling .compileBadgeIcon {
+    width: 12px;
+    height: 12px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    animation: compileBadgeSpin 800ms linear infinite;
+}
+
+.compileBadge--success {
+    color: var(--vscode-testing-iconPassed, #2ea043);
+    border-color: color-mix(in srgb, var(--vscode-testing-iconPassed, #2ea043) 35%, var(--vscode-editorWidget-border, rgba(0, 0, 0, 0.14)));
+}
+
+.compileBadge--failed {
+    color: var(--vscode-errorForeground, #f48771);
+    border-color: color-mix(in srgb, var(--vscode-errorForeground, #f48771) 35%, var(--vscode-editorWidget-border, rgba(0, 0, 0, 0.14)));
+}
+
+.compileBadge--alert {
+    color: var(--vscode-notificationsWarningIcon-foreground, var(--vscode-editorWarning-foreground, #ffcc02));
+    border-color: color-mix(in srgb, var(--vscode-notificationsWarningIcon-foreground, #ffcc02) 35%, var(--vscode-editorWidget-border, rgba(0, 0, 0, 0.14)));
+}
+
+@keyframes compileBadgeSpin {
+    to { transform: rotate(360deg); }
+}

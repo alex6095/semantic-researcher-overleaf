@@ -161,6 +161,17 @@ export class CompileManager {
         const uri = await CompileManager.check();
         if (uri) {
             this.inCompiling = status === 'compiling';
+            // Broadcast compile state to any open PDF webviews for this project
+            // so they can show an in-viewer badge alongside the status bar.
+            try {
+                const { identifier } = parseUri(uri);
+                const records = pdfViewRecord[identifier];
+                if (records) {
+                    Object.values(records).forEach((record) => {
+                        record.webviewPanel.webview.postMessage({type: 'compileStatus', status});
+                    });
+                }
+            } catch { /* parseUri may throw for non-overleaf URIs; ignore */ }
             this.vfsm.prefetch(uri).then((vfs) => {
                 const rootDocName = vfs.getRootDocName().slice(1);
                 const compilerName = vfs.getCompiler()?.name || '';
@@ -201,49 +212,63 @@ export class CompileManager {
         await vscode.workspace.saveAll(); // save all dirty files
 
         const uri = await this.update('compiling');
-        if (uri) {
-            this.vfsm.prefetch(uri)
-                .then(async (vfs) => {
-                    const content = new TextDecoder().decode( await vfs?.openFile(uri) );
-                    const match = RegExp(documentClassRegex).exec(content);
-                    const fileId = (await vfs._resolveUri(uri)).fileId;
-                    const rootDocId = match ? fileId : undefined;
-                    return await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId);
-                })
-                .then(async (res) => {
-                    switch (res) {
-                        case undefined:
-                            await this.update('success');
-                            break;
-                        case false:
-                            await this.update('failed');
-                            break;
-                        case true:
-                            return true;
-                        default:
-                            await this.update('alert');
-                            break;
-                    }
-                })
-                .then(status =>
-                    status ?
-                        vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compileErrorCheck`, uri)
-                        : Promise.reject()
-                )
-                .then(async (hasError) => {
-                    if (hasError) {
-                        await this.update('failed');
-                    } else {
-                        await this.update('success');
-                    }
-                    // refresh pdf
-                    const { identifier } = parseUri(uri);
-                    pdfViewRecord[identifier] && Object.values(pdfViewRecord[identifier]).forEach(
-                        (record) => record.doc.refresh()
-                    );
-                });
+        if (!uri) { return; }
 
-        }
+        const work = this.vfsm.prefetch(uri)
+            .then(async (vfs) => {
+                const content = new TextDecoder().decode( await vfs?.openFile(uri) );
+                const match = RegExp(documentClassRegex).exec(content);
+                const fileId = (await vfs._resolveUri(uri)).fileId;
+                const rootDocId = match ? fileId : undefined;
+                return await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId);
+            })
+            .then(async (res) => {
+                switch (res) {
+                    case undefined:
+                        await this.update('success');
+                        break;
+                    case false:
+                        await this.update('failed');
+                        break;
+                    case true:
+                        return true;
+                    default:
+                        await this.update('alert');
+                        break;
+                }
+            })
+            .then(status =>
+                status ?
+                    vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compileErrorCheck`, uri)
+                    : Promise.reject()
+            )
+            .then(async (hasError) => {
+                if (hasError) {
+                    await this.update('failed');
+                } else {
+                    await this.update('success');
+                }
+                // refresh pdf
+                const { identifier } = parseUri(uri);
+                pdfViewRecord[identifier] && Object.values(pdfViewRecord[identifier]).forEach(
+                    (record) => record.doc.refresh()
+                );
+            })
+            .catch(async () => {
+                // Either the intentional Promise.reject() flow-break (terminal
+                // update() already fired) or an actual exception mid-chain.
+                // If inCompiling is still set the chain failed before any
+                // terminal update(); surface as failed so the next compile()
+                // isn't permanently locked out by the inCompiling guard.
+                if (this.inCompiling) {
+                    await this.update('failed');
+                }
+            });
+
+        await vscode.window.withProgress(
+            {location: vscode.ProgressLocation.Window, title: vscode.l10n.t('Compiling LaTeX')},
+            () => work,
+        );
     }
 
     async stopCompile() {

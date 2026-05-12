@@ -1720,6 +1720,81 @@
         citationPreviewState.listenersEnabled = true;
     }
 
+    // Small "Compiling…" / result badge in the top-right of the PDF viewer,
+    // driven by `compileStatus` messages from the extension. Decoupled from the
+    // status bar so the user sees feedback in the surface they're looking at.
+    const compileBadgeState = { element: null, textEl: null, iconEl: null, timeoutId: null };
+    function ensureCompileBadge() {
+        if (compileBadgeState.element) { return compileBadgeState.element; }
+        const el = document.createElement('div');
+        el.className = 'compileBadge';
+        el.setAttribute('aria-live', 'polite');
+        const icon = document.createElement('span');
+        icon.className = 'compileBadgeIcon';
+        const text = document.createElement('span');
+        text.className = 'compileBadgeText';
+        el.appendChild(icon);
+        el.appendChild(text);
+        document.body.appendChild(el);
+        compileBadgeState.element = el;
+        compileBadgeState.iconEl = icon;
+        compileBadgeState.textEl = text;
+        return el;
+    }
+    function updateCompileBadge(status) {
+        const el = ensureCompileBadge();
+        if (compileBadgeState.timeoutId) {
+            clearTimeout(compileBadgeState.timeoutId);
+            compileBadgeState.timeoutId = null;
+        }
+        el.classList.remove(
+            'compileBadge--compiling',
+            'compileBadge--success',
+            'compileBadge--failed',
+            'compileBadge--alert',
+        );
+        let iconChar = '';
+        let label = '';
+        let autoHideMs = 0;
+        switch (status) {
+            case 'compiling':
+                el.classList.add('compileBadge--compiling');
+                iconChar = '';
+                label = 'Compiling…';
+                break;
+            case 'success':
+                el.classList.add('compileBadge--success');
+                iconChar = '✓';
+                label = 'Compiled';
+                autoHideMs = 1800;
+                break;
+            case 'failed':
+                el.classList.add('compileBadge--failed');
+                iconChar = '✕';
+                label = 'Compile failed';
+                autoHideMs = 4000;
+                break;
+            case 'alert':
+                el.classList.add('compileBadge--alert');
+                iconChar = '⚠';
+                label = 'Not connected';
+                autoHideMs = 4000;
+                break;
+            default:
+                el.classList.remove('compileBadge--visible');
+                return;
+        }
+        compileBadgeState.iconEl.textContent = iconChar;
+        compileBadgeState.textEl.textContent = label;
+        el.classList.add('compileBadge--visible');
+        if (autoHideMs > 0) {
+            compileBadgeState.timeoutId = setTimeout(() => {
+                el.classList.remove('compileBadge--visible');
+                compileBadgeState.timeoutId = null;
+            }, autoHideMs);
+        }
+    }
+
     //Reference: https://github.com/overleaf/overleaf/blob/main/services/web/frontend/js/features/pdf-preview/util/pdf-js-wrapper.js#L163
     function syncPdf(pageElem, pageNum, clientX, clientY, innerText) {
         const pageCanvas = pageElem.querySelector('canvas');
@@ -1783,6 +1858,9 @@
                     updateCitationPreviewOptions(message.citationPreview);
                     updatePdfViewerState();
                     enableThemeToggleButton( Object.keys(ColorThemes).indexOf(globalPdfViewerState.colorTheme) );
+                    break;
+                case 'compileStatus':
+                    updateCompileBadge(message.status);
                     break;
                 default:
                     break;
