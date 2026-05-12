@@ -339,6 +339,35 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return readReplicaSettings(rootUri ?? getActiveReplicaRoot());
     }
 
+    // Force the pending push for a local URI to fire NOW (cancelling its
+    // debounce timer) and resolve when the resulting sync settles. If the
+    // watcher hasn't fired yet, synthesise a push so callers that need the
+    // VFS to reflect a just-saved file (e.g. compile-on-save) don't race
+    // with the EVENT_COALESCE_MS window in syncToVFS.
+    public async flushPendingPush(localUri: vscode.Uri): Promise<void> {
+        if (localUri.scheme!=='file') { return; }
+        const basePath = this.baseUri.path.replace(/\/+$/, '');
+        if (localUri.path!==basePath && !localUri.path.startsWith(basePath + '/')) { return; }
+        if (isLocalReplicaMetadataUri(localUri, this.baseUri)) { return; }
+        const relPath = normalizeReplicaPath(localUri.path.slice(basePath.length));
+        if (this.matchIgnorePatterns(relPath)) { return; }
+
+        const pending = this.pendingLocalEvents.get(relPath);
+        if (pending) {
+            clearTimeout(pending.timer);
+            this.pendingLocalEvents.delete(relPath);
+            const vfsUri = this.vfs.pathToUri(relPath);
+            await this.enqueueSync(relPath, () => this.applySync('push', pending.latestType, relPath, pending.latestUri, vfsUri));
+            return;
+        }
+
+        // No debounced event yet — the watcher may simply not have fired
+        // before onDidSaveTextDocument. Synthesise a push so the VFS is
+        // current before the caller proceeds.
+        const vfsUri = this.vfs.pathToUri(relPath);
+        await this.enqueueSync(relPath, () => this.applySync('push', 'update', relPath, localUri, vfsUri));
+    }
+
     private matchIgnorePatterns(path: string): boolean {
         const ignorePatterns = this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns;
         for (const pattern of [...PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS, ...ignorePatterns]) {

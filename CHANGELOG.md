@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.19] - 2026-05-12
+### Fixed
+- fix(compile): compile-on-save now reliably fires in local-replica mode. The handler flushes any pending SCM push for the saved file before invoking compile, and passes `force=true` so the compile no longer races the `EVENT_COALESCE_MS` debounce / `isDirty` gate.
+
 ## [0.15.13] - 2026-04-18
 ### Changed
 - Rename the fork's VS Code command, URI, view, context, custom editor, configuration, and diagnostic namespaces to `semantic-researcher-overleaf`.

@@ -465,7 +465,15 @@ export class CompileManager {
                 const compileCondition = vscode.workspace.getConfiguration(`${ROOT_NAME}.compileOnSave`).get('enabled', true);
                 const postfixCondition = e.fileName.match(/\.tex$|\.sty$|\.cls$|\.bib$/i);
                 if (compileCondition && postfixCondition && vfs?.isInvisibleMode===false) {
-                    this.compile();
+                    // Local-replica saves race the SCM debounce: the local
+                    // watcher push to VFS is debounced (EVENT_COALESCE_MS),
+                    // so without flushing we'd compile the previous VFS state
+                    // and vfs.compile() would also short-circuit because
+                    // isDirty=true isn't set yet. Flush, then force-compile.
+                    if (e.uri.scheme==='file' && isWithinActiveReplica(e.uri)) {
+                        await vfs.flushPendingLocalPush(e.uri);
+                    }
+                    this.compile(true);
                 }
             }),
             EventBus.on('compilerUpdateEvent', () => {

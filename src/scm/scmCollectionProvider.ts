@@ -133,6 +133,18 @@ export class SCMCollectionProvider extends vscode.Disposable {
         this.statusBarItem.show();
     }
 
+    // Flush any pending Local Replica push for a local URI so compile-on-save
+    // sees the just-saved content. No-op for SCMs that don't cover the URI
+    // or aren't currently enabled.
+    public async flushPendingLocalPush(localUri: vscode.Uri): Promise<void> {
+        for (const {scm, enabled} of this.scms) {
+            if (!enabled) { continue; }
+            if (scm instanceof LocalReplicaSCMProvider) {
+                await scm.flushPendingPush(localUri);
+            }
+        }
+    }
+
     private initSCMs() {
         const scmPersists = GlobalStateManager.getServerProjectSCMPersists(this.context, this.vfs.serverName, this.vfs.projectId);
         Object.entries(scmPersists).forEach(async ([scmKey, scmPersist]) => {

@@ -567,6 +567,14 @@ export class VirtualFileSystem extends vscode.Disposable {
         return vscode.Uri.joinPath(this.origin, ...path);
     }
 
+    // Drain any pending Local Replica push for a local file URI before the
+    // caller runs an operation that depends on the VFS reflecting it (e.g.
+    // compile-on-save in local replica mode races the EVENT_COALESCE_MS
+    // debounce in syncToVFS).
+    public async flushPendingLocalPush(localUri: vscode.Uri): Promise<void> {
+        await this.scmCollectionItem?.collection.flushPendingLocalPush(localUri);
+    }
+
     async resolve(uri: vscode.Uri): Promise<File> {
         const {fileName, fileEntity, fileType} = await this._resolveUri(uri);
         const readonly = fileEntity?.readonly ? vscode.FilePermission.Readonly : undefined;
