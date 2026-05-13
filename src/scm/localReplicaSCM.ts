@@ -406,10 +406,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const thisHash = contentDigest(content);
             const ownCache = action==='push' ? cache[0] : cache[1];
             const oppositeCache = action==='push' ? cache[1] : cache[0];
-            if (ownCache.hash===thisHash) { return false; }
-            // Only suppress a cross-direction echo while it is fresh. A stale
-            // divergent cache must not swallow a later undo/redo save.
+            // Same-direction match: the last operation in THIS direction
+            // already produced these exact bytes. Suppress as a redundant
+            // no-op (avoids re-uploading identical bytes on bare Ctrl-S,
+            // which matters for large binaries). No time bound here — a
+            // duplicate save days later is still a duplicate.
+            if (ownCache.hash===thisHash) {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [${action} suppressed:own-echo] ${relPath} ` +
+                    `(age=${now-ownCache.date}ms, hash unchanged since prior ${action})`,
+                );
+                return false;
+            }
+            // Cross-direction match: the opposite side just produced these
+            // bytes — this fire is the watcher reacting to that write. Only
+            // honour while fresh so a stale divergent cache can't swallow a
+            // later undo/redo save back to that state.
             if (oppositeCache.hash===thisHash && now-oppositeCache.date<ECHO_WINDOW_MS) {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [${action} suppressed:cross-echo] ${relPath} ` +
+                    `(age=${now-oppositeCache.date}ms within ${ECHO_WINDOW_MS}ms window)`,
+                );
                 this.setBypassCache(key, content, action);
                 return false;
             }
@@ -588,16 +605,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     // Generic bounded-retry helper. Used by both push and pull paths so a stale
     // or reconnecting socket doesn't drop an operation silently. The optional
-    // `betweenAttempts` callback runs between failed attempts — push uses it
-    // to force a reconnect, pull uses it to passively await the existing
-    // connection state machine (no own reconnect — see waitForConnectedOrTimeout).
+    // `betweenAttempts` callback runs between failed attempts — both push and
+    // pull now passively await the existing connection state machine (no
+    // per-attempt reconnect — see waitForConnectedOrTimeout). Callers may still
+    // force a one-shot reconnect inside the task itself.
     private async withRetry<T>(
         label: 'push' | 'pull',
         relPath: string,
         task: () => Promise<T>,
         opts?: { delays?: number[]; betweenAttempts?: () => Promise<void> },
     ): Promise<T> {
-        const delays = opts?.delays ?? [0, 200, 700];
+        const delays = opts?.delays ?? LocalReplicaSCMProvider.PUSH_RETRY_DELAYS;
         const betweenAttempts = opts?.betweenAttempts;
         let lastError: unknown;
         for (let attempt = 0; attempt<delays.length; attempt++) {
@@ -630,20 +648,32 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             await this.vfs.ensureConnectedForWrite();
             await vscode.workspace.fs.writeFile(toUri, content);
         }, {
-            // Push genuinely needs a fresh connection — if the socket is dead,
-            // there is nothing else that will repair it for us before the next
-            // attempt. ensureConnectedForWrite() is itself a no-op when
-            // already connected so this is not a forced re-init.
-            betweenAttempts: () => this.vfs.ensureConnectedForWrite(),
+            delays: LocalReplicaSCMProvider.PUSH_RETRY_DELAYS,
+            // Match the pull-retry pattern: wait passively for the connection
+            // state machine to settle rather than firing reconnect() on every
+            // attempt. The task itself already calls ensureConnectedForWrite()
+            // which is a one-shot reconnect when state is 'disconnected', and
+            // back-to-back reconnect() calls clear the entire project state
+            // (see VirtualFileSystem.reconnect — root and initializing both
+            // get nulled). One-shot at task entry plus passive wait between
+            // attempts mirrors how pull handles a flapping socket without
+            // amplifying the failure into a socket storm.
+            betweenAttempts: async () => {
+                await this.waitForConnectedOrTimeout(LocalReplicaSCMProvider.PUSH_RECONNECT_WAIT_MS);
+            },
         });
     }
 
     // Pull binary files with a wider backoff. Binary VFS reads occasionally
     // return Unknown / zero bytes during socket reconnects; surface those as
     // failures the outer code can retry rather than silently writing empty
-    // files into the replica.
+    // files into the replica. Push now matches the same budget so a
+    // 1-2 second socket reconnect doesn't silently lose accepted edits — the
+    // prior 0.9s budget meant push gave up while pull was still recovering.
     private static readonly PULL_RETRY_DELAYS = [0, 300, 900, 2400];
+    private static readonly PUSH_RETRY_DELAYS = [0, 300, 900, 2400];
     private static readonly PULL_RECONNECT_WAIT_MS = 5000;
+    private static readonly PUSH_RECONNECT_WAIT_MS = 5000;
 
     private isLikelyBinaryRelPath(relPath: string): boolean {
         return /\.(pdf|png|jpe?g|gif|svg|webp|bmp|tiff?|eps|ps|zip|tar|gz|bz2|7z|rar|mp[34]|wav|ogg|woff2?|ttf|otf|ico)$/i.test(relPath);
@@ -728,7 +758,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     }
                 }
 
-                if (this.bypassSync(action, type, relPath, newContent)) { return; }
+                if (this.bypassSync(action, type, relPath, newContent)) {
+                    return;
+                }
                 if (action==='push') {
                     const decision = await getAgentReviewManager()?.beforeLocalReplicaPush({
                         rootUri: this.baseUri,
@@ -737,7 +769,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         type,
                         content: newContent,
                     });
-                    if (decision?.kind==='block') { return; }
+                    if (decision?.kind==='block') {
+                        return;
+                    }
                 }
                 delete this.baseCache[relPath];
                 this.seenLocalEntities.delete(relPath);
@@ -752,10 +786,29 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     });
                 }
             } else {
+                // Layer 4b — refuse a push-update for a path whose initial
+                // pull failed. The local replica never authoritatively held
+                // this file's remote contents, so propagating local bytes
+                // would clobber the remote with whatever happens to be on
+                // disk (often nothing, or a stale snapshot). The symmetric
+                // delete-side check lives above inside the `type==='delete'`
+                // branch; this guards the update path so the local watcher
+                // can be armed unconditionally without risk.
+                if (action==='push' && this.failedInitialPulls.has(relPath)) {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [push update blocked] ${relPath}: initial pull failed; refusing to mutate remote`,
+                    );
+                    maybeWarnSyncFailure(relPath, new Error(
+                        'Remote update blocked: initial pull failed for this file. Use "Retry Pull" before editing.',
+                    ));
+                    return;
+                }
                 const stat = await vscode.workspace.fs.stat(fromUri);
                 if (stat.type===vscode.FileType.Directory) {
                     const newContent = new Uint8Array();
-                    if (this.bypassSync(action, type, relPath, newContent)) { return; }
+                    if (this.bypassSync(action, type, relPath, newContent)) {
+                        return;
+                    }
                     await vscode.workspace.fs.createDirectory(toUri);
                 }
                 else if (stat.type===vscode.FileType.File) {
@@ -785,7 +838,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 return;
                             }
                         }
-                        if (this.bypassSync(action, type, relPath, newContent)) { return; }
+                        if (this.bypassSync(action, type, relPath, newContent)) {
+                            return;
+                        }
                         const pushChange = action==='push' ? {
                             rootUri: this.baseUri,
                             localUri: fromUri,
@@ -795,7 +850,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         } : undefined;
                         if (action==='push') {
                             const decision = await getAgentReviewManager()?.beforeLocalReplicaPush(pushChange!);
-                            if (decision?.kind==='block') { return; }
+                            if (decision?.kind==='block') {
+                                return;
+                            }
                         }
                         if (action==='push') {
                             // Push with bounded retry so a transient socket blip doesn't
@@ -978,7 +1035,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const showOutput = vscode.l10n.t('Show Output');
         vscode.window.showWarningMessage(
             vscode.l10n.t(
-                '{count} files failed to download from Overleaf. Local edits will NOT sync until you Retry Pull or Ignore These Files.',
+                '{count} files failed to download from Overleaf. Edits to those specific files will not push to remote until you Retry Pull or Ignore them; the rest of the project syncs normally.',
                 {count},
             ),
             retry, ignore, showOutput,
@@ -1073,10 +1130,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.vfsWatcher.onDidDelete(uri => this.syncFromVFS(uri, 'delete')),
         ];
 
-        // The local watcher is the dangerous direction (local→remote). Defer
-        // its creation until the initial pull is fully complete; while pull is
-        // partial there is literally no listener to fire syncToVFS, so a stray
-        // local FS event can never be translated into a remote mutation.
+        // Arm the local watcher unconditionally. Until 0.15.20 we deferred
+        // arming whenever the initial pull was partial — that was safe but
+        // silently disabled ALL local→remote sync for the whole project
+        // until the user clicked Retry/Ignore on a single toast they often
+        // missed. Push correctness for the failed-pull paths is now enforced
+        // inline by Layer 4 (push-delete) and Layer 4b (push-update) in
+        // applySync, both of which reject mutations for entries in
+        // failedInitialPulls. So the watcher firing for a failed-pull path
+        // is logged and ignored, while every other path syncs normally.
         this.armLocalWatcher = () => {
             if (this.localWatcher) { return; }
             this.localWatcher = vscode.workspace.createFileSystemWatcher(
@@ -1089,16 +1151,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 this.localWatcher.onDidDelete(uri => { void this.syncToVFS(uri, 'delete'); }),
             );
             getOutputChannel().appendLine(
-                `${new Date().toISOString()} [localWatcher armed]`,
+                `${new Date().toISOString()} [localWatcher armed] initialPullStatus=${this.initialPullStatus} ` +
+                `failedInitialPulls=${this.failedInitialPulls.size}`,
             );
         };
-
-        if (this.initialPullStatus==='complete') {
-            this.armLocalWatcher();
-        } else {
+        this.armLocalWatcher();
+        if (this.initialPullStatus!=='complete') {
             getOutputChannel().appendLine(
-                `${new Date().toISOString()} [localWatcher deferred] initialPullStatus=${this.initialPullStatus}; ` +
-                `${this.failedInitialPulls.size} files pending. Local edits will NOT push until retry/ignore.`,
+                `${new Date().toISOString()} [partial pull active] ${this.failedInitialPulls.size} files pending; ` +
+                `their local edits will be rejected by Layer 4/4b until retry/ignore. Other files push normally.`,
             );
         }
 
