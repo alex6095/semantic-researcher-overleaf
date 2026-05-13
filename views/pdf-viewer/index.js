@@ -168,6 +168,42 @@
         container.insertBefore(button, firstChild);
     }
 
+    // Toolbar compile button. Targets the same idle/compiling/success/failed
+    // state machine the compileStatus message already drives, so the button
+    // disables itself while a compile is in-flight and re-enables on terminal
+    // status. Lets the user trigger a build without leaving the PDF surface —
+    // primarily useful when working alongside the AI chat panel.
+    function enableCompileButton() {
+        if (document.getElementById('pdfCompileButton')) { return; }
+        const button = document.createElement('button');
+        button.setAttribute('class', 'toolbarButton hiddenMediumView pdfCompileButton');
+        button.setAttribute('id', 'pdfCompileButton');
+        button.setAttribute('tabindex', '31');
+        button.setAttribute('title', 'Compile project');
+        button.innerHTML =
+            '<span class="pdfCompileButtonSpinner" aria-hidden="true"></span>' +
+            '<span class="pdfCompileButtonLabel">Compile</span>';
+        button.addEventListener('click', () => {
+            if (button.disabled) { return; }
+            vscode.postMessage({type: 'compile'});
+        });
+        const container = document.getElementById('toolbarViewerRight');
+        const firstChild = document.getElementById('openFile');
+        container.insertBefore(button, firstChild);
+    }
+
+    function setCompileButtonState(status) {
+        const button = document.getElementById('pdfCompileButton');
+        if (!button) { return; }
+        const isCompiling = status === 'compiling';
+        button.disabled = isCompiling;
+        button.classList.toggle('pdfCompileButton--compiling', isCompiling);
+        button.setAttribute(
+            'title',
+            isCompiling ? 'Compiling…' : 'Compile project',
+        );
+    }
+
     async function updatePdf(pdf) {
         clearCitationPreviewState();
         const doc = await pdfjsLib.getDocument({
@@ -1742,6 +1778,7 @@
         return el;
     }
     function updateCompileBadge(status) {
+        setCompileButtonState(status);
         const el = ensureCompileBadge();
         if (compileBadgeState.timeoutId) {
             clearTimeout(compileBadgeState.timeoutId);
@@ -1858,6 +1895,7 @@
                     updateCitationPreviewOptions(message.citationPreview);
                     updatePdfViewerState();
                     enableThemeToggleButton( Object.keys(ColorThemes).indexOf(globalPdfViewerState.colorTheme) );
+                    enableCompileButton();
                     break;
                 case 'compileStatus':
                     updateCompileBadge(message.status);

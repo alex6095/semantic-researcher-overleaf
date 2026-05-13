@@ -435,3 +435,45 @@ html, body {
 @keyframes compileBadgeSpin {
     to { transform: rotate(360deg); }
 }
+
+/* =========================================================
+   Compile Button (toolbar, top-right of PDF viewer)
+   ========================================================= */
+
+.pdfCompileButton {
+    /* pdf.js .toolbarButton already provides the chrome; we tweak the
+       internal layout so the label sits next to a hidden spinner. */
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    padding-inline: 8px;
+}
+
+.pdfCompileButton .pdfCompileButtonLabel {
+    font-size: 12px;
+    line-height: 1;
+    letter-spacing: 0.1px;
+}
+
+/* Spinner is collapsed by default; revealed only while compiling.
+   The pdf.js viewer button text colour is inherited via currentColor. */
+.pdfCompileButton .pdfCompileButtonSpinner {
+    width: 0;
+    height: 12px;
+    border: 2px solid currentColor;
+    border-right-color: transparent;
+    border-radius: 50%;
+    opacity: 0;
+    transition: width 120ms ease, opacity 120ms ease;
+}
+
+.pdfCompileButton--compiling .pdfCompileButtonSpinner {
+    width: 12px;
+    opacity: 1;
+    animation: compileBadgeSpin 800ms linear infinite;
+}
+
+.pdfCompileButton:disabled {
+    cursor: progress;
+    opacity: 0.7;
+}
