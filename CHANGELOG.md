@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.21] - 2026-05-13
+### Added
+- feat(local-replica): expose a new `scmSyncCompleteEvent` on `EventBus` that fires once per `applySync` terminal — for either direction (push/pull), either type (update/delete), with an `outcome` of `success`/`error`/`blocked`/`suppressed` (the latter two cover Layer 3/4/4b guards and bypass-cache / pull-noop short-circuits). Replaces the prior `flushPendingPush + poll status` pattern for callers that need to know precisely when a specific path has finished syncing.
+- feat(pdf-viewer): add a **Compile** button to the PDF viewer toolbar (next to the theme toggle). Clicking it triggers the same `compileManager.compile` command the status bar uses, so users working in the PDF surface alongside the AI chat panel can recompile without switching focus. The button shares state with the existing compile-status badge — it disables itself and shows an inline spinner while a compile is in flight, then re-enables on terminal status.
+
+### Fixed
+- fix(local-replica): make local→remote push as robust as the remote→local pull path. Symmetrises four asymmetries that allowed local edits to be silently dropped or arbitrarily delayed:
+  - **Push retry budget**: extended from `[0, 200, 700]ms` (0.9s total) to `[0, 300, 900, 2400]ms` (3.6s total) so a 1–2s socket reconnect no longer makes push give up while pull is still recovering.
+  - **Between-attempt connection handling**: push now passively waits via `waitForConnectedOrTimeout` between retries instead of firing `ensureConnectedForWrite()` on every attempt. Back-to-back `reconnect()` calls cleared project state and caused socket storms; the task body still does a one-shot reconnect on entry.
+  - **Local watcher arming**: the watcher is now armed unconditionally on `initWatch`. Previously a single failed initial pull deferred arming for the entire project, so a missed toast left local→remote sync silently dead. Push correctness for failed-pull paths is enforced inline by a new Layer 4b guard in `applySync` that rejects push-update for any path in `failedInitialPulls` (symmetric to the existing Layer 4 push-delete guard).
+  - **Echo suppression visibility**: `shouldPropagate` now logs an `[<action> suppressed:own-echo]` or `[suppressed:cross-echo]` line to the shared output channel whenever it swallows an event, with the cache age included. Previously suppression was silent and indistinguishable from "no event happened".
+
 ## [0.15.20] - 2026-05-13
 ### Added
 - feat(compile): show a Window-level progress spinner (`ProgressLocation.Window`) while a compile is in flight, alongside the existing status-bar indicator.
