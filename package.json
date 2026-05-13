@@ -360,7 +360,7 @@
         "command": "semantic-researcher-overleaf.compileManager.compile",
         "title": "%commands.compileManager.compile.title%",
         "icon": "$(debug-start)",
-        "enablement": "(resourceScheme == semantic-researcher-overleaf || semantic-researcher-overleaf.activeReplicaCompileEditor) && resourceExtname == .tex",
+        "enablement": "(resourceScheme == semantic-researcher-overleaf || semantic-researcher-overleaf.activeReplicaCompileEditor || semantic-researcher-overleaf.activate) && (resourceExtname == .tex || resourceExtname == .pdf)",
         "category": "%extension.displayName%"
       },
       {
@@ -750,6 +750,11 @@
           "command": "semantic-researcher-overleaf.compileManager.viewPdf",
           "when": "(resourceScheme == semantic-researcher-overleaf || semantic-researcher-overleaf.activeReplicaCompileEditor) && resourceExtname == .tex",
           "group": "navigation@2"
+        },
+        {
+          "command": "semantic-researcher-overleaf.compileManager.compile",
+          "when": "(resourceScheme == semantic-researcher-overleaf || semantic-researcher-overleaf.activate) && resourceExtname == .pdf",
+          "group": "navigation@1"
         }
       ],
       "view/item/context": [

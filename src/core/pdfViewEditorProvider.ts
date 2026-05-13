@@ -87,14 +87,6 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                 case 'syncPdf':
                     vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.syncPdf`, e.content);
                     break;
-                case 'compile':
-                    // Trigger the same command the status-bar / command-palette
-                    // entry uses. CompileManager.compile() falls back through
-                    // active editor → workspace folder → local-replica settings
-                    // to find the project URI, so no extra arg is needed even
-                    // when the PDF viewer is the focused editor.
-                    vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
-                    break;
                 case 'saveState':
                     GlobalStateManager.updatePdfViewPersist(this.context, doc.uri.toString(), e.content);
                     break;

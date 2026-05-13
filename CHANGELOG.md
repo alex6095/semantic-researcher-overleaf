@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [0.15.21] - 2026-05-13
 ### Added
 - feat(local-replica): expose a new `scmSyncCompleteEvent` on `EventBus` that fires once per `applySync` terminal — for either direction (push/pull), either type (update/delete), with an `outcome` of `success`/`error`/`blocked`/`suppressed` (the latter two cover Layer 3/4/4b guards and bypass-cache / pull-noop short-circuits). Replaces the prior `flushPendingPush + poll status` pattern for callers that need to know precisely when a specific path has finished syncing.
-- feat(pdf-viewer): add a **Compile** button to the PDF viewer toolbar (next to the theme toggle). Clicking it triggers the same `compileManager.compile` command the status bar uses, so users working in the PDF surface alongside the AI chat panel can recompile without switching focus. The button shares state with the existing compile-status badge — it disables itself and shows an inline spinner while a compile is in flight, then re-enables on terminal status.
+- feat(pdf-viewer): expose the **Compile** command in the PDF tab's editor-title bar (`▶` icon), matching the placement of the existing `.tex` compile button. When a project is active and the PDF tab is focused, the same `compileManager.compile` action is one click away — useful when working in the PDF surface alongside the AI chat panel. Implemented purely as an `editor/title` menu contribution so the icon is rendered by VS Code itself and respects all native chrome (theme tokens, overflow menu, accessibility).
 
 ### Fixed
 - fix(local-replica): make local→remote push as robust as the remote→local pull path. Symmetrises four asymmetries that allowed local edits to be silently dropped or arbitrarily delayed:
