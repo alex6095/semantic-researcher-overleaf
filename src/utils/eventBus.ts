@@ -11,6 +11,22 @@ export type Events = {
     'rootDocUpdateEvent': {rootDocId:string},
     'scmStatusChangeEvent': {status:StatusInfo},
     'socketioConnectedEvent': {publicId:string},
+    // Fires once per applySync terminal — success, failure, or guard-block —
+    // for either sync direction. Replaces the prior pattern of awaiting
+    // flushPendingPush() + polling status; subscribers can wait for the
+    // specific (relPath, direction) without races. `outcome` distinguishes:
+    //   'success' — work landed on the destination
+    //   'error'   — the inner write/upload threw (see `error` for message)
+    //   'blocked' — a Layer 3/4/4b guard rejected the operation
+    //   'suppressed' — bypassSync / noop / cache match short-circuited it
+    'scmSyncCompleteEvent': {
+        rootUri: vscode.Uri,
+        relPath: string,
+        direction: 'push' | 'pull',
+        type: 'update' | 'delete',
+        outcome: 'success' | 'error' | 'blocked' | 'suppressed',
+        error?: string,
+    },
 };
 
 export class EventBus {

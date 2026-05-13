@@ -20,6 +20,7 @@ import {
     REPLICA_SETTINGS_FILE,
 } from '../consts';
 import { stringifyOverleafUri } from '../utils/overleafUri';
+import { EventBus } from '../utils/eventBus';
 import { formatUnknownError } from '../utils/errorMessage';
 import { PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS, getAgentReviewManager } from '../agentReview';
 
@@ -710,6 +711,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
         this.status = {status: action, message: `${type}: ${relPath}`};
 
+        // Track the terminal outcome so we can fire a single scmSyncCompleteEvent
+        // after the IIFE settles. Each early `return` along a guard/suppress
+        // path updates `outcome` first; the catch updates `outcome` + `error`.
+        // Subscribers (compileManager, status UI, tests) can wait on a specific
+        // (relPath, direction, outcome) without polling status.
+        let outcome: 'success' | 'error' | 'blocked' | 'suppressed' = 'success';
+        let errorMessage: string | undefined;
+
         await (async () => {
             if (type==='delete') {
                 const newContent = undefined;
@@ -732,6 +741,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         );
                         this.setBypassCache(relPath, undefined);
                         this.failedInitialPulls.delete(relPath);
+                        outcome = 'suppressed';
                         return;
                     }
                 }
@@ -748,17 +758,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         maybeWarnSyncFailure(relPath, new Error(
                             'Remote delete blocked: initial pull failed for this file. Use "Retry Pull" before deleting.',
                         ));
+                        outcome = 'blocked';
+                        errorMessage = 'initial pull failed';
                         return;
                     }
                     if (!this.seenLocalEntities.has(relPath) && !(relPath in this.baseCache)) {
                         getOutputChannel().appendLine(
                             `${new Date().toISOString()} [push delete blocked] ${relPath}: no local-write trace; treating as echo`,
                         );
+                        outcome = 'suppressed';
                         return;
                     }
                 }
 
                 if (this.bypassSync(action, type, relPath, newContent)) {
+                    outcome = 'suppressed';
                     return;
                 }
                 if (action==='push') {
@@ -770,6 +784,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         content: newContent,
                     });
                     if (decision?.kind==='block') {
+                        outcome = 'blocked';
+                        errorMessage = 'blocked by agent review';
                         return;
                     }
                 }
@@ -801,12 +817,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     maybeWarnSyncFailure(relPath, new Error(
                         'Remote update blocked: initial pull failed for this file. Use "Retry Pull" before editing.',
                     ));
+                    outcome = 'blocked';
+                    errorMessage = 'initial pull failed';
                     return;
                 }
                 const stat = await vscode.workspace.fs.stat(fromUri);
                 if (stat.type===vscode.FileType.Directory) {
                     const newContent = new Uint8Array();
                     if (this.bypassSync(action, type, relPath, newContent)) {
+                        outcome = 'suppressed';
                         return;
                     }
                     await vscode.workspace.fs.createDirectory(toUri);
@@ -835,10 +854,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 getOutputChannel().appendLine(
                                     `${new Date().toISOString()} [pull noop] ${relPath} (${newContent.length} bytes, content unchanged)`,
                                 );
+                                outcome = 'suppressed';
                                 return;
                             }
                         }
                         if (this.bypassSync(action, type, relPath, newContent)) {
+                            outcome = 'suppressed';
                             return;
                         }
                         const pushChange = action==='push' ? {
@@ -851,6 +872,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         if (action==='push') {
                             const decision = await getAgentReviewManager()?.beforeLocalReplicaPush(pushChange!);
                             if (decision?.kind==='block') {
+                                outcome = 'blocked';
+                                errorMessage = 'blocked by agent review';
                                 return;
                             }
                         }
@@ -894,15 +917,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             });
                         }
                         console.error(error);
+                        outcome = 'error';
+                        errorMessage = formatUnknownError(error);
                     }
                 }
                 else {
                     console.error(`Unknown file type: ${stat.type}`);
+                    outcome = 'error';
+                    errorMessage = `unknown file type: ${stat.type}`;
                 }
             }
         })();
 
         this.status = {status: 'idle', message: ''};
+        EventBus.fire('scmSyncCompleteEvent', {
+            rootUri: this.baseUri,
+            relPath,
+            direction: action,
+            type,
+            outcome,
+            error: errorMessage,
+        });
     }
 
     // Compute the debounce delay for the next firing of a path's pending
