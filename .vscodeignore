@@ -3,12 +3,15 @@
 .github/**
 .husky/**
 src/**
+out/**
+!out/extension.js
 patches/**
 docs/**
 .gitignore
 .yarnrc
 commitlint.config.js
 scripts/**
+node_modules/**
 remote-pack/**
 **/tsconfig.json
 **/.eslintrc.json

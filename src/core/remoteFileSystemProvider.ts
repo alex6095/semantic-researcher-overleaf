@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
-import * as DiffMatchPatch from 'diff-match-patch';
+import DiffMatchPatch = require('diff-match-patch');
 import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { OUTPUT_FOLDER_NAME, PREFETCH_COMMAND, ROOT_NAME } from '../consts';

@@ -3,7 +3,7 @@ import * as nodeFs from 'fs/promises';
 import * as os from 'os';
 import * as nodePath from 'path';
 import * as vscode from 'vscode';
-import * as DiffMatchPatch from 'diff-match-patch';
+import DiffMatchPatch = require('diff-match-patch');
 import { minimatch } from 'minimatch';
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';

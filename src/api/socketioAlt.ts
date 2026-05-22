@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
-import * as DiffMatchPatch from 'diff-match-patch';
+import DiffMatchPatch = require('diff-match-patch');
 import { EventEmitter } from 'events';
 import { BaseAPI, Identity, ProjectMessageResponseSchema, ProjectSettingsSchema } from './base';
 import { DocumentEntity, FileEntity, ProjectEntity, VirtualFileSystem } from '../core/remoteFileSystemProvider';
