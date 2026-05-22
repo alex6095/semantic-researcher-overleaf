@@ -31,6 +31,7 @@ import { PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS, getAgentReviewManager } from '
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 const ECHO_WINDOW_MS = 500;
+const SYNC_MANIFEST_FILE = `${REPLICA_SETTINGS_DIR}/sync-manifest.json`;
 
 // Single shared output channel for Local Replica sync diagnostics. Lazy-created.
 let sharedOutput: vscode.OutputChannel | undefined;
@@ -62,6 +63,20 @@ function maybeWarnSyncFailure(relPath: string, error: unknown) {
 type FileCache = {date:number, hash:string};
 
 const DELETE_DIGEST = '\0';
+
+interface SyncManifestEntry {
+    remoteFingerprint: string;
+    localSize: number;
+    localMtime: number;
+    localDigest: string;
+    updatedAt: string;
+}
+
+interface SyncManifest {
+    version: 1;
+    projectUri: string;
+    files: Record<string, SyncManifestEntry>;
+}
 
 interface PendingEvent {
     timer: ReturnType<typeof setTimeout>;
@@ -128,6 +143,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private bypassCache: Map<string, [FileCache,FileCache]> = new Map();
     private baseCache: {[key:string]: Uint8Array} = {};
+    private syncManifest?: SyncManifest;
+    private syncManifestDirty = false;
     // Files we have written locally at least once. A push-delete arriving for a
     // relPath that isn't in here AND isn't in baseCache is treated as an echo,
     // not a user-driven delete, and is refused in the delete-guard layer.
@@ -363,6 +380,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return vscode.Uri.joinPath(this.baseUri, REPLICA_SETTINGS_FILE);
     }
 
+    private get syncManifestUri(): vscode.Uri {
+        return vscode.Uri.joinPath(this.baseUri, SYNC_MANIFEST_FILE);
+    }
+
     private get legacySettingsUri(): vscode.Uri {
         return vscode.Uri.joinPath(this.baseUri, LEGACY_REPLICA_SETTINGS_FILE);
     }
@@ -438,6 +459,41 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.settingsUri,
             Buffer.from(JSON.stringify(this.localReplicaSettings, null, 4)),
         );
+    }
+
+    private emptySyncManifest(): SyncManifest {
+        return {
+            version: 1,
+            projectUri: stringifyOverleafUri(this.vfs.origin),
+            files: {},
+        };
+    }
+
+    private async loadSyncManifest() {
+        const projectUri = stringifyOverleafUri(this.vfs.origin);
+        try {
+            const content = await vscode.workspace.fs.readFile(this.syncManifestUri);
+            const manifest = JSON.parse(new TextDecoder().decode(content)) as SyncManifest;
+            if (manifest.version===1 && manifest.projectUri===projectUri && manifest.files) {
+                this.syncManifest = manifest;
+                this.syncManifestDirty = false;
+                return;
+            }
+        } catch {
+            // Missing or invalid manifests are rebuilt opportunistically.
+        }
+        this.syncManifest = this.emptySyncManifest();
+        this.syncManifestDirty = true;
+    }
+
+    private async persistSyncManifest(force = false) {
+        if (!this.syncManifest || (!force && !this.syncManifestDirty)) { return; }
+        await vscode.workspace.fs.createDirectory(this.settingsDirectoryUri);
+        await vscode.workspace.fs.writeFile(
+            this.syncManifestUri,
+            Buffer.from(JSON.stringify(this.syncManifest, null, 2)),
+        );
+        this.syncManifestDirty = false;
     }
 
     public static async validateBaseUri(uri: string, projectName?: string): Promise<vscode.Uri> {
@@ -627,9 +683,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private setBypassCache(relPath: string, content?: Uint8Array, action?: 'push'|'pull') {
+        this.setBypassCacheDigest(relPath, contentDigest(content), action);
+    }
+
+    private setBypassCacheDigest(relPath: string, hash: string, action?: 'push'|'pull') {
         const key = normalizeReplicaPath(relPath);
         const date = Date.now();
-        const hash = contentDigest(content);
         const cache = this.bypassCache.get(key) || [undefined,undefined];
         // update the push/pull cache
         if (action==='push') {
@@ -644,6 +703,77 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         // write back to the cache
         this.bypassCache.set(key, cache as [FileCache,FileCache]);
+    }
+
+    private async getRemoteFingerprint(relPath: string, vfsUri: vscode.Uri): Promise<string | undefined> {
+        if (!this.isLikelyBinaryRelPath(relPath)) { return undefined; }
+        try {
+            const {fileType, fileEntity} = await this.vfs._resolveUri(vfsUri);
+            if (fileType==='file' && fileEntity?._id) {
+                return `${fileType}:${fileEntity._id}`;
+            }
+        } catch {
+            return undefined;
+        }
+        return undefined;
+    }
+
+    private async manifestLocalStat(relPath: string): Promise<{size: number; mtime: number} | undefined> {
+        try {
+            const stat = await vscode.workspace.fs.stat(this.localUri(relPath));
+            if (stat.type!==vscode.FileType.File) { return undefined; }
+            return {size: stat.size, mtime: stat.mtime};
+        } catch {
+            return undefined;
+        }
+    }
+
+    private async canSkipInitialBinaryPull(relPath: string, vfsUri: vscode.Uri): Promise<boolean> {
+        const entry = this.syncManifest?.files[relPath];
+        if (!entry) { return false; }
+        const remoteFingerprint = await this.getRemoteFingerprint(relPath, vfsUri);
+        if (!remoteFingerprint || entry.remoteFingerprint!==remoteFingerprint) { return false; }
+        const localStat = await this.manifestLocalStat(relPath);
+        if (!localStat) { return false; }
+        if (localStat.size!==entry.localSize || localStat.mtime!==entry.localMtime) {
+            return false;
+        }
+
+        this.baseCache[relPath] = new Uint8Array();
+        this.seenLocalEntities.add(relPath);
+        this.setBypassCacheDigest(relPath, entry.localDigest);
+        return true;
+    }
+
+    private async isLocalUnchangedFromManifest(relPath: string): Promise<boolean> {
+        const entry = this.syncManifest?.files[relPath];
+        if (!entry) { return false; }
+        const localStat = await this.manifestLocalStat(relPath);
+        return localStat!==undefined
+            && localStat.size===entry.localSize
+            && localStat.mtime===entry.localMtime;
+    }
+
+    private async recordSyncManifestEntry(relPath: string, vfsUri: vscode.Uri, content: Uint8Array) {
+        if (!this.syncManifest || !this.isLikelyBinaryRelPath(relPath)) { return; }
+        const remoteFingerprint = await this.getRemoteFingerprint(relPath, vfsUri);
+        const localStat = await this.manifestLocalStat(relPath);
+        if (!remoteFingerprint || !localStat) { return; }
+        this.syncManifest.files[relPath] = {
+            remoteFingerprint,
+            localSize: localStat.size,
+            localMtime: localStat.mtime,
+            localDigest: contentDigest(content),
+            updatedAt: new Date().toISOString(),
+        };
+        this.syncManifestDirty = true;
+    }
+
+    private removeSyncManifestEntry(relPath: string) {
+        if (this.syncManifest?.files[relPath]) {
+            delete this.syncManifest.files[relPath];
+            this.syncManifestDirty = true;
+        }
     }
 
     private shouldPropagate(action: 'push'|'pull', relPath: string, content?: Uint8Array): boolean {
@@ -740,6 +870,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (resetLocalFilesToRemote) {
                 if (token.isCancellationRequested) { return false; }
                 await this.clearLocalProjectFilesForRemoteReset();
+                this.syncManifest = this.emptySyncManifest();
+                this.syncManifestDirty = true;
             }
 
             for (const relPath of directories) {
@@ -761,8 +893,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (token.isCancellationRequested) { return false; }
                 progress.report({increment: 100/total, message: relPath});
                 //
+                if (!resetLocalFilesToRemote && await this.canSkipInitialBinaryPull(relPath, vfsUri)) {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [initial pull skip] ${relPath}: manifest fingerprint unchanged`,
+                    );
+                    continue;
+                }
                 const baseContent = this.baseCache[relPath];
-                const localContent = await this.readFile(relPath);
+                const refreshPreservedBinary = preserveExistingLocalFiles
+                    && this.isLikelyBinaryRelPath(relPath)
+                    && await this.isLocalUnchangedFromManifest(relPath);
+                const localContent = refreshPreservedBinary ? undefined : await this.readFile(relPath);
                 if (preserveExistingLocalFiles && localContent!==undefined) {
                     this.baseCache[relPath] = localContent;
                     this.seenLocalEntities.add(relPath);
@@ -790,11 +931,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     await this.writeFile(relPath, remoteContent);
                     this.baseCache[relPath] = remoteContent;
                     this.seenLocalEntities.add(relPath);
+                    await this.recordSyncManifestEntry(relPath, vfsUri, remoteContent);
                 } else if (this.isLikelyBinaryRelPath(relPath)) {
                     this.setBypassCache(relPath, remoteContent);
                     await this.writeFile(relPath, remoteContent);
                     this.baseCache[relPath] = remoteContent;
                     this.seenLocalEntities.add(relPath);
+                    await this.recordSyncManifestEntry(relPath, vfsUri, remoteContent);
                 } else {
                     const dmp = new DiffMatchPatch();
                     const baseContentStr = new TextDecoder().decode(baseContent);
@@ -1120,6 +1263,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 delete this.baseCache[relPath];
                 this.seenLocalEntities.delete(relPath);
                 await vscode.workspace.fs.delete(toUri, {recursive:true});
+                this.removeSyncManifestEntry(relPath);
+                await this.persistSyncManifest();
                 if (action==='push') {
                     await getAgentReviewManager()?.afterLocalReplicaPush({
                         rootUri: this.baseUri,
@@ -1214,6 +1359,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         }
                         this.baseCache[relPath] = newContent;
                         this.seenLocalEntities.add(relPath);
+                        await this.recordSyncManifestEntry(relPath, action==='push' ? toUri : fromUri, newContent);
+                        await this.persistSyncManifest();
                         if (action==='push') {
                             try {
                                 await vscode.workspace.fs.readFile(toUri); // update remote cache
@@ -1353,6 +1500,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             ...definedInitializationOptions(options),
         };
         await this.ensureLocalReplicaSettings();
+        await this.loadSyncManifest();
         this.initialPullStatus = 'pending';
         // Per-file failures accumulate in failedInitialPulls; reset before each
         // attempt so a fresh init starts from a clean slate.
@@ -1378,6 +1526,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             ).then((choice) => {
                 if (choice==='Show Output') { getOutputChannel().show(true); }
             });
+            await this.persistSyncManifest();
             return;
         }
         if (this.failedInitialPulls.size>0) {
@@ -1391,6 +1540,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.initialPullStatus = 'complete';
             this.partialPullToastShown = false;
         }
+        await this.persistSyncManifest();
     }
 
     private surfacePartialPullToast() {
@@ -1433,6 +1583,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 await this.writeFile(relPath, content);
                 this.baseCache[relPath] = content;
                 this.seenLocalEntities.add(relPath);
+                await this.recordSyncManifestEntry(relPath, vfsUri, content);
                 this.failedInitialPulls.delete(relPath);
                 recovered.push(relPath);
                 getOutputChannel().appendLine(
@@ -1459,6 +1610,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 message: vscode.l10n.t('{count} files failed to download', {count: this.failedInitialPulls.size}),
             };
         }
+        await this.persistSyncManifest();
         return {recovered, stillFailed};
     }
 

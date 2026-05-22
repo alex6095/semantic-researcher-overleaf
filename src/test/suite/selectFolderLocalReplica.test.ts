@@ -32,6 +32,7 @@ class FakeVirtualFileSystem {
     private readonly connectionEmitter = new vscode.EventEmitter<string>();
     public readonly onDidChangeConnection = this.connectionEmitter.event;
     private readonly persists = new Map<string, PersistRecord>();
+    private readonly entityIds = new Map<string, string>();
 
     constructor(private readonly remoteRoot: vscode.Uri) {
         this.origin = remoteRoot;
@@ -40,6 +41,28 @@ class FakeVirtualFileSystem {
     pathToUri(...parts: string[]) {
         const segments = parts.flatMap(part => part.split('/').filter(Boolean));
         return vscode.Uri.joinPath(this.remoteRoot, ...segments);
+    }
+
+    setEntityId(relPath: string, entityId: string) {
+        this.entityIds.set('/' + relPath.split('/').filter(Boolean).join('/'), entityId);
+    }
+
+    async _resolveUri(uri: vscode.Uri) {
+        const relativePath = path.relative(this.remoteRoot.fsPath, uri.fsPath).split(path.sep).join('/');
+        const relPath = '/' + relativePath.split('/').filter(Boolean).join('/');
+        const fileName = path.basename(uri.fsPath);
+        const fileType = /\.tex$/i.test(fileName) ? 'doc' : 'file';
+        return {
+            fileName,
+            fileType,
+            fileEntity: {
+                _id: this.entityIds.get(relPath) ?? relPath,
+                name: fileName,
+                _type: fileType,
+                linkedFileData: null,
+                created: new Date(0).toISOString(),
+            },
+        };
     }
 
     async ensureConnectedForWrite() {}
@@ -663,6 +686,28 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, 'paper-renamed.pdf')), true);
         assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, 'local-only.tex')), true);
         assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, '.semantic-researcher-overleaf', 'settings.json')), true);
+    });
+
+    test('refreshes unchanged local media when the remote file fingerprint changes during attach', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('/supplement.pdf', 'pdf-v1');
+        await writeBytes(vscode.Uri.joinPath(remoteRoot, 'supplement.pdf'), Buffer.from('%PDF old\n', 'utf-8'));
+
+        const firstScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const nextPdf = Buffer.from('%PDF remote v2\n', 'utf-8');
+        fakeVfs.setEntityId('/supplement.pdf', 'pdf-v2');
+        await writeBytes(vscode.Uri.joinPath(remoteRoot, 'supplement.pdf'), nextPdf);
+
+        const restartedScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true});
+
+        assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(localRoot, 'supplement.pdf')), nextPdf);
     });
 
     test('deactivates a freshly activated project when exact folder selection is cancelled', async () => {

@@ -116,6 +116,8 @@ export async function activate(context: vscode.ExtensionContext) {
     let activeReplicaSyncPromise: Promise<void> | undefined;
     let activeReplicaSyncKey: string | undefined;
     let queuedActiveReplicaSyncKey: string | undefined;
+    let activeReplicaSyncTimer: NodeJS.Timeout | undefined;
+    let initializingLocalReplicaWorkspace = true;
 
     const getActiveReplicaSyncTarget = (): ActiveReplicaSyncTarget | undefined => {
         const uri = getActiveReplicaOriginUri();
@@ -174,16 +176,40 @@ export async function activate(context: vscode.ExtensionContext) {
         return activeReplicaSyncPromise;
     };
 
+    const scheduleActiveReplicaProjectSync = (delayMs: number) => {
+        if (activeReplicaSyncTimer) {
+            clearTimeout(activeReplicaSyncTimer);
+        }
+        activeReplicaSyncTimer = setTimeout(() => {
+            activeReplicaSyncTimer = undefined;
+            void syncActiveReplicaProject();
+        }, delayMs);
+    };
+
     context.subscriptions.push(
         onDidChangeActiveReplicaRoot(() => {
             void agentReviewManager.activate(getActiveReplicaRoot());
-            void syncActiveReplicaProject();
+            if (initializingLocalReplicaWorkspace) {
+                scheduleActiveReplicaProjectSync(1500);
+            } else {
+                void syncActiveReplicaProject();
+            }
+        }),
+        new vscode.Disposable(() => {
+            if (activeReplicaSyncTimer) {
+                clearTimeout(activeReplicaSyncTimer);
+                activeReplicaSyncTimer = undefined;
+            }
         }),
     );
 
     void initializeLocalReplicaWorkspace().then(async () => {
+        initializingLocalReplicaWorkspace = false;
         await agentReviewManager.activate(getActiveReplicaRoot());
-        await syncActiveReplicaProject();
+        scheduleActiveReplicaProjectSync(1500);
+    }).catch(error => {
+        initializingLocalReplicaWorkspace = false;
+        console.error('Local Replica workspace initialization failed:', error);
     });
 }
 
