@@ -5,6 +5,7 @@ import { SocketIOAPI, UpdateUserSchema } from '../api/socketio';
 import { VirtualFileSystem } from '../core/remoteFileSystemProvider';
 import { ChatViewProvider } from './chatViewProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
+import { isSupportedReplicaDocument } from '../utils/localReplicaWorkspace';
 
 interface ExtendedUpdateUserSchema extends UpdateUserSchema {
     selection?: {
@@ -60,7 +61,12 @@ export class ClientManager {
     private connectedFlag: boolean = true;
     private readonly chatViewer: ChatViewProvider;
     private disposed = false;
-    private statusTimer?: NodeJS.Timeout;
+    private readonly socketHandlers: vscode.Disposable;
+    private pendingPosition?: {uri: vscode.Uri, row: number, column: number};
+    private lastSentPosition?: {docId: string, row: number, column: number};
+    private positionTimer?: NodeJS.Timeout;
+    private lastPositionUpdateAt = 0;
+    private static readonly positionUpdateThrottleMs = 250;
 
     constructor(
         private readonly vfs: VirtualFileSystem,
@@ -68,19 +74,23 @@ export class ClientManager {
         private readonly publicId: string,
         private readonly socket: SocketIOAPI,
     ) {
-        this.socket.updateEventHandlers({
+        this.socketHandlers = this.socket.updateEventHandlers({
             onClientUpdated: (user:UpdateUserSchema) => {
                 if (user.id !== this.publicId) { this.setStatusActive(user.id); }
                 this.updatePosition(user.id, user.doc_id, user.row, user.column, user);
+                this.updateStatus();
             },
             onClientDisconnected: (id:string) => {
                 this.removePosition(id);
+                this.updateStatus();
             },
             onDisconnected: () => {
                 this.connectedFlag = false;
+                this.updateStatus();
             },
             onConnectionAccepted: (publicId:string) => {
                 this.connectedFlag = true;
+                this.updateStatus();
             }
         });
         this.socket.getConnectedUsers().then(users => {
@@ -102,7 +112,7 @@ export class ClientManager {
             });
         });
 
-        this.chatViewer = new ChatViewProvider(this.vfs, this.publicId, this.context.extensionUri, this.socket);
+        this.chatViewer = new ChatViewProvider(this.vfs, this.publicId, this.context.extensionUri, this.socket, () => this.updateStatus());
         this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 0);
         this.updateStatus();
     }
@@ -299,15 +309,61 @@ export class ClientManager {
         }
         
         this.status.show();
-        this.statusTimer = setTimeout(this.updateStatus.bind(this), 500);
     }
 
     setStatusActive(clientId:string, timeout:number=10) {
         this.inactivateTask && clearTimeout(this.inactivateTask);
         this.inactivateTask = setTimeout(() => {
             this.activeExists = undefined;
+            this.updateStatus();
         }, timeout*1000);
         this.activeExists = clientId;
+        this.updateStatus();
+    }
+
+    private queuePositionUpdate(uri: vscode.Uri, row: number, column: number) {
+        if (!isSupportedReplicaDocument(uri)) { return; }
+        this.pendingPosition = {uri, row, column};
+        const elapsed = Date.now() - this.lastPositionUpdateAt;
+        if (!this.positionTimer && elapsed>=ClientManager.positionUpdateThrottleMs) {
+            void this.sendPendingPosition().catch(console.error);
+            return;
+        }
+        if (this.positionTimer) { return; }
+        this.positionTimer = setTimeout(() => {
+            this.positionTimer = undefined;
+            void this.sendPendingPosition().catch(console.error);
+        }, Math.max(0, ClientManager.positionUpdateThrottleMs - elapsed));
+    }
+
+    private async sendPendingPosition() {
+        const pending = this.pendingPosition;
+        this.pendingPosition = undefined;
+        if (!pending || this.disposed) { return; }
+        this.lastPositionUpdateAt = Date.now();
+
+        let uri = pending.uri;
+        if (uri.scheme==='file') {
+            const path = await LocalReplicaSCMProvider.uriToPath(uri);
+            if (path) {
+                uri = this.vfs.pathToUri(path);
+            } else {
+                return;
+            }
+        }
+
+        const doc = uri && await this.vfs._resolveUri(uri);
+        const docId = doc?.fileEntity?._id;
+        if (!docId) { return; }
+        if (
+            this.lastSentPosition?.docId===docId
+            && this.lastSentPosition.row===pending.row
+            && this.lastSentPosition.column===pending.column
+        ) {
+            return;
+        }
+        this.lastSentPosition = {docId, row: pending.row, column: pending.column};
+        await this.socket.updatePosition(docId, pending.row, pending.column);
     }
 
     collaborationSettings() {
@@ -377,22 +433,11 @@ export class ClientManager {
             // update this client's position
             vscode.window.onDidChangeTextEditorSelection(async e => {
                 if (e.kind===undefined) { return; }
-                let uri = e.textEditor.document.uri;
-                // deal with local replica
-                if (uri.scheme==='file') {
-                    const path = await LocalReplicaSCMProvider.uriToPath(uri);
-                    if (path) {
-                        uri = this.vfs.pathToUri(path);
-                    } else {
-                        return;
-                    }
-                }
-
-                const doc = uri && await this.vfs._resolveUri(uri);
-                const docId = doc?.fileEntity?._id;
-                if (docId) {
-                    this.socket.updatePosition(docId, e.selections[0].active.line, e.selections[0].active.character);
-                }
+                this.queuePositionUpdate(
+                    e.textEditor.document.uri,
+                    e.selections[0].active.line,
+                    e.selections[0].active.character,
+                );
             }),
             // refresh decorations when editor is switched
             vscode.window.onDidChangeVisibleTextEditors(e => {
@@ -403,9 +448,14 @@ export class ClientManager {
 
     dispose() {
         this.disposed = true;
-        if (this.statusTimer) {
-            clearTimeout(this.statusTimer);
-            this.statusTimer = undefined;
+        this.socketHandlers.dispose();
+        if (this.positionTimer) {
+            clearTimeout(this.positionTimer);
+            this.positionTimer = undefined;
+        }
+        if (this.inactivateTask) {
+            clearTimeout(this.inactivateTask);
+            this.inactivateTask = undefined;
         }
     }
 }

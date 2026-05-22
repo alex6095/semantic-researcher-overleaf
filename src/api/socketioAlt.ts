@@ -52,17 +52,19 @@ type ListenEventsSupport = {
 
 class SyncTimer {
     private timer?: NodeJS.Timeout;
+    private stopped = false;
 
     constructor(
         private _interval: number,
         private readonly _callback: () => Promise<void>,
     ) {
-        this._callback().then(() => this.trigger());
+        this._callback().catch(console.error).then(() => this.trigger());
     }
 
     private trigger() {
+        if (this.stopped) { return; }
         this.timer = setTimeout(async () => {
-            await this._callback();
+            await this._callback().catch(console.error);
             this.trigger();
         }, this._interval);
     }
@@ -72,6 +74,7 @@ class SyncTimer {
     }
 
     stop() {
+        this.stopped = true;
         this.timer && clearTimeout(this.timer);
     }
 }
@@ -278,14 +281,23 @@ export class SocketIOAlt {
             this.msgCache = (await this.api.getMessages(this.identity, this.projectId)).messages?.map(m => m.id);
         } else {
             let fetchNum = 2;
+            const maxFetchNum = 100;
             let lastOldMessageId:string|undefined;
             let newMessages:ProjectMessageResponseSchema[]|undefined;
             // fetch messages until the last old message is found
             do {
                 newMessages = (await this.api.getMessages(this.identity, this.projectId, fetchNum)).messages;
+                if (!newMessages?.length) {
+                    this.msgCache = [];
+                    return;
+                }
                 const newMessageIds = newMessages?.map(m => m.id);
                 lastOldMessageId = newMessageIds?.find(id => this.msgCache?.includes(id));
                 if (lastOldMessageId===undefined) {
+                    if (fetchNum>=maxFetchNum) {
+                        this.msgCache = newMessageIds;
+                        return;
+                    }
                     fetchNum += 2;
                     continue;
                 } else {

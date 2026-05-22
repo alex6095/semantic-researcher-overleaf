@@ -130,6 +130,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private notify: (events:vscode.FileChangeEvent[])=>void;
     private clientManagerItem?: {manager: ClientManager, triggers: vscode.Disposable[]};
     private scmCollectionItem?: {collection: SCMCollectionProvider, triggers: vscode.Disposable[]};
+    private remoteWatchDisposable?: vscode.Disposable;
     private disposed = false;
 
     // Connection state is useful for SCM and UI layers: we don't want to trust
@@ -154,9 +155,11 @@ export class VirtualFileSystem extends vscode.Disposable {
             // dispose all triggers of scmCollection
             this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
             this.scmCollectionItem = undefined;
+            this.remoteWatchDisposable?.dispose();
+            this.remoteWatchDisposable = undefined;
             // disconnect socketio
             try {
-                this.socket.disconnect();
+                this.socket.dispose();
             } catch (error) {
                 console.warn(`Could not disconnect socket for ${this.origin.toString()}:`, error);
             }
@@ -303,8 +306,6 @@ export class VirtualFileSystem extends vscode.Disposable {
                     triggers: scmCollection.triggers,
                 };
             }
-            // trigger the first compile
-            vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compile`);
             return project;
         }).catch((err) => {
             this.lastConnectionError = err instanceof Error ? err : new Error(String(err));
@@ -449,7 +450,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     private remoteWatch(): void {
-        this.socket.updateEventHandlers({
+        this.remoteWatchDisposable?.dispose();
+        this.remoteWatchDisposable = this.socket.updateEventHandlers({
             onDisconnected: () => {
                 if (this.disposed) { return; }
                 if (this.root===undefined) { return; } // bypass the first initialization
@@ -1397,6 +1399,19 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
         return vfs;
     }
 
+    async deactivateProject(uri?: vscode.Uri): Promise<void> {
+        const targetQuery = uri ? canonicalizeOverleafUri(uri).query : this._activeVFS?.origin.query;
+        if (!targetQuery) { return; }
+
+        const vfs = this.vfss[targetQuery];
+        if (vfs===undefined) { return; }
+        if (this._activeVFS===vfs) {
+            this.setActiveVFS(undefined);
+        }
+        vfs.dispose();
+        delete this.vfss[targetQuery];
+    }
+
     notify(events :vscode.FileChangeEvent[]) {
         this._emitter.fire(events);
     }
@@ -1457,6 +1472,9 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.activateProject`, (uri: vscode.Uri) => {
                 return this.activateProject(uri);
+            }),
+            vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.deactivateProject`, (uri?: vscode.Uri) => {
+                return this.deactivateProject(uri);
             }),
         ];
     }

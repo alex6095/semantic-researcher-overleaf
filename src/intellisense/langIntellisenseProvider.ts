@@ -1,7 +1,8 @@
 import * as vscode from 'vscode';
 import { ROOT_NAME } from '../consts';
 import { RemoteFileSystemProvider } from '../core/remoteFileSystemProvider';
-import { getActiveReplicaOriginUri } from '../utils/localReplicaWorkspace';
+import { getActiveReplicaOriginUri, onDidChangeActiveReplicaRoot } from '../utils/localReplicaWorkspace';
+import { EventBus } from '../utils/eventBus';
 
 import { IntellisenseProvider } from '.';
 import { TexDocumentSymbolProvider } from './texDocumentSymbolProvider';
@@ -33,18 +34,19 @@ export class LangIntellisenseProvider {
         const config = vscode.workspace.getConfiguration("cSpell");
         if (config.inspect("enabledSchemes")!==undefined) {
             const enabledSchemes = config.get<Record<string, boolean>>("enabledSchemes") || {}; 
-            enabledSchemes[ROOT_NAME] = true; 
-            config.update("enabledSchemes", enabledSchemes, vscode.ConfigurationTarget.Global);
+            if (enabledSchemes[ROOT_NAME]!==true) {
+                enabledSchemes[ROOT_NAME] = true; 
+                config.update("enabledSchemes", enabledSchemes, vscode.ConfigurationTarget.Global);
+            }
         }
         
-        this.activate();
+        void this.updateStatus();
     }
 
-    async activate() {
+    async updateStatus() {
         const uri = getActiveReplicaOriginUri() ?? vscode.workspace.workspaceFolders?.[0].uri;
         if (uri?.scheme!==ROOT_NAME) {
             this.status.hide();
-            setTimeout(this.activate.bind(this), 200);
             return;
         }
 
@@ -61,13 +63,18 @@ export class LangIntellisenseProvider {
         }
         this.status.command = `${ROOT_NAME}.langIntellisense.settings`;
         this.status.show();
-        setTimeout(this.activate.bind(this), 200);
     }
 
     get triggers() {
         return [
             // register provider triggers
             ...this.providers.map(x => x.triggers).flat(),
+            this.status,
+            onDidChangeActiveReplicaRoot(() => void this.updateStatus()),
+            this.vfsm.onDidChangeActiveConnection(() => void this.updateStatus()),
+            vscode.window.onDidChangeActiveTextEditor(() => void this.updateStatus()),
+            vscode.workspace.onDidChangeWorkspaceFolders(() => void this.updateStatus()),
+            EventBus.on('spellCheckLanguageUpdateEvent', () => void this.updateStatus()),
         ];
     }
 }

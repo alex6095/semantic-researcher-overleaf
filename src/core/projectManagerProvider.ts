@@ -4,7 +4,7 @@ import { ProjectTagsResponseSchema } from '../api/base';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { RemoteFileSystemProvider, VFSConnectionState, VirtualFileSystem, parseUri } from './remoteFileSystemProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
-import { getActiveReplicaRoot, readReplicaSettings, setActiveReplicaRoot } from '../utils/localReplicaWorkspace';
+import { getActiveReplicaRoot, readReplicaSettingsSnapshot, setActiveReplicaRoot } from '../utils/localReplicaWorkspace';
 import { BrowserLogin } from '../auth/browserLogin';
 import { canonicalizeOverleafUri, stringifyOverleafUri } from '../utils/overleafUri';
 
@@ -792,7 +792,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
                             const scmKey = Object.keys(scmPersists).find(key => vscode.Uri.parse(scmPersists[key].baseUri).fsPath===item.label)!;
                             GlobalStateManager.updateServerProjectSCMPersist(this.context, serverName, projectId, scmKey);
                             // remove entry from quick pick
-                            quickPick.items = quickPick.items.filter(item => item.label!==item.label);
+                            quickPick.items = quickPick.items.filter(candidate => candidate.label!==item.label);
                         }
                     });
                 }
@@ -827,21 +827,24 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             return;
         }
 
-        await vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.activateProject`, uri) as VirtualFileSystem;
+        const previousActiveVfs = this.remoteFileSystem?.getActiveVFS();
+        const activatedVfs = await vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.activateProject`, uri) as VirtualFileSystem;
+        let completed = false;
 
-        const scm = await vscode.commands.executeCommand(
-            `${ROOT_NAME}.projectSCM.newSCMWithOptions`,
-            LocalReplicaSCMProvider,
-            {
-                exactBaseUri: true,
-                replaceExistingLabel: LocalReplicaSCMProvider.label,
-                preserveExistingLocalFiles: true,
-            },
-        ) as LocalReplicaSCMProvider | undefined;
+        try {
+            const scm = await vscode.commands.executeCommand(
+                `${ROOT_NAME}.projectSCM.newExactLocalReplicaSCM`,
+            ) as LocalReplicaSCMProvider | undefined;
 
-        if (scm) {
-            await setActiveReplicaRoot(scm.baseUri, {ensureWorkspaceFolder: true});
-            vscode.commands.executeCommand('workbench.view.explorer');
+            if (scm) {
+                await setActiveReplicaRoot(scm.baseUri, {ensureWorkspaceFolder: true});
+                vscode.commands.executeCommand('workbench.view.explorer');
+                completed = true;
+            }
+        } finally {
+            if (!completed && previousActiveVfs!==activatedVfs) {
+                await vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.deactivateProject`, uri);
+            }
         }
     }
 
@@ -859,7 +862,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         }
 
         for (const rootUri of candidateRoots.values()) {
-            const settings = await readReplicaSettings(rootUri);
+            const settings = await readReplicaSettingsSnapshot(rootUri);
             if (!settings?.uri) {
                 continue;
             }

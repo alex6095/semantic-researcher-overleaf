@@ -1,4 +1,7 @@
 import * as crypto from 'crypto';
+import * as nodeFs from 'fs/promises';
+import * as os from 'os';
+import * as nodePath from 'path';
 import * as vscode from 'vscode';
 import * as DiffMatchPatch from 'diff-match-patch';
 import { minimatch } from 'minimatch';
@@ -9,8 +12,10 @@ import {
     getActiveReplicaRoot,
     isLocalReplicaMetadataUri,
     localUriToPath,
+    normalizeLocalReplicaRelPath,
     pathToLocalUri,
     readReplicaSettings,
+    readReplicaSettingsSnapshot,
 } from '../utils/localReplicaWorkspace';
 import {
     LEGACY_REPLICA_SETTINGS_BACKUP_FILE,
@@ -67,6 +72,29 @@ interface PendingEvent {
 
 interface InitializeLocalReplicaOptions {
     preserveExistingLocalFiles?: boolean;
+    resetLocalFilesToRemote?: boolean;
+}
+
+interface ValidateExactBaseUriOptions {
+    beforeEmpty?: (baseUri: vscode.Uri) => void | Promise<void>;
+    projectUri?: vscode.Uri;
+}
+
+type ProtectedExactBaseUriReasonCode =
+    | 'filesystem-root'
+    | 'home-directory'
+    | 'workspace-root'
+    | 'mount-root'
+    | 'windows-user-profile-root'
+    | 'git-repository-root';
+
+class LocalReplicaFolderSelectionCancelledError extends Error {}
+class LocalReplicaFolderSelectionRejectedError extends Error {}
+
+function definedInitializationOptions(options?: InitializeLocalReplicaOptions): InitializeLocalReplicaOptions {
+    return Object.fromEntries(
+        Object.entries(options ?? {}).filter(([_key, value]) => value!==undefined),
+    ) as InitializeLocalReplicaOptions;
 }
 
 // Byte-true digest used to detect echoes in the bypass cache. The previous
@@ -133,8 +161,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // can't starve the path indefinitely.
     private pendingVfsEvents: Map<string, PendingEvent> = new Map();
     private pendingLocalEvents: Map<string, PendingEvent> = new Map();
-    private static readonly EVENT_COALESCE_MS = 250;
-    private static readonly EVENT_MAX_WAIT_MS = 2000;
+    private static readonly eventCoalesceMs = 250;
+    private static readonly eventMaxWaitMs = 2000;
     private initializationOptions: InitializeLocalReplicaOptions = {};
     private ignorePatterns: string[] = [
         '**/.*',
@@ -156,7 +184,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         '**/*.synctex.gz',
         '**/*.toc',
         '**/*.xdv',
-        '/*.pdf',
         '**/main.pdf',
         '**/output.pdf',
     ];
@@ -168,7 +195,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         super(vfs, baseUri);
     }
 
-    private static sanitizeProjectFolderName(projectName: string): string {
+    public static sanitizeProjectFolderName(projectName: string): string {
         let sanitized = projectName;
         if (process.platform==='win32') {
             sanitized = projectName
@@ -195,10 +222,139 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+    private static comparableFsPath(fsPath: string): string {
+        const normalized = nodePath.normalize(fsPath);
+        return process.platform==='win32' ? normalized.toLowerCase() : normalized;
+    }
+
+    private static async resolvedFsPath(uri: vscode.Uri): Promise<string> {
+        const resolvedPath = nodePath.resolve(uri.fsPath);
+        try {
+            return LocalReplicaSCMProvider.comparableFsPath(await nodeFs.realpath(resolvedPath));
+        } catch {
+            return LocalReplicaSCMProvider.comparableFsPath(resolvedPath);
+        }
+    }
+
+    private static async isGitRepositoryRoot(uri: vscode.Uri): Promise<boolean> {
+        return LocalReplicaSCMProvider.pathExists(vscode.Uri.joinPath(uri, '.git'));
+    }
+
+    private static isMountRoot(resolvedPath: string): boolean {
+        if (process.platform==='win32') { return false; }
+        const normalized = resolvedPath.replace(/\/+$/, '') || '/';
+        return normalized==='/mnt'
+            || /^\/mnt\/[^/]+$/i.test(normalized);
+    }
+
+    private static isWindowsUserProfileRoot(resolvedPath: string): boolean {
+        if (process.platform==='win32') {
+            return LocalReplicaSCMProvider.isNativeWindowsUserProfileRoot(resolvedPath);
+        }
+        const normalized = resolvedPath.replace(/\/+$/, '');
+        return /^\/mnt\/[^/]+\/Users$/i.test(normalized)
+            || /^\/mnt\/[^/]+\/Users\/[^/]+$/i.test(normalized);
+    }
+
+    private static isNativeWindowsUserProfileRoot(resolvedPath: string): boolean {
+        const normalized = nodePath.win32.normalize(resolvedPath).replace(/[\\/]+$/, '');
+        const parts = normalized.split(/[\\/]+/).filter(Boolean);
+        return /^[a-z]:$/i.test(parts[0] ?? '')
+            && parts[1]?.toLowerCase()==='users'
+            && (parts.length===2 || parts.length===3);
+    }
+
+    private static protectedExactBaseUriReasonMessage(reason: ProtectedExactBaseUriReasonCode): string {
+        switch (reason) {
+            case 'filesystem-root': return vscode.l10n.t('filesystem root');
+            case 'home-directory': return vscode.l10n.t('home directory');
+            case 'workspace-root': return vscode.l10n.t('workspace root');
+            case 'mount-root': return vscode.l10n.t('mount root');
+            case 'windows-user-profile-root': return vscode.l10n.t('Windows user profile root');
+            case 'git-repository-root': return vscode.l10n.t('Git repository root');
+        }
+    }
+
+    private static async getProtectedExactBaseUriReasonCode(baseUri: vscode.Uri): Promise<ProtectedExactBaseUriReasonCode | undefined> {
+        if (baseUri.scheme!=='file') {
+            return undefined;
+        }
+
+        const resolvedPath = await LocalReplicaSCMProvider.resolvedFsPath(baseUri);
+        const parsed = nodePath.parse(resolvedPath);
+        const homePath = await LocalReplicaSCMProvider.resolvedFsPath(vscode.Uri.file(os.homedir()));
+        const workspaceRoots = await Promise.all(
+            (vscode.workspace.workspaceFolders ?? [])
+                .filter(folder => folder.uri.scheme==='file')
+                .map(folder => LocalReplicaSCMProvider.resolvedFsPath(folder.uri)),
+        );
+
+        if (resolvedPath===nodePath.resolve(parsed.root)) {
+            return 'filesystem-root';
+        } else if (resolvedPath===homePath) {
+            return 'home-directory';
+        } else if (LocalReplicaSCMProvider.isMountRoot(resolvedPath)) {
+            return 'mount-root';
+        } else if (LocalReplicaSCMProvider.isWindowsUserProfileRoot(resolvedPath)) {
+            return 'windows-user-profile-root';
+        } else if (await LocalReplicaSCMProvider.isGitRepositoryRoot(baseUri)) {
+            return 'git-repository-root';
+        } else if (workspaceRoots.includes(resolvedPath)) {
+            return 'workspace-root';
+        }
+
+        return undefined;
+    }
+
+    private static async getProtectedExactBaseUriReason(baseUri: vscode.Uri): Promise<string | undefined> {
+        const reason = await LocalReplicaSCMProvider.getProtectedExactBaseUriReasonCode(baseUri);
+        return reason ? LocalReplicaSCMProvider.protectedExactBaseUriReasonMessage(reason) : undefined;
+    }
+
+    private static async rejectDangerousExactBaseUri(baseUri: vscode.Uri): Promise<void> {
+        if (baseUri.scheme!=='file') {
+            const message = vscode.l10n.t('Local Replica folder must be a local file-system path.');
+            getOutputChannel().appendLine(`${new Date().toISOString()} [exact folder rejected] ${baseUri.toString()}: non-local path`);
+            vscode.window.showErrorMessage(message);
+            throw new LocalReplicaFolderSelectionRejectedError('Local Replica folder must be a file URI.');
+        }
+
+        const reasonCode = await LocalReplicaSCMProvider.getProtectedExactBaseUriReasonCode(baseUri);
+        if (reasonCode) {
+            const reason = LocalReplicaSCMProvider.protectedExactBaseUriReasonMessage(reasonCode);
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [exact folder rejected] ${baseUri.fsPath || baseUri.toString()}: ${reason}`,
+            );
+            vscode.window.showErrorMessage(
+                vscode.l10n.t(
+                    'Refusing to use {path} as a Local Replica folder because it is a protected {reason}. Select a dedicated project folder instead.',
+                    {path: baseUri.fsPath || baseUri.toString(), reason},
+                ),
+            );
+            throw new LocalReplicaFolderSelectionRejectedError(`Protected Local Replica folder: ${reason}`);
+        }
+    }
+
+    private static async validateExistingExactReplicaSettings(
+        baseUri: vscode.Uri,
+        expectedProjectUri?: vscode.Uri,
+    ): Promise<'same-project' | 'different-project' | 'none'> {
+        const settings = await readReplicaSettingsSnapshot(baseUri);
+        if (!settings?.uri) {
+            return 'none';
+        }
+        if (!expectedProjectUri) {
+            return 'different-project';
+        }
+        const existingProjectUri = stringifyOverleafUri(vscode.Uri.parse(settings.uri));
+        const targetProjectUri = stringifyOverleafUri(expectedProjectUri);
+        return existingProjectUri===targetProjectUri ? 'same-project' : 'different-project';
+    }
+
     public setInitializationOptions(options?: InitializeLocalReplicaOptions) {
         this.initializationOptions = {
             ...this.initializationOptions,
-            ...options,
+            ...definedInitializationOptions(options),
         };
         return this;
     }
@@ -305,14 +461,43 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             await vscode.workspace.fs.stat(baseUri);
             return baseUri;
         } catch (error) {
+            if (error instanceof LocalReplicaFolderSelectionCancelledError) {
+                return Promise.reject(error);
+            }
             vscode.window.showErrorMessage( vscode.l10n.t('Invalid Path. Please make sure the absolute path to a folder with read/write permissions is used.') );
             return Promise.reject(error);
         }
     }
 
-    public static async validateExactBaseUri(uri: string): Promise<vscode.Uri> {
+    public static async validateExactBaseUri(uri: string, options?: ValidateExactBaseUriOptions): Promise<vscode.Uri> {
         try {
             const baseUri = vscode.Uri.file(uri);
+            if (await LocalReplicaSCMProvider.pathExists(baseUri)) {
+                const stat = await vscode.workspace.fs.stat(baseUri);
+                if (stat.type!==vscode.FileType.Directory) {
+                    throw new Error('Not a folder');
+                }
+
+                const settingsStatus = await LocalReplicaSCMProvider.validateExistingExactReplicaSettings(baseUri, options?.projectUri);
+                if (settingsStatus==='same-project') {
+                    const protectedReason = await LocalReplicaSCMProvider.getProtectedExactBaseUriReasonCode(baseUri);
+                    if (protectedReason!==undefined && protectedReason!=='workspace-root') {
+                        await LocalReplicaSCMProvider.rejectDangerousExactBaseUri(baseUri);
+                    }
+                    return baseUri;
+                }
+                if (settingsStatus==='different-project') {
+                    vscode.window.showErrorMessage(
+                        vscode.l10n.t(
+                            'The selected folder is already configured for a different Overleaf project: {path}. Select another folder.',
+                            {path: baseUri.fsPath || baseUri.toString()},
+                        ),
+                    );
+                    throw new LocalReplicaFolderSelectionRejectedError('Selected folder belongs to another Overleaf project.');
+                }
+            }
+
+            await LocalReplicaSCMProvider.rejectDangerousExactBaseUri(baseUri);
             if (await LocalReplicaSCMProvider.pathExists(baseUri)) {
                 const stat = await vscode.workspace.fs.stat(baseUri);
                 if (stat.type!==vscode.FileType.Directory) {
@@ -321,10 +506,50 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
             await vscode.workspace.fs.createDirectory(baseUri);
             await vscode.workspace.fs.stat(baseUri);
+            await LocalReplicaSCMProvider.ensureEmptyExactBaseUri(baseUri, options);
             return baseUri;
         } catch (error) {
+            if (
+                error instanceof LocalReplicaFolderSelectionCancelledError
+                || error instanceof LocalReplicaFolderSelectionRejectedError
+            ) {
+                return Promise.reject(error);
+            }
             vscode.window.showErrorMessage( vscode.l10n.t('Invalid Path. Please make sure the absolute path to a folder with read/write permissions is used.') );
             return Promise.reject(error);
+        }
+    }
+
+    private static async ensureEmptyExactBaseUri(baseUri: vscode.Uri, options?: ValidateExactBaseUriOptions): Promise<void> {
+        const entries = await vscode.workspace.fs.readDirectory(baseUri);
+        if (entries.length===0) { return; }
+
+        const emptyAndContinue = vscode.l10n.t('Empty Folder and Continue');
+        const cancel = vscode.l10n.t('Cancel');
+        const selected = await vscode.window.showWarningMessage(
+            vscode.l10n.t(
+                'The selected Local Replica folder is not empty: {path}. Empty it before syncing?',
+                {path: baseUri.fsPath || baseUri.toString()},
+            ),
+            {modal: true},
+            emptyAndContinue,
+            cancel,
+        );
+        if (selected!==emptyAndContinue) {
+            throw new LocalReplicaFolderSelectionCancelledError('Selected Local Replica folder is not empty.');
+        }
+
+        await options?.beforeEmpty?.(baseUri);
+        await LocalReplicaSCMProvider.emptyDirectory(baseUri);
+    }
+
+    private static async emptyDirectory(baseUri: vscode.Uri): Promise<void> {
+        const entries = await vscode.workspace.fs.readDirectory(baseUri);
+        for (const [name] of entries) {
+            await vscode.workspace.fs.delete(vscode.Uri.joinPath(baseUri, name), {
+                recursive: true,
+                useTrash: true,
+            });
         }
     }
 
@@ -340,6 +565,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return readReplicaSettings(rootUri ?? getActiveReplicaRoot());
     }
 
+    private normalizeConfinedRelPath(relPath: string, operation: string): string | undefined {
+        const normalized = normalizeLocalReplicaRelPath(relPath);
+        if (normalized===undefined) {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [path rejected] ${operation}: ${relPath}`,
+            );
+            return undefined;
+        }
+
+        return normalized;
+    }
+
+    private requireConfinedRelPath(relPath: string, operation: string): string {
+        const normalized = this.normalizeConfinedRelPath(relPath, operation);
+        if (normalized===undefined) {
+            throw new Error(`Invalid Local Replica path for ${operation}: ${relPath}`);
+        }
+        return normalized;
+    }
+
     // Force the pending push for a local URI to fire NOW (cancelling its
     // debounce timer) and resolve when the resulting sync settles. If the
     // watcher hasn't fired yet, synthesise a push so callers that need the
@@ -348,9 +593,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     public async flushPendingPush(localUri: vscode.Uri): Promise<void> {
         if (localUri.scheme!=='file') { return; }
         const basePath = this.baseUri.path.replace(/\/+$/, '');
-        if (localUri.path!==basePath && !localUri.path.startsWith(basePath + '/')) { return; }
+        if (localUri.path===basePath) { return; }
+        if (!localUri.path.startsWith(basePath + '/')) { return; }
         if (isLocalReplicaMetadataUri(localUri, this.baseUri)) { return; }
-        const relPath = normalizeReplicaPath(localUri.path.slice(basePath.length));
+        const relPath = this.normalizeConfinedRelPath(localUri.path.slice(basePath.length), 'flush pending push');
+        if (relPath===undefined) { return; }
         if (this.matchIgnorePatterns(relPath)) { return; }
 
         const pending = this.pendingLocalEvents.get(relPath);
@@ -458,8 +705,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             cancellable: true,
         }, async (progress, token) => {
             const preserveExistingLocalFiles = options.preserveExistingLocalFiles ?? false;
+            const resetLocalFilesToRemote = options.resetLocalFilesToRemote ?? false;
             // breadth-first search for the files
             const files: [string,string][] = [];
+            const directories: string[] = [];
             const queue: string[] = [root];
             while (queue.length!==0) {
                 const nextRoot = queue.shift();
@@ -472,18 +721,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (token.isCancellationRequested) { return undefined; }
                 //
                 for (const [name, type] of items) {
-                    const relPath = nextRoot + name;
+                    const relPath = this.normalizeConfinedRelPath(nextRoot + name, 'initial pull');
+                    if (relPath===undefined) {
+                        continue;
+                    }
                     if (this.matchIgnorePatterns(relPath)) {
                         continue;
                     }
                     if (type === vscode.FileType.Directory) {
-                        this.setBypassCache(relPath, new Uint8Array(), 'pull');
-                        const localUri = this.localUri(relPath);
-                        await this.withFileSystemContext(
-                            'Create local directory',
-                            localUri,
-                            () => vscode.workspace.fs.createDirectory(localUri),
-                        );
+                        directories.push(relPath);
                         queue.push(relPath+'/');
                     } else {
                         files.push([name, relPath]);
@@ -491,10 +737,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 }
             }
 
+            if (resetLocalFilesToRemote) {
+                if (token.isCancellationRequested) { return false; }
+                await this.clearLocalProjectFilesForRemoteReset();
+            }
+
+            for (const relPath of directories) {
+                if (token.isCancellationRequested) { return false; }
+                this.setBypassCache(relPath, new Uint8Array(), 'pull');
+                const localUri = this.localUri(relPath);
+                await this.withFileSystemContext(
+                    'Create local directory',
+                    localUri,
+                    () => vscode.workspace.fs.createDirectory(localUri),
+                );
+            }
+
             // sync the files
             const total = files.length;
             for (let i=0; i<total; i++) {
-                const [name, relPath] = files[i];
+                const [_name, relPath] = files[i];
                 const vfsUri = this.vfs.pathToUri(relPath);
                 if (token.isCancellationRequested) { return false; }
                 progress.report({increment: 100/total, message: relPath});
@@ -528,6 +790,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     await this.writeFile(relPath, remoteContent);
                     this.baseCache[relPath] = remoteContent;
                     this.seenLocalEntities.add(relPath);
+                } else if (this.isLikelyBinaryRelPath(relPath)) {
+                    this.setBypassCache(relPath, remoteContent);
+                    await this.writeFile(relPath, remoteContent);
+                    this.baseCache[relPath] = remoteContent;
+                    this.seenLocalEntities.add(relPath);
                 } else {
                     const dmp = new DiffMatchPatch();
                     const baseContentStr = new TextDecoder().decode(baseContent);
@@ -555,6 +822,49 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
             return true;
         });
+    }
+
+    private async collectLocalProjectRelPaths(rootUri: vscode.Uri = this.baseUri): Promise<string[]> {
+        const relPaths: string[] = [];
+        const entries = await vscode.workspace.fs.readDirectory(rootUri);
+        const basePath = this.baseUri.path.replace(/\/+$/, '');
+        for (const [name, type] of entries) {
+            const childUri = vscode.Uri.joinPath(rootUri, name);
+            if (isLocalReplicaMetadataUri(childUri, this.baseUri)) {
+                continue;
+            }
+            const relPath = normalizeReplicaPath(childUri.path.slice(basePath.length));
+            relPaths.push(relPath);
+            if (type===vscode.FileType.Directory) {
+                relPaths.push(...await this.collectLocalProjectRelPaths(childUri));
+            }
+        }
+        return relPaths;
+    }
+
+    private async clearLocalProjectFilesForRemoteReset(): Promise<void> {
+        const relPaths = await this.collectLocalProjectRelPaths();
+        for (const relPath of relPaths) {
+            this.setBypassCache(relPath, undefined, 'pull');
+        }
+
+        const entries = await vscode.workspace.fs.readDirectory(this.baseUri);
+        for (const [name] of entries) {
+            const childUri = vscode.Uri.joinPath(this.baseUri, name);
+            if (isLocalReplicaMetadataUri(childUri, this.baseUri)) {
+                continue;
+            }
+            await this.withFileSystemContext(
+                'Delete local file before remote-authoritative sync',
+                childUri,
+                () => vscode.workspace.fs.delete(childUri, {recursive: true, useTrash: true}),
+            );
+        }
+
+        this.baseCache = {};
+        this.seenLocalEntities.clear();
+        this.pendingLocalEvents.forEach(pending => clearTimeout(pending.timer));
+        this.pendingLocalEvents.clear();
     }
 
     private bypassSync(action:'push'|'pull', type:'update'|'delete', relPath: string, content?: Uint8Array): boolean {
@@ -616,7 +926,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         task: () => Promise<T>,
         opts?: { delays?: number[]; betweenAttempts?: () => Promise<void> },
     ): Promise<T> {
-        const delays = opts?.delays ?? LocalReplicaSCMProvider.PUSH_RETRY_DELAYS;
+        const delays = opts?.delays ?? LocalReplicaSCMProvider.pushRetryDelays;
         const betweenAttempts = opts?.betweenAttempts;
         let lastError: unknown;
         for (let attempt = 0; attempt<delays.length; attempt++) {
@@ -649,7 +959,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             await this.vfs.ensureConnectedForWrite();
             await vscode.workspace.fs.writeFile(toUri, content);
         }, {
-            delays: LocalReplicaSCMProvider.PUSH_RETRY_DELAYS,
+            delays: LocalReplicaSCMProvider.pushRetryDelays,
             // Match the pull-retry pattern: wait passively for the connection
             // state machine to settle rather than firing reconnect() on every
             // attempt. The task itself already calls ensureConnectedForWrite()
@@ -660,7 +970,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             // attempts mirrors how pull handles a flapping socket without
             // amplifying the failure into a socket storm.
             betweenAttempts: async () => {
-                await this.waitForConnectedOrTimeout(LocalReplicaSCMProvider.PUSH_RECONNECT_WAIT_MS);
+                await this.waitForConnectedOrTimeout(LocalReplicaSCMProvider.pushReconnectWaitMs);
             },
         });
     }
@@ -671,10 +981,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // files into the replica. Push now matches the same budget so a
     // 1-2 second socket reconnect doesn't silently lose accepted edits — the
     // prior 0.9s budget meant push gave up while pull was still recovering.
-    private static readonly PULL_RETRY_DELAYS = [0, 300, 900, 2400];
-    private static readonly PUSH_RETRY_DELAYS = [0, 300, 900, 2400];
-    private static readonly PULL_RECONNECT_WAIT_MS = 5000;
-    private static readonly PUSH_RECONNECT_WAIT_MS = 5000;
+    private static readonly pullRetryDelays = [0, 300, 900, 2400];
+    private static readonly pushRetryDelays = [0, 300, 900, 2400];
+    private static readonly pullReconnectWaitMs = 5000;
+    private static readonly pushReconnectWaitMs = 5000;
 
     private isLikelyBinaryRelPath(relPath: string): boolean {
         return /\.(pdf|png|jpe?g|gif|svg|webp|bmp|tiff?|eps|ps|zip|tar|gz|bz2|7z|rar|mp[34]|wav|ogg|woff2?|ttf|otf|ico)$/i.test(relPath);
@@ -696,19 +1006,37 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
             return content;
         }, {
-            delays: LocalReplicaSCMProvider.PULL_RETRY_DELAYS,
+            delays: LocalReplicaSCMProvider.pullRetryDelays,
             // Critical: do NOT call vfs.reconnect() between attempts. Parallel
             // pulls each issuing reconnect() cascade-clear the project state
             // and produce a socket storm severe enough that Overleaf rate-limits
             // us. Instead, wait passively for the existing reconnect cycle to
             // resolve (it does on its own via the VFS's internal logic).
             betweenAttempts: async () => {
-                await this.waitForConnectedOrTimeout(LocalReplicaSCMProvider.PULL_RECONNECT_WAIT_MS);
+                await this.waitForConnectedOrTimeout(LocalReplicaSCMProvider.pullReconnectWaitMs);
             },
         });
     }
 
     private async applySync(action:'push'|'pull', type: 'update'|'delete', relPath:string, fromUri: vscode.Uri, toUri: vscode.Uri) {
+        const originalRelPath = relPath;
+        const confinedRelPath = this.normalizeConfinedRelPath(relPath, `${action} ${type}`);
+        if (confinedRelPath===undefined) {
+            this.status = {status: 'idle', message: ''};
+            EventBus.fire('scmSyncCompleteEvent', {
+                rootUri: this.baseUri,
+                relPath: normalizeReplicaPath(originalRelPath),
+                direction: action,
+                type,
+                outcome: 'blocked',
+                error: 'invalid replica path',
+            });
+            return;
+        }
+        relPath = confinedRelPath;
+        if (action==='pull') {
+            toUri = this.localUri(relPath);
+        }
         this.status = {status: action, message: `${type}: ${relPath}`};
 
         // Track the terminal outcome so we can fire a single scmSyncCompleteEvent
@@ -948,14 +1276,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // the `pending` map entry is the source of truth.
     private computeDebounceDelay(firstEventAt: number): number {
         const elapsed = Date.now() - firstEventAt;
-        const remainingBudget = LocalReplicaSCMProvider.EVENT_MAX_WAIT_MS - elapsed;
-        return Math.max(0, Math.min(LocalReplicaSCMProvider.EVENT_COALESCE_MS, remainingBudget));
+        const remainingBudget = LocalReplicaSCMProvider.eventMaxWaitMs - elapsed;
+        return Math.max(0, Math.min(LocalReplicaSCMProvider.eventCoalesceMs, remainingBudget));
     }
 
     private syncFromVFS(vfsUri: vscode.Uri, type: 'update'|'delete') {
         const {pathParts} = parseUri(vfsUri);
         pathParts.at(-1)==='' && pathParts.pop(); // remove the last empty string
-        const relPath = normalizeReplicaPath('/' + pathParts.join('/'));
+        const relPath = this.normalizeConfinedRelPath('/' + pathParts.join('/'), 'sync from Overleaf');
+        if (relPath===undefined) { return; }
         // Early ignore-pattern short-circuit. Without this, ignored paths
         // (compile artifacts under /.output/*, .aux, .log, etc.) still flow
         // through enqueueSync + applySync's stat + readFile before the
@@ -993,7 +1322,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // baseUri can otherwise drop the leading slash, producing a relPath
         // shape that disagrees with the pull side and defeats the bypass cache.
         const basePath = this.baseUri.path.replace(/\/+$/, '');
-        const relPath = normalizeReplicaPath(localUri.path.slice(basePath.length));
+        if (localUri.path===basePath || !localUri.path.startsWith(basePath + '/')) { return; }
+        const relPath = this.normalizeConfinedRelPath(localUri.path.slice(basePath.length), 'sync to Overleaf');
+        if (relPath===undefined) { return; }
         // Same early-ignore short-circuit as syncFromVFS — no point enqueueing
         // work that bypassSync would reject anyway.
         if (this.matchIgnorePatterns(relPath)) { return; }
@@ -1017,8 +1348,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     public async initializeLocalReplica(options?: InitializeLocalReplicaOptions) {
         const initializationOptions = {
-            ...this.initializationOptions,
-            ...options,
+            resetLocalFilesToRemote: false,
+            ...definedInitializationOptions(this.initializationOptions),
+            ...definedInitializationOptions(options),
         };
         await this.ensureLocalReplicaSettings();
         this.initialPullStatus = 'pending';
@@ -1234,7 +1566,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private localUri(relPath: string): vscode.Uri {
-        return vscode.Uri.joinPath(this.baseUri, relPath.replace(/^\/+/, ''));
+        const confinedRelPath = this.requireConfinedRelPath(relPath, 'local URI resolution');
+        return vscode.Uri.joinPath(this.baseUri, ...confinedRelPath.replace(/^\/+/, '').split('/'));
     }
 
     private async withFileSystemContext<T>(
@@ -1250,7 +1583,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private async ensureParentDirectory(relPath: string) {
-        const pathParts = relPath.replace(/^\/+/, '').split('/').filter(Boolean);
+        const confinedRelPath = this.requireConfinedRelPath(relPath, 'create local parent directory');
+        const pathParts = confinedRelPath.replace(/^\/+/, '').split('/');
         if (pathParts.length<=1) { return; }
         const parentUri = vscode.Uri.joinPath(this.baseUri, ...pathParts.slice(0, -1));
         await this.withFileSystemContext(
@@ -1271,7 +1605,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     readFile(relPath: string): Thenable<Uint8Array|undefined> {
-        const uri = this.localUri(relPath);
+        let uri: vscode.Uri;
+        try {
+            uri = this.localUri(relPath);
+        } catch {
+            return Promise.resolve(undefined);
+        }
         return new Promise(async (resolve, reject) => {
             try {
                 const content = await vscode.workspace.fs.readFile(uri);

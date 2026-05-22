@@ -1,4 +1,6 @@
 import * as vscode from 'vscode';
+import * as os from 'os';
+import * as nodePath from 'path';
 import { VirtualFileSystem } from '../core/remoteFileSystemProvider';
 
 import { BaseSCM, CommitItem, SettingItem } from ".";
@@ -9,6 +11,8 @@ import { GlobalStateManager } from '../utils/globalStateManager';
 import { EventBus } from '../utils/eventBus';
 import { ROOT_NAME } from '../consts';
 import { formatUnknownError } from '../utils/errorMessage';
+import { stringifyOverleafUri } from '../utils/overleafUri';
+import { readReplicaSettingsSnapshot } from '../utils/localReplicaWorkspace';
 
 const supportedSCMs = [
     LocalReplicaSCMProvider,
@@ -48,10 +52,22 @@ interface SCMRecord {
     triggers: vscode.Disposable[];
 }
 
+interface SuspendedSCMRecord {
+    item: SCMRecord;
+    wasEnabled: boolean;
+}
+
 interface CreateSCMOptions {
     exactBaseUri?: boolean;
     replaceExistingLabel?: string;
     preserveExistingLocalFiles?: boolean;
+    resetLocalFilesToRemote?: boolean;
+}
+
+interface PromptBaseUriOptions {
+    title?: string;
+    placeholder?: string;
+    value?: string;
 }
 
 function parsePersistedBaseUri(baseUri: string): vscode.Uri {
@@ -182,6 +198,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
             if (existing.scm instanceof LocalReplicaSCMProvider) {
                 existing.scm.setInitializationOptions({
                     preserveExistingLocalFiles: options?.preserveExistingLocalFiles,
+                    resetLocalFilesToRemote: options?.resetLocalFilesToRemote,
                 });
             }
             let activated = false;
@@ -201,6 +218,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
             if (!activated && existing.scm instanceof LocalReplicaSCMProvider) {
                 await existing.scm.initializeLocalReplica({
                     preserveExistingLocalFiles: options?.preserveExistingLocalFiles,
+                    resetLocalFilesToRemote: options?.resetLocalFilesToRemote,
                 });
             }
             return existing.scm;
@@ -233,6 +251,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
         if (scm instanceof LocalReplicaSCMProvider) {
             scm.setInitializationOptions({
                 preserveExistingLocalFiles: options?.preserveExistingLocalFiles,
+                resetLocalFilesToRemote: options?.resetLocalFilesToRemote,
             });
         }
         // insert into global state
@@ -277,6 +296,34 @@ export class SCMCollectionProvider extends vscode.Disposable {
         }
     }
 
+    private suspendSCMsByLabel(label: string, keepBaseUri?: vscode.Uri): SuspendedSCMRecord[] {
+        const suspended: SuspendedSCMRecord[] = [];
+        this.scms
+            .filter(item => (item.scm.constructor as any).label===label)
+            .filter(item => keepBaseUri===undefined || item.scm.baseUri.toString()!==keepBaseUri.toString())
+            .forEach(item => {
+                suspended.push({item, wasEnabled: item.enabled});
+                item.triggers.forEach(trigger => trigger.dispose());
+                item.triggers = [];
+            });
+        this.updateStatus();
+        return suspended;
+    }
+
+    private async restoreSuspendedSCMs(suspended: SuspendedSCMRecord[]) {
+        for (const {item, wasEnabled} of suspended) {
+            if (!wasEnabled || !item.enabled || !this.scms.includes(item) || item.triggers.length!==0) {
+                continue;
+            }
+            try {
+                item.triggers = await item.scm.triggers;
+            } catch (error) {
+                console.error(`Could not restore "${(item.scm.constructor as any).label}" watcher for ${item.scm.baseUri.toString()}:`, error);
+            }
+        }
+        this.updateStatus();
+    }
+
     private removeSCMsByLabel(label: string, keepBaseUri?: vscode.Uri) {
         [...this.scms]
             .filter(item => (item.scm.constructor as any).label===label)
@@ -292,30 +339,57 @@ export class SCMCollectionProvider extends vscode.Disposable {
         this.updateStatus();
     }
 
-    private createNewSCM(scmProto: SupportedSCM, options?: CreateSCMOptions) {
+    private promptBaseUri(scmProto: SupportedSCM, options?: PromptBaseUriOptions): Promise<string | undefined> {
         return new Promise(resolve => {
             const inputBox = scmProto.baseUriInputBox;
+            let settled = false;
+            const finish = (value?: string) => {
+                if (settled) { return; }
+                settled = true;
+                inputBox.dispose();
+                resolve(value);
+            };
             inputBox.ignoreFocusOut = true;
-            inputBox.title = vscode.l10n.t('Create Source Control: {scm}', {scm:scmProto.label});
+            inputBox.title = options?.title ?? vscode.l10n.t('Create Source Control: {scm}', {scm:scmProto.label});
+            if (options?.placeholder!==undefined) {
+                inputBox.placeholder = options.placeholder;
+            }
+            if (options?.value!==undefined) {
+                inputBox.value = options.value;
+            }
             inputBox.buttons = [{iconPath: new vscode.ThemeIcon('check')}];
             inputBox.show();
             //
             inputBox.onDidTriggerButton(() => {
-                inputBox.hide();
-                resolve(inputBox.value);
+                finish(inputBox.value);
             });
             inputBox.onDidAccept(() => {
                 if (inputBox.activeItems.length===0) {
-                    inputBox.hide();
-                    resolve(inputBox.value);
+                    finish(inputBox.value);
                 }
             });
-        })
+            inputBox.onDidHide(() => {
+                finish(undefined);
+            });
+        });
+    }
+
+    private async isSameProjectLocalReplica(baseUri: vscode.Uri): Promise<boolean> {
+        const settings = await readReplicaSettingsSnapshot(baseUri);
+        if (!settings?.uri) {
+            return false;
+        }
+        return stringifyOverleafUri(vscode.Uri.parse(settings.uri))===stringifyOverleafUri(this.vfs.origin);
+    }
+
+    private createNewSCM(scmProto: SupportedSCM, options?: CreateSCMOptions) {
+        if (options?.exactBaseUri && scmProto===LocalReplicaSCMProvider) {
+            return this.createNewExactLocalReplicaSCM();
+        }
+
+        return this.promptBaseUri(scmProto)
         .then((uri) => {
-            if (options?.exactBaseUri && scmProto===LocalReplicaSCMProvider) {
-                return LocalReplicaSCMProvider.validateExactBaseUri(uri as string || '');
-            }
-            return scmProto.validateBaseUri(uri as string || '', this.vfs.projectName);
+            return scmProto.validateBaseUri(uri || '', this.vfs.projectName);
         })
         .then(async (baseUri) => {
             if (baseUri) {
@@ -330,6 +404,52 @@ export class SCMCollectionProvider extends vscode.Disposable {
             }
             return undefined;
         });
+    }
+
+    private async createNewExactLocalReplicaSCM() {
+        const suggestedProjectFolder = nodePath.join(
+            os.homedir(),
+            'Overleaf',
+            LocalReplicaSCMProvider.sanitizeProjectFolderName(this.vfs.projectName),
+        );
+        const selectedPath = await this.promptBaseUri(LocalReplicaSCMProvider, {
+            title: vscode.l10n.t('Select Project Folder Locally'),
+            placeholder: vscode.l10n.t('e.g., dedicated local project folder'),
+            value: suggestedProjectFolder,
+        });
+        if (selectedPath===undefined) {
+            return undefined;
+        }
+
+        let suspended: SuspendedSCMRecord[] = [];
+        let baseUri: vscode.Uri | undefined;
+        try {
+            baseUri = await LocalReplicaSCMProvider.validateExactBaseUri(selectedPath || '', {
+                projectUri: this.vfs.origin,
+                beforeEmpty: () => {
+                    suspended = this.suspendSCMsByLabel(LocalReplicaSCMProvider.label);
+                },
+            });
+            const attachOnly = await this.isSameProjectLocalReplica(baseUri);
+            const scm = await this.createSCM(LocalReplicaSCMProvider, baseUri, true, true, {
+                preserveExistingLocalFiles: attachOnly,
+                resetLocalFilesToRemote: !attachOnly,
+            });
+            if (!scm) {
+                if (!attachOnly) {
+                    this.vfs.setProjectSCMPersist(baseUri.toString(), undefined);
+                }
+                await this.restoreSuspendedSCMs(suspended);
+                return undefined;
+            }
+            this.removeSCMsByLabel(LocalReplicaSCMProvider.label, baseUri);
+            vscode.window.showInformationMessage( vscode.l10n.t('"{scm}" created: {uri}.', {scm:LocalReplicaSCMProvider.label, uri: decodeURI(scm.baseUri.toString()) }) );
+            return scm;
+        } catch (error) {
+            await this.restoreSuspendedSCMs(suspended);
+            console.error(`Exact Local Replica creation failed${baseUri ? ` for ${baseUri.toString()}` : ''}:`, error);
+            return undefined;
+        }
     }
 
     private configSCM(scmItem: SCMRecord) {
@@ -445,6 +565,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.newSCMWithOptions`, (scmProto, options?: CreateSCMOptions) => {
                 return this.createNewSCM(scmProto, options);
+            }),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.newExactLocalReplicaSCM`, () => {
+                return this.createNewExactLocalReplicaSCM();
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.ensureLocalReplicaSCM`, (baseUri: vscode.Uri) => {
                 return this.ensureLocalReplicaSCM(baseUri);

@@ -1,7 +1,8 @@
 /* eslint-disable @typescript-eslint/naming-convention */
+import * as vscode from 'vscode';
 import { Identity, BaseAPI, ProjectMessageResponseSchema } from './base';
 import { FileEntity, DocumentEntity, FileRefEntity, FileType, FolderEntity, ProjectEntity } from '../core/remoteFileSystemProvider';
-import { EventBus } from '../utils/eventBus';
+import { EventBus, Events } from '../utils/eventBus';
 import { SocketIOAlt } from './socketioAlt';
 
 function decodePackedUtf8(text: string): string {
@@ -117,8 +118,9 @@ export class SocketIOAPI {
         }
         // create emit
         (this.socket.emit)[require('util').promisify.custom] = (event:string, ...args:any[]) => {
+            let timeout: NodeJS.Timeout;
             const timeoutPromise = new Promise((_, reject) => {
-                setTimeout(() => {
+                timeout = setTimeout(() => {
                     reject(new Error('timeout'));
                 }, SOCKET_ACK_TIMEOUT_MS);
             });
@@ -131,7 +133,7 @@ export class SocketIOAPI {
                     }
                 });
             });
-            return Promise.race([waitPromise, timeoutPromise]);
+            return Promise.race([waitPromise, timeoutPromise]).finally(() => clearTimeout(timeout));
         };
         this.emit = require('util').promisify(this.socket.emit).bind(this.socket);
         // resume handlers
@@ -162,9 +164,11 @@ export class SocketIOAPI {
             || error.message==='connect_failed';
     }
 
-    private disconnectSocket() {
+    private disconnectSocket(options: {removeListeners?: boolean} = {removeListeners: true}) {
         try {
-            this.socket?.removeAllListeners?.();
+            if (options.removeListeners!==false) {
+                this.socket?.removeAllListeners?.();
+            }
             this.socket?.disconnect();
         } catch {
             // Ignore cleanup errors from already-closing transports.
@@ -248,7 +252,11 @@ export class SocketIOAPI {
     }
 
     disconnect() {
-        this.socket.disconnect();
+        this.disconnectSocket({removeListeners: false});
+    }
+
+    dispose() {
+        this.disconnectSocket();
     }
 
     get handlers() {
@@ -274,87 +282,106 @@ export class SocketIOAPI {
         });
     }
 
-    updateEventHandlers(handlers: EventsHandler) {
+    updateEventHandlers(handlers: EventsHandler): vscode.Disposable {
         this._handlers.push(handlers);
+        const disposables: vscode.Disposable[] = [];
+        const addSocketListener = (event: string, listener: (...args:any[]) => void) => {
+            const socket = this.socket;
+            socket.on(event, listener);
+            disposables.push(new vscode.Disposable(() => {
+                socket.removeListener?.(event, listener);
+                socket.off?.(event, listener);
+            }));
+        };
+        const addEventBusListener = <T extends keyof Events>(event: T, listener: (arg: Events[T]) => void) => {
+            disposables.push(EventBus.on(event, listener));
+        };
         Object.values(handlers).forEach((handler) => {
             switch (handler) {
                 case handlers.onFileCreated:
-                    this.socket.on('reciveNewDoc', (parentFolderId:string, doc:DocumentEntity) => {
+                    addSocketListener('reciveNewDoc', (parentFolderId:string, doc:DocumentEntity) => {
                         handler(parentFolderId, 'doc', doc);
                     });
-                    this.socket.on('reciveNewFile', (parentFolderId:string, file:FileRefEntity) => {
+                    addSocketListener('reciveNewFile', (parentFolderId:string, file:FileRefEntity) => {
                         handler(parentFolderId, 'file', file);
                     });
-                    this.socket.on('reciveNewFolder', (parentFolderId:string, folder:FolderEntity) => {
+                    addSocketListener('reciveNewFolder', (parentFolderId:string, folder:FolderEntity) => {
                         handler(parentFolderId, 'folder', folder);
                     });
                     break;
                 case handlers.onFileRenamed:
-                    this.socket.on('reciveEntityRename', (entityId:string, newName:string) => {
+                    addSocketListener('reciveEntityRename', (entityId:string, newName:string) => {
                         handler(entityId, newName);
                     });
                     break;
                 case handlers.onFileRemoved:
-                    this.socket.on('removeEntity', (entityId:string) => {
+                    addSocketListener('removeEntity', (entityId:string) => {
                         handler(entityId);
                     });
                     break;
                 case handlers.onFileMoved:
-                    this.socket.on('reciveEntityMove', (entityId:string, folderId:string) => {
+                    addSocketListener('reciveEntityMove', (entityId:string, folderId:string) => {
                         handler(entityId, folderId);
                     });
                     break;
                 case handlers.onFileChanged:
-                    this.socket.on('otUpdateApplied', (update: UpdateSchema) => {
+                    addSocketListener('otUpdateApplied', (update: UpdateSchema) => {
                         handler(update);
                     });
                     break;
                 case handlers.onDisconnected:
-                    this.socket.on('disconnect', () => {
+                    addSocketListener('disconnect', () => {
                         handler();
                     });
                     break;
                 case handlers.onConnectionAccepted:
-                    this.socket.on('connectionAccepted', (_:any, publicId:any) => {
+                    addSocketListener('connectionAccepted', (_:any, publicId:any) => {
                         handler(publicId);
                     });
-                    EventBus.on('socketioConnectedEvent', (arg:{publicId:string}) => {
+                    addEventBusListener('socketioConnectedEvent', (arg:{publicId:string}) => {
                         handler(arg.publicId);
                     });
                     break;
                 case handlers.onClientUpdated:
-                    this.socket.on('clientTracking.clientUpdated', (user:UpdateUserSchema) => {
+                    addSocketListener('clientTracking.clientUpdated', (user:UpdateUserSchema) => {
                         handler(user);
                     });
                     break;
                 case handlers.onClientDisconnected:
-                    this.socket.on('clientTracking.clientDisconnected', (id:string) => {
+                    addSocketListener('clientTracking.clientDisconnected', (id:string) => {
                         handler(id);
                     });
                     break;
                 case handlers.onReceivedMessage:
-                    this.socket.on('new-chat-message', (message:ProjectMessageResponseSchema) => {
+                    addSocketListener('new-chat-message', (message:ProjectMessageResponseSchema) => {
                         handler(message);
                     });
                     break;
                 case handlers.onSpellCheckLanguageUpdated:
-                    this.socket.on('spellCheckLanguageUpdated', (language:string) => {
+                    addSocketListener('spellCheckLanguageUpdated', (language:string) => {
                         handler(language);
                     });
                     break;
                 case handlers.onCompilerUpdated:
-                    this.socket.on('compilerUpdated', (compiler:string) => {
+                    addSocketListener('compilerUpdated', (compiler:string) => {
                         handler(compiler);
                     });
                     break;
                 case handlers.onRootDocUpdated:
-                    this.socket.on('rootDocUpdated', (rootDocId:string) => {
+                    addSocketListener('rootDocUpdated', (rootDocId:string) => {
                         handler(rootDocId);
                     });
                     break;
                 default:
                     break;
             }
+        });
+        return new vscode.Disposable(() => {
+            const index = this._handlers.indexOf(handlers);
+            if (index!==-1) {
+                this._handlers.splice(index, 1);
+            }
+            disposables.forEach(disposable => disposable.dispose());
         });
     }
 
@@ -377,8 +404,9 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async joinProject(project_id:string): Promise<ProjectEntity> {
+        let timeout: NodeJS.Timeout;
         const timeoutPromise: Promise<ProjectEntity> = new Promise((_, reject) => {
-            setTimeout(() => {
+            timeout = setTimeout(() => {
                 reject(new Error('timeout'));
             }, SOCKET_ACK_TIMEOUT_MS);
         });
@@ -400,12 +428,14 @@ export class SocketIOAPI {
                     this.socketErrorHandlers.add(socketErrorHandler);
                 });
                 return Promise.race([joinPromise, rejectPromise, timeoutPromise]).finally(() => {
+                    clearTimeout(timeout);
                     if (socketErrorHandler) {
                         this.socketErrorHandlers.delete(socketErrorHandler);
                     }
                 }) as Promise<ProjectEntity>;
             case 'v2':
                 return Promise.race([this.record!, timeoutPromise]).finally(() => {
+                    clearTimeout(timeout);
                     if (this.recordErrorHandler) {
                         this.socketErrorHandlers.delete(this.recordErrorHandler);
                         this.recordErrorHandler = undefined;

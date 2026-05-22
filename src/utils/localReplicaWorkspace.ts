@@ -76,6 +76,16 @@ async function readSettingsFile(settingsUri: vscode.Uri): Promise<LocalReplicaSe
     }
 }
 
+async function readSettingsFileSnapshot(settingsUri: vscode.Uri): Promise<LocalReplicaSettings | undefined> {
+    try {
+        const content = await vscode.workspace.fs.readFile(settingsUri);
+        const settings = JSON.parse(new TextDecoder().decode(content)) as LocalReplicaSettings;
+        return normalizeSettings(settings);
+    } catch {
+        return undefined;
+    }
+}
+
 async function backupLegacySettings(rootUri: vscode.Uri) {
     const legacySettingsUri = vscode.Uri.joinPath(rootUri, LEGACY_REPLICA_SETTINGS_FILE);
     const backupUri = vscode.Uri.joinPath(rootUri, LEGACY_REPLICA_SETTINGS_BACKUP_FILE);
@@ -116,6 +126,35 @@ async function readSettingsFromRoot(rootUri: vscode.Uri): Promise<LocalReplicaSe
     );
     await backupLegacySettings(rootUri);
     return legacySettings;
+}
+
+async function readSettingsSnapshotFromRoot(rootUri: vscode.Uri): Promise<LocalReplicaSettings | undefined> {
+    const settingsUri = vscode.Uri.joinPath(rootUri, REPLICA_SETTINGS_FILE);
+    const settings = await readSettingsFileSnapshot(settingsUri);
+    if (settings) {
+        return settings;
+    }
+
+    const legacySettingsUri = vscode.Uri.joinPath(rootUri, LEGACY_REPLICA_SETTINGS_FILE);
+    return readSettingsFileSnapshot(legacySettingsUri);
+}
+
+export function normalizeLocalReplicaRelPath(relPath: string): string | undefined {
+    if (relPath.includes('\0') || relPath.includes('\\')) {
+        return undefined;
+    }
+
+    const relativePath = relPath.replace(/^\/+/, '');
+    if (relativePath==='') {
+        return undefined;
+    }
+
+    const parts = relativePath.split('/');
+    if (parts.some(part => part==='' || part==='.' || part==='..')) {
+        return undefined;
+    }
+
+    return `/${parts.join('/')}`;
 }
 
 async function syncContexts(settings?: LocalReplicaSettings) {
@@ -292,10 +331,22 @@ export async function readReplicaSettings(rootUri?: vscode.Uri) {
     return readActiveReplicaSettings();
 }
 
+export async function readReplicaSettingsSnapshot(rootUri?: vscode.Uri) {
+    if (rootUri) {
+        return readSettingsSnapshotFromRoot(rootUri);
+    }
+    if (!activeReplicaRoot) {
+        return undefined;
+    }
+    return readSettingsSnapshotFromRoot(activeReplicaRoot);
+}
+
 export async function pathToLocalUri(path: string, rootUri?: vscode.Uri): Promise<vscode.Uri | undefined> {
     const resolvedRoot = rootUri ?? activeReplicaRoot;
     if (!resolvedRoot) { return undefined; }
-    return vscode.Uri.joinPath(resolvedRoot, path.replace(/^\/+/, ''));
+    const normalizedPath = normalizeLocalReplicaRelPath(path);
+    if (!normalizedPath) { return undefined; }
+    return vscode.Uri.joinPath(resolvedRoot, ...normalizedPath.replace(/^\/+/, '').split('/'));
 }
 
 export async function localUriToPath(uri: vscode.Uri, rootUri?: vscode.Uri): Promise<string | undefined> {
@@ -305,7 +356,7 @@ export async function localUriToPath(uri: vscode.Uri, rootUri?: vscode.Uri): Pro
     }
 
     const relativePath = uri.path.slice(resolvedRoot.path.length);
-    return relativePath.startsWith('/') ? relativePath : `/${relativePath}`;
+    return normalizeLocalReplicaRelPath(relativePath);
 }
 
 export async function toVirtualUri(uri: vscode.Uri): Promise<vscode.Uri | undefined> {

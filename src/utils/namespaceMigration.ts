@@ -19,6 +19,7 @@ const CONFIG_KEYS = [
     'pdfViewer.themes',
     'pdfViewer.defaultScrollMode',
     'pdfViewer.defaultSpreadMode',
+    'pdfViewer.openLocation',
     'invisibleMode.historyRefreshInterval',
     'invisibleMode.chatMessageRefreshInterval',
     'invisibleMode.inactiveTimeout',

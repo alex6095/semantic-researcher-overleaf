@@ -15,7 +15,11 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
     private learnedWords?: Set<string>;
     private suggestionCache: Map<string, string[]> = new Map();
     private diagnosticCollection = vscode.languages.createDiagnosticCollection(`${ROOT_NAME}.spell`);
+    private pendingDiagnostics = new Map<string, {uri: vscode.Uri, range?: vscode.Range, timer: NodeJS.Timeout}>();
     protected readonly contextPrefix = [];
+    private readonly debounceMs = 500;
+    private readonly spellCheckBatchSize = 200;
+    private readonly spellCheckBatchDelayMs = 150;
 
     private splitText(text: string) {
         return text.split(/([\P{L}\p{N}]*\\[a-zA-Z]*|[\P{L}\p{N}]+)/gu);
@@ -37,19 +41,25 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
                             .filter(x => !this.suggestionCache.has(x))
                             .filter(x => !this.learnedWords?.has(x));
         if (words.length === 0) { return; }
-        const uniqueWords = new Set(words);
-        const uniqueWordsArray = [...uniqueWords];
+        const uniqueWordsArray = [...new Set(words)];
 
         // update suggestion cache and learned words
         const vfs = await this.vfsm.prefetch(vfsUri);
-        const misspellings = await vfs.spellCheck(vfsUri, uniqueWordsArray);
-        if (misspellings) {
-            misspellings.forEach(misspelling => {
-                uniqueWords.delete(uniqueWordsArray[misspelling.index]);
-                this.suggestionCache.set(uniqueWordsArray[misspelling.index], misspelling.suggestions);
-            });
+        for (let offset=0; offset<uniqueWordsArray.length; offset+=this.spellCheckBatchSize) {
+            const batch = uniqueWordsArray.slice(offset, offset + this.spellCheckBatchSize);
+            const acceptedWords = new Set(batch);
+            const misspellings = await vfs.spellCheck(vfsUri, batch);
+            if (misspellings) {
+                misspellings.forEach(misspelling => {
+                    acceptedWords.delete(batch[misspelling.index]);
+                    this.suggestionCache.set(batch[misspelling.index], misspelling.suggestions);
+                });
+            }
+            acceptedWords.forEach(x => this.learnedWords?.add(x));
+            if (offset + this.spellCheckBatchSize < uniqueWordsArray.length) {
+                await new Promise(resolve => setTimeout(resolve, this.spellCheckBatchDelayMs));
+            }
         }
-        uniqueWords.forEach(x => this.learnedWords?.add(x));
 
         // restrict cache size
         if (this.suggestionCache.size > 1000) {
@@ -98,13 +108,47 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
         this.diagnosticCollection.set(uri, diagnostics);
     }
 
+    private mergeRanges(a: vscode.Range | undefined, b: vscode.Range | undefined): vscode.Range | undefined {
+        if (a===undefined || b===undefined) { return undefined; }
+        const start = a.start.isBefore(b.start) ? a.start : b.start;
+        const end = a.end.isAfter(b.end) ? a.end : b.end;
+        return new vscode.Range(start, end);
+    }
+
+    private clearPendingDiagnostics() {
+        this.pendingDiagnostics.forEach(({timer}) => clearTimeout(timer));
+        this.pendingDiagnostics.clear();
+    }
+
+    private scheduleDiagnostics(uri: vscode.Uri, range?: vscode.Range) {
+        const key = uri.toString();
+        const previous = this.pendingDiagnostics.get(key);
+        if (previous) {
+            clearTimeout(previous.timer);
+        }
+        const nextRange = previous ? this.mergeRanges(previous.range, range) : range;
+        const timer = setTimeout(async () => {
+            this.pendingDiagnostics.delete(key);
+            if (!isSupportedReplicaDocument(uri)) { return; }
+            const document = await vscode.workspace.openTextDocument(uri);
+            const validatedRange = nextRange && document.validateRange(nextRange);
+            const changedText = validatedRange
+                ? [...sRange(validatedRange.start.line, validatedRange.end.line)]
+                    .map(i => document.lineAt(i).text).join(' ')
+                : document.getText();
+            await this.check(uri, changedText);
+            await this.updateDiagnostics(uri, validatedRange);
+        }, this.debounceMs);
+        this.pendingDiagnostics.set(key, {uri, range: nextRange, timer});
+    }
+
     private resetDiagnosticCollection() {
+        this.clearPendingDiagnostics();
         this.diagnosticCollection.clear();
         vscode.workspace.textDocuments.forEach(async doc => {
             if (!isSupportedReplicaDocument(doc.uri)) { return; }
             const uri = doc.uri;
-            await this.check( uri, doc.getText() );
-            this.updateDiagnostics(uri);
+            this.scheduleDiagnostics(uri);
         });
     }
 
@@ -222,9 +266,7 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
             // update diagnostics on document open
             vscode.workspace.onDidOpenTextDocument(async doc => {
                 if (isSupportedReplicaDocument(doc.uri)) {
-                    const uri = doc.uri;
-                    await this.check( uri, doc.getText() );
-                    this.updateDiagnostics(uri);
+                    this.scheduleDiagnostics(doc.uri);
                 }
             }),
             // update diagnostics on text changed
@@ -233,7 +275,7 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
                     const uri = e.document.uri;
                     for (const event of e.contentChanges) {
                         // extract changed text
-                        const startLine = Math.min(0, event.range.start.line-1);
+                        const startLine = Math.max(0, event.range.start.line-1);
                         const [endLine, maxLength] = (() => {
                             try {
                                 const _line = event.range.end.line;
@@ -244,14 +286,11 @@ export class MisspellingCheckProvider extends IntellisenseProvider implements vs
                         })();
                         let _range = new vscode.Range(startLine, 0, endLine, maxLength);
                         _range = e.document.validateRange(_range);
-                        // update diagnostics
-                        const changedText = [...sRange(_range.start.line, _range.end.line)]
-                                            .map(i => e.document.lineAt(i).text).join(' ');
-                        await this.check( uri, changedText );
-                        this.updateDiagnostics(uri, _range);
+                        this.scheduleDiagnostics(uri, _range);
                     };
                 }
             }),
+            new vscode.Disposable(() => this.clearPendingDiagnostics()),
         ];
     }
 }

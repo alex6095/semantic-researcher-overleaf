@@ -1,6 +1,6 @@
 import * as vscode from 'vscode';
 import { RemoteFileSystemProvider, parseUri } from '../core/remoteFileSystemProvider';
-import { ROOT_NAME, ELEGANT_NAME, OUTPUT_FOLDER_NAME, PDF_VIEW_TYPE } from '../consts';
+import { ROOT_NAME, ELEGANT_NAME, OUTPUT_FOLDER_NAME, PDF_VIEW_TYPE, getConfiguredValue } from '../consts';
 import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
 import { EventBus } from '../utils/eventBus';
@@ -141,12 +141,16 @@ export class CompileManager {
     }
 
     static async check(uri?: vscode.Uri) {
+        const hasExplicitUri = uri!==undefined;
         const candidate = uri ?? vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0].uri;
         if (candidate?.scheme === ROOT_NAME) {
             return candidate;
         }
         if (candidate?.scheme==='file' && isWithinActiveReplica(candidate)) {
             return getActiveReplicaOriginUri();
+        }
+        if (hasExplicitUri) {
+            return undefined;
         }
         // check if supported local replica
         const localSetting = await LocalReplicaSCMProvider.readSettings();
@@ -207,15 +211,38 @@ export class CompileManager {
         return uri;
     }
 
+    private async saveProjectDocuments(uri: vscode.Uri) {
+        const {identifier} = parseUri(uri);
+        const savedLocalReplicaDocs: vscode.Uri[] = [];
+        const dirtyDocs = vscode.workspace.textDocuments.filter(doc => doc.isDirty);
+        for (const doc of dirtyDocs) {
+            if (doc.uri.scheme===ROOT_NAME) {
+                try {
+                    if (parseUri(doc.uri).identifier===identifier) {
+                        await doc.save();
+                    }
+                } catch {}
+            } else if (doc.uri.scheme==='file' && isWithinActiveReplica(doc.uri)) {
+                if (await doc.save()) {
+                    savedLocalReplicaDocs.push(doc.uri);
+                }
+            }
+        }
+        return savedLocalReplicaDocs;
+    }
+
     async compile(force:boolean=false) {
         if (this.inCompiling) { return; }
-        await vscode.workspace.saveAll(); // save all dirty files
 
         const uri = await this.update('compiling');
         if (!uri) { return; }
+        const savedLocalReplicaDocs = await this.saveProjectDocuments(uri);
 
         const work = this.vfsm.prefetch(uri)
             .then(async (vfs) => {
+                for (const localUri of savedLocalReplicaDocs) {
+                    await vfs.flushPendingLocalPush(localUri);
+                }
                 const content = new TextDecoder().decode( await vfs?.openFile(uri) );
                 const match = RegExp(documentClassRegex).exec(content);
                 const fileId = (await vfs._resolveUri(uri)).fileId;
@@ -287,9 +314,14 @@ export class CompileManager {
             const pdfUri = uri.with({
                 path: `/${rootPath}/${OUTPUT_FOLDER_NAME}/output.pdf`,
             });
+            const openLocation = getConfiguredValue<'current' | 'beside'>('pdfViewer.openLocation', 'current');
+            const openOptions: vscode.TextDocumentShowOptions = {
+                preview: false,
+                viewColumn: openLocation==='beside' ? vscode.ViewColumn.Beside : vscode.ViewColumn.Active,
+            };
             vscode.commands.executeCommand('vscode.openWith', pdfUri,
                 PDF_VIEW_TYPE,
-                { preview: false, viewColumn: vscode.ViewColumn.Beside }
+                openOptions
             );
         }
     }

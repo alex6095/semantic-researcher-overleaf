@@ -77,9 +77,7 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
     private _path?: string;
     private _history?: HistoryRecord;
 
-    constructor(private readonly vfs: VirtualFileSystem) {
-        setInterval(this.refresh.bind(this), 30*1000);
-    }
+    constructor(private readonly vfs: VirtualFileSystem) {}
 
     private _onDidChangeTreeData: vscode.EventEmitter<HistoryItem | undefined | void> = new vscode.EventEmitter<HistoryItem | undefined | void>();
 
@@ -96,6 +94,10 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
         }
         await this.getHistory();
         this.refresh();
+    }
+
+    async refreshCurrentData(force:boolean=false) {
+        await this.refreshData(this._path, force);
     }
 
     async openDiffEditor(originVersion:number, targetVersion:number) {
@@ -333,35 +335,62 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
 export class HistoryViewProvider {
     private treeDataProvider: HistoryDataProvider;
     private historyView: vscode.TreeView<HistoryItem>;
+    private refreshTimer?: NodeJS.Timeout;
+    private static readonly visibleRefreshMs = 30*1000;
 
     constructor(vfs: VirtualFileSystem) {
         const treeDataProvider = new HistoryDataProvider(vfs);
         this.historyView = vscode.window.createTreeView(`${ROOT_NAME}.projectHistory`, {treeDataProvider});
         this.treeDataProvider = treeDataProvider;
-        this.updateView();
     }
 
-    private async updateViewForUri(uri: vscode.Uri) {
+    private async updateViewForUri(uri: vscode.Uri, force:boolean=false): Promise<boolean> {
         if (uri.scheme===ROOT_NAME) {
             const {pathParts} = parseUri(uri);
-            if (pathParts[0]===OUTPUT_FOLDER_NAME) { return; }
-            this.updateView(pathParts);
-            return;
+            if (pathParts[0]===OUTPUT_FOLDER_NAME) { return false; }
+            this.updateView(pathParts, force);
+            return true;
         }
 
         if (uri.scheme==='file') {
             const path = await LocalReplicaSCMProvider.uriToPath(uri);
-            if (!path) { return; }
+            if (!path) { return false; }
 
             const pathParts = path.split('/').filter(Boolean);
-            if (pathParts[0]===OUTPUT_FOLDER_NAME) { return; }
-            this.updateView(pathParts);
+            if (pathParts[0]===OUTPUT_FOLDER_NAME) { return false; }
+            this.updateView(pathParts, force);
+            return true;
         }
+        return false;
     }
 
-    updateView(pathParts?: string[]) {
+    updateView(pathParts?: string[], force:boolean=false) {
         this.historyView.description = pathParts?.at(-1);
-        this.treeDataProvider.refreshData( pathParts?.join('/') );
+        this.treeDataProvider.refreshData( pathParts?.join('/'), force );
+    }
+
+    private async refreshVisibleView(force:boolean=false) {
+        const uri = vscode.window.activeTextEditor?.document.uri;
+        if (uri) {
+            const updated = await this.updateViewForUri(uri, force);
+            if (updated) { return; }
+        }
+        await this.treeDataProvider.refreshCurrentData(force);
+    }
+
+    private startVisibleRefreshTimer() {
+        if (this.refreshTimer) { return; }
+        this.refreshTimer = setInterval(() => {
+            if (this.historyView.visible) {
+                void this.treeDataProvider.refreshCurrentData(true);
+            }
+        }, HistoryViewProvider.visibleRefreshMs);
+    }
+
+    private stopVisibleRefreshTimer() {
+        if (!this.refreshTimer) { return; }
+        clearInterval(this.refreshTimer);
+        this.refreshTimer = undefined;
     }
 
     get triggers() {
@@ -375,9 +404,18 @@ export class HistoryViewProvider {
             vscode.commands.registerCommand(`${ROOT_NAME}.projectHistory.revealHistoryView`, async() => {
                 vscode.commands.executeCommand(`${ROOT_NAME}.projectHistory.focus`);
             }),
+            this.historyView.onDidChangeVisibility((event) => {
+                if (event.visible) {
+                    void this.refreshVisibleView(true);
+                    this.startVisibleRefreshTimer();
+                } else {
+                    this.stopVisibleRefreshTimer();
+                }
+            }),
             // on vfs file open
             EventBus.on('fileWillOpenEvent', async ({uri}) => {
                 setTimeout(() => {
+                    if (!this.historyView.visible) { return; }
                     // filter noise read events
                     const activeTextUri = vscode.window.activeTextEditor?.document.uri;
                     if (activeTextUri && activeTextUri.path!==uri.path) { return; }
@@ -386,11 +424,13 @@ export class HistoryViewProvider {
                 }, 100);
             }),
             vscode.window.onDidChangeActiveTextEditor((editor) => {
+                if (!this.historyView.visible) { return; }
                 const uri = editor?.document.uri;
                 if (uri) {
                     void this.updateViewForUri(uri);
                 }
             }),
+            new vscode.Disposable(() => this.stopVisibleRefreshTimer()),
         ];
     }
 }

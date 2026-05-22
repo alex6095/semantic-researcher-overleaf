@@ -8,14 +8,16 @@ import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 export class ChatViewProvider implements vscode.WebviewViewProvider {
     private hasUnreadMessages = 0;
     private webviewView?: vscode.WebviewView;
+    private readonly socketHandlers: vscode.Disposable;
 
     constructor(
         private readonly vfs: VirtualFileSystem,
         private readonly publicId: string,
         private readonly extensionUri: vscode.Uri,
         private readonly socket: SocketIOAPI,
+        private readonly onUnreadChanged?: () => void,
     ) {
-        this.socket.updateEventHandlers({
+        this.socketHandlers = this.socket.updateEventHandlers({
             onReceivedMessage: this.onReceivedMessage.bind(this)
         });
     }
@@ -80,6 +82,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
 
         if (!this.isViewVisible()) {
             this.hasUnreadMessages += 1;
+            this.onUnreadChanged?.();
         }
     }
 
@@ -95,6 +98,7 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
         // this.webviewView?.show(true);
         vscode.commands.executeCommand(`${ROOT_NAME}.chatWebview.focus`);
         this.hasUnreadMessages = 0;
+        this.onUnreadChanged?.();
     }
 
     insertText(text: string='') {
@@ -146,6 +150,11 @@ export class ChatViewProvider implements vscode.WebviewViewProvider {
             }),
             // register chat webview
             vscode.window.registerWebviewViewProvider(`${ROOT_NAME}.chatWebview`, this, {webviewOptions:{retainContextWhenHidden:true}}),
+            this as vscode.Disposable,
         ];
+    }
+
+    dispose() {
+        this.socketHandlers.dispose();
     }
 }
