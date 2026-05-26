@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.25] - 2026-05-26
+### Changed
+- Restore the upstream-style non-bundled extension packaging so activation loads the normal CommonJS `out/**` module graph instead of a single generated bundle. This avoids the activation-time `command ... addServer not found` failure caused by bundled circular intellisense imports.
+- Document the current activation model for Local Replica: Overleaf Activity Bar, Overleaf commands, Overleaf virtual workspaces, or workspaces containing `.semantic-researcher-overleaf/settings.json` / legacy `.overleaf/settings.json` activate the extension. Unrelated VS Code windows are left idle instead of reconnecting to a previously selected external replica on global startup.
+
 ## [0.15.21] - 2026-05-13
 ### Added
 - feat(local-replica): expose a new `scmSyncCompleteEvent` on `EventBus` that fires once per `applySync` terminal — for either direction (push/pull), either type (update/delete), with an `outcome` of `success`/`error`/`blocked`/`suppressed` (the latter two cover Layer 3/4/4b guards and bypass-cache / pull-noop short-circuits). Replaces the prior `flushPendingPush + poll status` pattern for callers that need to know precisely when a specific path has finished syncing.

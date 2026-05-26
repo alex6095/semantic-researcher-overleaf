@@ -173,6 +173,8 @@ This command differs from `Open Project Locally ...` in two important ways:
 1. the selected folder is used directly as the replica root, so `.semantic-researcher-overleaf/settings.json` and the synced project files will be created inside that exact folder;
 2. the selected folder becomes the active local replica root for the current VS Code window, so local history, chat, collaboration helpers, compile / preview actions, and intellisense-related features resolve against that exact folder without replacing the current window.
 
+The extension activates when you open the Overleaf Activity Bar, run an Overleaf command, open an Overleaf virtual workspace, or open a workspace that contains `.semantic-researcher-overleaf/settings.json` or legacy `.overleaf/settings.json`. After activation, a local replica that is part of the current workspace resumes its Overleaf connection and sync. Unrelated VS Code windows do not activate the extension just because a replica was selected in another window.
+
 > [!WARNING]
 > Do not select local folders for two different Overleaf projects in the same VS Code window. The extension currently keeps one active local replica root per window; selecting a folder for another project changes that active root and can cause collaboration, history, compile, or sync operations to resolve against the wrong local LaTeX folder.
 >
