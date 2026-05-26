@@ -12,6 +12,7 @@ docs/**
 commitlint.config.js
 scripts/**
 node_modules/**
+!node_modules/playwright-core/**
 remote-pack/**
 **/tsconfig.json
 **/.eslintrc.json

@@ -13,11 +13,13 @@ esbuild.build({
     sourcesContent: false,
     external: [
         'vscode',
+        // Browser login loads Playwright at runtime. Keep its package layout in
+        // the VSIX instead of bundling it into the extension entrypoint.
+        'playwright-core',
     ],
     logOverride: {
-        // Playwright's Electron/app-launcher helpers use require.resolve() for
-        // files we do not call from browser login. The Chromium channel flow used
-        // here bundles cleanly, so keep the VSIX free of node_modules.
+        // Dependencies may contain optional platform helpers behind dynamic
+        // require.resolve() calls. They are not needed during extension startup.
         'require-resolve-not-external': 'silent',
     },
     logLevel: 'info',
