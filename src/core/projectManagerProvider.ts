@@ -823,6 +823,10 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         }
 
         const uri = vscode.Uri.parse(project.uri);
+        if (!await this.prepareForLocalReplicaSelection(project, uri)) {
+            return;
+        }
+
         if (await this.hasConflictingLocalReplicaWorkspace(uri)) {
             return;
         }
@@ -846,6 +850,97 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
                 await vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.deactivateProject`, uri);
             }
         }
+    }
+
+    async disconnectProjectFolderLocalReplica(options?: {
+        confirm?: boolean,
+        nextProject?: ProjectItem,
+        removeWorkspaceFolder?: boolean,
+        showNoActiveMessage?: boolean,
+    }) {
+        const activeRoot = getActiveReplicaRoot();
+        const activeSettings = activeRoot ? await readReplicaSettingsSnapshot(activeRoot) : undefined;
+        const activeVfs = this.remoteFileSystem?.getActiveVFS();
+        const settingsProjectUri = activeSettings?.uri
+            ? canonicalizeOverleafUri(vscode.Uri.parse(activeSettings.uri))
+            : activeVfs?.origin;
+        const activeProjectUri = activeVfs?.origin ?? settingsProjectUri;
+
+        if (!activeRoot && !activeProjectUri) {
+            if (options?.showNoActiveMessage!==false) {
+                vscode.window.showInformationMessage(vscode.l10n.t('No Local Replica project is currently live.'));
+            }
+            return false;
+        }
+
+        if (options?.confirm!==false) {
+            const confirmLabel = options?.nextProject ? vscode.l10n.t('Switch') : vscode.l10n.t('Disconnect');
+            const message = options?.nextProject
+                ? vscode.l10n.t(
+                    'Switch live Local Replica from "{currentProjectName}" to "{nextProjectName}"? The previous folder will stay on disk.',
+                    {
+                        currentProjectName: activeSettings?.projectName ?? activeVfs?.projectName ?? vscode.l10n.t('current project'),
+                        nextProjectName: options.nextProject.label,
+                    },
+                )
+                : vscode.l10n.t(
+                    'Disconnect live Local Replica project "{projectName}"? The local folder will stay on disk.',
+                    {projectName: activeSettings?.projectName ?? activeVfs?.projectName ?? vscode.l10n.t('current project')},
+                );
+            const selected = await vscode.window.showWarningMessage(
+                message,
+                {modal: true},
+                confirmLabel,
+            );
+            if (selected!==confirmLabel) {
+                return false;
+            }
+        }
+
+        await setActiveReplicaRoot(undefined, {suppressAutoRestoreRoot: activeRoot});
+        await vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.deactivateProject`, activeProjectUri);
+
+        if (activeRoot && options?.removeWorkspaceFolder) {
+            this.removeExactWorkspaceFolder(activeRoot);
+        }
+
+        this.setActiveProject('', undefined, 'inactive');
+        if (!options?.nextProject) {
+            vscode.window.showInformationMessage(vscode.l10n.t('Disconnected live Local Replica project.'));
+        }
+        return true;
+    }
+
+    private async prepareForLocalReplicaSelection(project: ProjectItem, projectUri: vscode.Uri) {
+        const activeRoot = getActiveReplicaRoot();
+        if (!activeRoot) {
+            return true;
+        }
+
+        const activeSettings = await readReplicaSettingsSnapshot(activeRoot);
+        if (!activeSettings?.uri) {
+            return true;
+        }
+
+        const activeProjectUri = stringifyOverleafUri(canonicalizeOverleafUri(vscode.Uri.parse(activeSettings.uri)));
+        const targetProjectUri = stringifyOverleafUri(canonicalizeOverleafUri(projectUri));
+        if (activeProjectUri===targetProjectUri) {
+            return true;
+        }
+
+        return this.disconnectProjectFolderLocalReplica({
+            nextProject: project,
+            removeWorkspaceFolder: true,
+        });
+    }
+
+    private removeExactWorkspaceFolder(rootUri: vscode.Uri) {
+        const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
+        const index = workspaceFolders.findIndex(folder => folder.uri.toString()===rootUri.toString());
+        if (index===-1) {
+            return;
+        }
+        vscode.workspace.updateWorkspaceFolders(index, 1);
     }
 
     private async hasConflictingLocalReplicaWorkspace(projectUri: vscode.Uri) {
@@ -872,7 +967,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             }
 
             vscode.window.showWarningMessage(vscode.l10n.t(
-                'A different Local Replica project is already active in this workspace: "{projectName}" at {path}. Open a separate VS Code window before selecting another project folder.',
+                'A different Local Replica folder is already open in this workspace: "{projectName}" at {path}. Disconnect it or remove it from the workspace before selecting another project folder.',
                 {
                     projectName: settings.projectName,
                     path: rootUri.fsPath || rootUri.toString(),
@@ -957,6 +1052,9 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.selectProjectFolderLocalReplica`, (item) => {
                 return this.selectProjectFolderLocalReplica(item);
+            }),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.disconnectProjectFolderLocalReplica`, () => {
+                return this.disconnectProjectFolderLocalReplica();
             }),
         ];
     }

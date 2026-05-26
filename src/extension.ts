@@ -36,7 +36,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // Register: global Overleaf connection status bar so the user is never left
     // with "selected" as a false proxy for "live". Event-driven, no polling.
     const overleafStatusItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, 90);
-    overleafStatusItem.command = 'workbench.action.output.toggleOutput';
+    overleafStatusItem.command = `${ROOT_NAME}.projectManager.disconnectProjectFolderLocalReplica`;
     context.subscriptions.push(overleafStatusItem);
 
     const applyConnectionState = (state: VFSConnectionState, projectName?: string) => {
@@ -44,7 +44,7 @@ export async function activate(context: vscode.ExtensionContext) {
         switch (state) {
             case 'connected':
                 overleafStatusItem.text = `$(cloud) ${label}`;
-                overleafStatusItem.tooltip = 'Overleaf connected (changes sync live)';
+                overleafStatusItem.tooltip = 'Overleaf connected (changes sync live). Click to disconnect.';
                 overleafStatusItem.color = undefined;
                 overleafStatusItem.backgroundColor = undefined;
                 overleafStatusItem.show();
@@ -52,7 +52,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 break;
             case 'reconnecting':
                 overleafStatusItem.text = `$(sync~spin) ${label}`;
-                overleafStatusItem.tooltip = 'Reconnecting to Overleaf';
+                overleafStatusItem.tooltip = 'Reconnecting to Overleaf. Click to disconnect.';
                 overleafStatusItem.color = new vscode.ThemeColor('statusBarItem.warningForeground');
                 overleafStatusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
                 overleafStatusItem.show();
@@ -60,7 +60,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 break;
             case 'initial':
                 overleafStatusItem.text = `$(sync~spin) ${label}`;
-                overleafStatusItem.tooltip = 'Connecting to Overleaf';
+                overleafStatusItem.tooltip = 'Connecting to Overleaf. Click to disconnect.';
                 overleafStatusItem.color = undefined;
                 overleafStatusItem.backgroundColor = undefined;
                 overleafStatusItem.show();
@@ -68,7 +68,7 @@ export async function activate(context: vscode.ExtensionContext) {
                 break;
             case 'disconnected':
                 overleafStatusItem.text = `$(cloud-offline) ${label}`;
-                overleafStatusItem.tooltip = 'Overleaf disconnected — edits will not reach the server until reconnected';
+                overleafStatusItem.tooltip = 'Overleaf disconnected — edits will not reach the server until reconnected. Click to clear live project.';
                 overleafStatusItem.color = new vscode.ThemeColor('statusBarItem.errorForeground');
                 overleafStatusItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
                 overleafStatusItem.show();

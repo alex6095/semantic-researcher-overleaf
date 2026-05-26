@@ -17,9 +17,6 @@
   "categories": [
     "Other"
   ],
-  "activationEvents": [
-    "onCommand:semantic-researcher-overleaf-remote-pack.login"
-  ],
   "main": "./out/extension.js",
   "contributes": {
     "commands": [

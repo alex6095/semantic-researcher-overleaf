@@ -60,6 +60,17 @@ function maybeWarnSyncFailure(relPath: string, error: unknown) {
     });
 }
 
+async function deleteWithTrashFallback(uri: vscode.Uri, options?: {recursive?: boolean}) {
+    try {
+        await vscode.workspace.fs.delete(uri, {...options, useTrash: true});
+    } catch (error) {
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [delete trash fallback] ${uri.toString()}: ${formatUnknownError(error)}`,
+        );
+        await vscode.workspace.fs.delete(uri, options);
+    }
+}
+
 type FileCache = {date:number, hash:string};
 
 const DELETE_DIGEST = '\0';
@@ -581,7 +592,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (entries.length===0) { return; }
 
         const emptyAndContinue = vscode.l10n.t('Empty Folder and Continue');
-        const cancel = vscode.l10n.t('Cancel');
         const selected = await vscode.window.showWarningMessage(
             vscode.l10n.t(
                 'The selected Local Replica folder is not empty: {path}. Empty it before syncing?',
@@ -589,7 +599,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             ),
             {modal: true},
             emptyAndContinue,
-            cancel,
         );
         if (selected!==emptyAndContinue) {
             throw new LocalReplicaFolderSelectionCancelledError('Selected Local Replica folder is not empty.');
@@ -602,10 +611,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private static async emptyDirectory(baseUri: vscode.Uri): Promise<void> {
         const entries = await vscode.workspace.fs.readDirectory(baseUri);
         for (const [name] of entries) {
-            await vscode.workspace.fs.delete(vscode.Uri.joinPath(baseUri, name), {
-                recursive: true,
-                useTrash: true,
-            });
+            await deleteWithTrashFallback(vscode.Uri.joinPath(baseUri, name), {recursive: true});
         }
     }
 
@@ -1000,7 +1006,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             await this.withFileSystemContext(
                 'Delete local file before remote-authoritative sync',
                 childUri,
-                () => vscode.workspace.fs.delete(childUri, {recursive: true, useTrash: true}),
+                () => deleteWithTrashFallback(childUri, {recursive: true}),
             );
         }
 
@@ -1784,39 +1790,100 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     public static get baseUriInputBox(): vscode.QuickPick<vscode.QuickPickItem> {
-        const sep = require('path').sep;
+        const sep = nodePath.sep;
         const inputBox = vscode.window.createQuickPick();
         inputBox.placeholder = vscode.l10n.t('e.g., local parent folder');
-        inputBox.value = require('os').homedir()+sep;
+        inputBox.value = os.homedir()+sep;
+
+        let lookupTimer: ReturnType<typeof setTimeout> | undefined;
+        let lookupRequest = 0;
+        const stripTrailingSeparator = (value: string) => {
+            const normalized = value.replace(/[\\/]+$/, '');
+            return normalized==='' ? value : normalized;
+        };
+        const getDirectoryRequest = (value: string) => {
+            const trimmed = value.trim();
+            if (trimmed==='') {
+                return undefined;
+            }
+            const browsingDirectory = /[\\/]$/.test(trimmed);
+            const directory = browsingDirectory
+                ? stripTrailingSeparator(trimmed)
+                : nodePath.dirname(trimmed);
+            const prefix = browsingDirectory ? '' : nodePath.basename(trimmed);
+            return {
+                directory: directory==='' ? sep : directory,
+                prefix,
+            };
+        };
+        const readDirectoryWithTimeout = async (uri: vscode.Uri) => {
+            return Promise.race([
+                vscode.workspace.fs.readDirectory(uri),
+                new Promise<undefined>(resolve => setTimeout(() => resolve(undefined), 3000)),
+            ]);
+        };
+
         // enable auto-complete
-        inputBox.onDidChangeValue(async value => {
-            try {
-                // remove the last part of the path
-                inputBox.busy = true;
-                const path = value.split(sep).slice(0, -1).join(sep);
-                const items = await vscode.workspace.fs.readDirectory( vscode.Uri.file(path) );
-                const subDirs = items.filter( ([name, type]) => type===vscode.FileType.Directory )
-                                    .filter( ([name, type]) => `${path}${sep}${name}`.startsWith(value) );
+        inputBox.onDidChangeValue(value => {
+            if (lookupTimer) {
+                clearTimeout(lookupTimer);
+                lookupTimer = undefined;
+            }
+            const request = getDirectoryRequest(value);
+            const currentRequest = ++lookupRequest;
+            inputBox.activeItems = [];
+            if (!request) {
+                inputBox.items = [];
                 inputBox.busy = false;
-                // update the sub-directories
-                if (subDirs.length!==0) {
-                    const candidates = subDirs.map(([name, type]) => ({label:name, alwaysShow:true, picked:false}));
-                    if (path!=='') {
+                return;
+            }
+            inputBox.busy = true;
+            lookupTimer = setTimeout(async () => {
+                try {
+                    const items = await readDirectoryWithTimeout(vscode.Uri.file(request.directory));
+                    if (currentRequest!==lookupRequest) { return; }
+                    if (!items) {
+                        inputBox.items = [];
+                        return;
+                    }
+                    const prefixLower = request.prefix.toLowerCase();
+                    const subDirs = items
+                        .filter(([name, type]) => type===vscode.FileType.Directory && name.toLowerCase().startsWith(prefixLower))
+                        .slice(0, 200);
+                    const candidates = subDirs.map(([name]) => ({label:name, alwaysShow:true, picked:false}));
+                    if (request.directory!==nodePath.dirname(request.directory)) {
                         candidates.unshift({label:'..', alwaysShow:true, picked:false});
                     }
                     inputBox.items = candidates;
+                } catch {
+                    if (currentRequest===lookupRequest) {
+                        inputBox.items = [];
+                    }
+                } finally {
+                    if (currentRequest===lookupRequest) {
+                        inputBox.busy = false;
+                    }
                 }
-            }
-            finally {
-                inputBox.activeItems = [];
-            }
+            }, 150);
         });
         inputBox.onDidAccept(() => {
             if (inputBox.activeItems.length!==0) {
                 const selected = inputBox.selectedItems[0];
-                const path = inputBox.value.split(sep).slice(0, -1).join(sep);
-                inputBox.value = selected.label==='..'? path : `${path}${sep}${selected.label}${sep}`;
+                const request = getDirectoryRequest(inputBox.value);
+                if (!request) { return; }
+                const nextPath = selected.label==='..'
+                    ? nodePath.dirname(stripTrailingSeparator(request.directory))
+                    : nodePath.join(request.directory, selected.label);
+                inputBox.value = nextPath.endsWith(sep) ? nextPath : `${nextPath}${sep}`;
             }
+        });
+        inputBox.onDidHide(() => {
+            if (lookupTimer) {
+                clearTimeout(lookupTimer);
+                lookupTimer = undefined;
+            }
+            lookupRequest++;
+            inputBox.busy = false;
         });
         return inputBox;
     }

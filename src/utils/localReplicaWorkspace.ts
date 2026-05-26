@@ -21,6 +21,7 @@ export interface LocalReplicaSettings {
 
 const ACTIVE_REPLICA_ROOT_KEY = `${ROOT_NAME}.activeReplicaRoot`;
 const LEGACY_ACTIVE_REPLICA_ROOT_KEY = `${LEGACY_EXTENSION_NAMESPACE}.activeReplicaRoot`;
+const SUPPRESSED_AUTO_RESTORE_ROOT_KEY = `${ROOT_NAME}.suppressedActiveReplicaRoot`;
 
 let extensionContext: vscode.ExtensionContext | undefined;
 let activeReplicaRoot: vscode.Uri | undefined;
@@ -168,6 +169,11 @@ async function persistActiveRoot(rootUri: vscode.Uri | undefined) {
     await extensionContext.workspaceState.update(ACTIVE_REPLICA_ROOT_KEY, rootUri?.toString());
 }
 
+async function persistSuppressedAutoRestoreRoot(rootUri: vscode.Uri | undefined) {
+    if (!extensionContext) { return; }
+    await extensionContext.workspaceState.update(SUPPRESSED_AUTO_RESTORE_ROOT_KEY, rootUri?.toString());
+}
+
 async function discoverDirectReplicaRoots() {
     const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
     const matches: vscode.Uri[] = [];
@@ -195,6 +201,8 @@ export function configureLocalReplicaWorkspace(context: vscode.ExtensionContext)
 
 export async function initializeLocalReplicaWorkspace() {
     let rootUri: vscode.Uri | undefined;
+    const suppressedRootValue = extensionContext?.workspaceState.get<string>(SUPPRESSED_AUTO_RESTORE_ROOT_KEY);
+    const suppressedRoot = suppressedRootValue ? parsePersistedLocalRoot(suppressedRootValue) : undefined;
     const savedRoot = extensionContext?.workspaceState.get<string>(ACTIVE_REPLICA_ROOT_KEY);
     const legacySavedRoot = extensionContext?.workspaceState.get<string>(LEGACY_ACTIVE_REPLICA_ROOT_KEY);
     if (savedRoot || legacySavedRoot) {
@@ -210,8 +218,9 @@ export async function initializeLocalReplicaWorkspace() {
 
     if (!rootUri) {
         const discovered = await discoverDirectReplicaRoots();
-        if (discovered.length===1) {
-            rootUri = discovered[0];
+        const restoreCandidates = discovered.filter(uri => uri.toString()!==suppressedRoot?.toString());
+        if (restoreCandidates.length===1) {
+            rootUri = restoreCandidates[0];
         }
     }
 
@@ -226,12 +235,13 @@ export async function initializeLocalReplicaWorkspace() {
 
 export async function setActiveReplicaRoot(
     rootUri: vscode.Uri | undefined,
-    options?: { ensureWorkspaceFolder?: boolean },
+    options?: { ensureWorkspaceFolder?: boolean, suppressAutoRestoreRoot?: vscode.Uri },
 ) {
     if (!rootUri) {
         activeReplicaRoot = undefined;
         activeReplicaSettings = undefined;
         await persistActiveRoot(undefined);
+        await persistSuppressedAutoRestoreRoot(options?.suppressAutoRestoreRoot);
         await syncContexts(undefined);
         onDidChangeActiveReplicaEmitter.fire({rootUri: undefined, settings: undefined});
         return undefined;
@@ -245,6 +255,7 @@ export async function setActiveReplicaRoot(
     activeReplicaRoot = rootUri;
     activeReplicaSettings = settings;
     await persistActiveRoot(rootUri);
+    await persistSuppressedAutoRestoreRoot(undefined);
     await syncContexts(settings);
 
     if (options?.ensureWorkspaceFolder) {

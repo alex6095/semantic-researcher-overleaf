@@ -68,6 +68,7 @@ interface PromptBaseUriOptions {
     title?: string;
     placeholder?: string;
     value?: string;
+    createFolderName?: string;
 }
 
 function parsePersistedBaseUri(baseUri: string): vscode.Uri {
@@ -342,12 +343,42 @@ export class SCMCollectionProvider extends vscode.Disposable {
     private promptBaseUri(scmProto: SupportedSCM, options?: PromptBaseUriOptions): Promise<string | undefined> {
         return new Promise(resolve => {
             const inputBox = scmProto.baseUriInputBox;
+            const selectButton: vscode.QuickInputButton = {
+                iconPath: new vscode.ThemeIcon('check'),
+                tooltip: vscode.l10n.t('Select Folder'),
+            };
+            const createFolderButton: vscode.QuickInputButton = {
+                iconPath: new vscode.ThemeIcon('new-folder'),
+                tooltip: vscode.l10n.t('Create typed folder and select it'),
+            };
             let settled = false;
             const finish = (value?: string) => {
                 if (settled) { return; }
                 settled = true;
                 inputBox.dispose();
                 resolve(value);
+            };
+            const createTypedFolder = async () => {
+                let folderPath = inputBox.value.trim();
+                if (folderPath==='') {
+                    vscode.window.showErrorMessage( vscode.l10n.t('Invalid Path. Please make sure the absolute path to a folder with read/write permissions is used.') );
+                    return;
+                }
+                if (options?.createFolderName && /[\\/]$/.test(folderPath)) {
+                    folderPath = nodePath.join(folderPath, options.createFolderName);
+                }
+                const folderUri = vscode.Uri.file(folderPath);
+                try {
+                    await vscode.workspace.fs.createDirectory(folderUri);
+                    const stat = await vscode.workspace.fs.stat(folderUri);
+                    if (stat.type!==vscode.FileType.Directory) {
+                        throw new Error('Not a folder');
+                    }
+                    finish(folderUri.fsPath);
+                } catch (error) {
+                    console.error(`Could not create Local Replica folder ${folderUri.toString()}:`, error);
+                    vscode.window.showErrorMessage( vscode.l10n.t('Invalid Path. Please make sure the absolute path to a folder with read/write permissions is used.') );
+                }
             };
             inputBox.ignoreFocusOut = true;
             inputBox.title = options?.title ?? vscode.l10n.t('Create Source Control: {scm}', {scm:scmProto.label});
@@ -357,10 +388,16 @@ export class SCMCollectionProvider extends vscode.Disposable {
             if (options?.value!==undefined) {
                 inputBox.value = options.value;
             }
-            inputBox.buttons = [{iconPath: new vscode.ThemeIcon('check')}];
+            inputBox.buttons = options?.createFolderName
+                ? [createFolderButton, selectButton]
+                : [selectButton];
             inputBox.show();
             //
-            inputBox.onDidTriggerButton(() => {
+            inputBox.onDidTriggerButton((button) => {
+                if (button===createFolderButton) {
+                    void createTypedFolder();
+                    return;
+                }
                 finish(inputBox.value);
             });
             inputBox.onDidAccept(() => {
@@ -407,15 +444,13 @@ export class SCMCollectionProvider extends vscode.Disposable {
     }
 
     private async createNewExactLocalReplicaSCM() {
-        const suggestedProjectFolder = nodePath.join(
-            os.homedir(),
-            'Overleaf',
-            LocalReplicaSCMProvider.sanitizeProjectFolderName(this.vfs.projectName),
-        );
+        const suggestedProjectFolderName = LocalReplicaSCMProvider.sanitizeProjectFolderName(this.vfs.projectName);
+        const suggestedProjectFolder = await this.suggestExactLocalReplicaPath(suggestedProjectFolderName);
         const selectedPath = await this.promptBaseUri(LocalReplicaSCMProvider, {
             title: vscode.l10n.t('Select Project Folder Locally'),
             placeholder: vscode.l10n.t('e.g., dedicated local project folder'),
             value: suggestedProjectFolder,
+            createFolderName: suggestedProjectFolderName,
         });
         if (selectedPath===undefined) {
             return undefined;
@@ -450,6 +485,23 @@ export class SCMCollectionProvider extends vscode.Disposable {
             console.error(`Exact Local Replica creation failed${baseUri ? ` for ${baseUri.toString()}` : ''}:`, error);
             return undefined;
         }
+    }
+
+    private async suggestExactLocalReplicaPath(projectFolderName: string) {
+        const activeDocumentUri = vscode.window.activeTextEditor?.document.uri;
+        const activeWorkspaceFolder = activeDocumentUri
+            ? vscode.workspace.getWorkspaceFolder(activeDocumentUri)
+            : undefined;
+        const fileWorkspaceFolder = activeWorkspaceFolder?.uri.scheme==='file'
+            ? activeWorkspaceFolder
+            : (vscode.workspace.workspaceFolders ?? []).find(folder => folder.uri.scheme==='file');
+        let parentPath = fileWorkspaceFolder?.uri.fsPath ?? nodePath.join(os.homedir(), 'Overleaf');
+
+        if (fileWorkspaceFolder && await readReplicaSettingsSnapshot(fileWorkspaceFolder.uri)) {
+            parentPath = nodePath.dirname(fileWorkspaceFolder.uri.fsPath);
+        }
+
+        return nodePath.join(parentPath, projectFolderName);
     }
 
     private configSCM(scmItem: SCMRecord) {

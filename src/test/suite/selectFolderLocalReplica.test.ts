@@ -14,7 +14,7 @@ import { ProjectManagerProvider } from '../../core/projectManagerProvider';
 import { VirtualFileSystem } from '../../core/remoteFileSystemProvider';
 import { LocalReplicaSCMProvider } from '../../scm/localReplicaSCM';
 import { EventBus, Events } from '../../utils/eventBus';
-import { pathToLocalUri, setActiveReplicaRoot } from '../../utils/localReplicaWorkspace';
+import { getActiveReplicaRoot, pathToLocalUri, setActiveReplicaRoot } from '../../utils/localReplicaWorkspace';
 
 interface PersistRecord {
     enabled: boolean;
@@ -209,24 +209,30 @@ suite('Select Project Folder Local Replica', function () {
 
     const tempRoots: vscode.Uri[] = [];
     let originalShowWarningMessage: typeof vscode.window.showWarningMessage;
+    let originalShowInformationMessage: typeof vscode.window.showInformationMessage;
     let originalShowErrorMessage: typeof vscode.window.showErrorMessage;
     let originalCreateFileSystemWatcher: typeof vscode.workspace.createFileSystemWatcher;
     let originalExecuteCommand: typeof vscode.commands.executeCommand;
+    let originalUpdateWorkspaceFolders: typeof vscode.workspace.updateWorkspaceFolders;
     let originalWorkspaceFoldersDescriptor: PropertyDescriptor | undefined;
 
     setup(() => {
         originalShowWarningMessage = vscode.window.showWarningMessage;
+        originalShowInformationMessage = vscode.window.showInformationMessage;
         originalShowErrorMessage = vscode.window.showErrorMessage;
         originalCreateFileSystemWatcher = vscode.workspace.createFileSystemWatcher;
         originalExecuteCommand = vscode.commands.executeCommand;
+        originalUpdateWorkspaceFolders = vscode.workspace.updateWorkspaceFolders;
         originalWorkspaceFoldersDescriptor = Object.getOwnPropertyDescriptor(vscode.workspace, 'workspaceFolders');
     });
 
     teardown(async () => {
         (vscode.window as any).showWarningMessage = originalShowWarningMessage;
+        (vscode.window as any).showInformationMessage = originalShowInformationMessage;
         (vscode.window as any).showErrorMessage = originalShowErrorMessage;
         (vscode.workspace as any).createFileSystemWatcher = originalCreateFileSystemWatcher;
         (vscode.commands as any).executeCommand = originalExecuteCommand;
+        (vscode.workspace as any).updateWorkspaceFolders = originalUpdateWorkspaceFolders;
         await setActiveReplicaRoot(undefined);
         if (originalWorkspaceFoldersDescriptor) {
             Object.defineProperty(vscode.workspace, 'workspaceFolders', originalWorkspaceFoldersDescriptor);
@@ -282,7 +288,8 @@ suite('Select Project Folder Local Replica', function () {
         await writeText(staleUri, 'stale');
 
         (vscode.window as any).showWarningMessage = async (_message: string, _options: unknown, ...items: string[]) => {
-            return items[1];
+            assert.deepStrictEqual(items, [vscode.l10n.t('Empty Folder and Continue')]);
+            return undefined;
         };
 
         await assert.rejects(() => LocalReplicaSCMProvider.validateExactBaseUri(localRoot.fsPath));
@@ -745,6 +752,96 @@ suite('Select Project Folder Local Replica', function () {
             `${ROOT_NAME}.projectSCM.newExactLocalReplicaSCM`,
             `${ROOT_NAME}.remoteFileSystem.deactivateProject`,
         ]);
+    });
+
+    test('disconnects the current live local replica without deleting local files', async () => {
+        const localRoot = await tempDir('sr-overleaf-live-');
+        tempRoots.push(localRoot);
+        const projectUri = vscode.Uri.parse(`${ROOT_NAME}://test-server/Live%20Project?user=test-user&project=live-project`);
+        await writeText(settingsUri(localRoot), JSON.stringify({
+            uri: vscode.Uri.file('/tmp/live-project').toString(),
+            serverName: 'test-server',
+            enableCompileNPreview: true,
+            projectName: 'Live Project',
+        }));
+        await writeText(vscode.Uri.joinPath(localRoot, 'main.tex'), 'local content');
+        await setActiveReplicaRoot(localRoot);
+
+        const deactivated: string[] = [];
+        const provider = new ProjectManagerProvider({} as any, {
+            getActiveVFS: () => ({origin: projectUri, projectName: 'Live Project'}),
+        } as any);
+        (vscode.window as any).showWarningMessage = async (_message: string, _options: unknown, ...items: string[]) => items[0];
+        (vscode.window as any).showInformationMessage = async () => undefined;
+        (vscode.commands as any).executeCommand = async (command: string, arg?: unknown) => {
+            if (command===`${ROOT_NAME}.remoteFileSystem.deactivateProject`) {
+                deactivated.push((arg as vscode.Uri).toString());
+            }
+            return undefined;
+        };
+
+        const disconnected = await provider.disconnectProjectFolderLocalReplica();
+
+        assert.strictEqual(disconnected, true);
+        assert.strictEqual(getActiveReplicaRoot(), undefined);
+        assert.deepStrictEqual(deactivated, [projectUri.toString()]);
+        assert.strictEqual(await pathExists(settingsUri(localRoot)), true);
+        assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, 'main.tex')), 'local content');
+    });
+
+    test('switches away from an active live local replica before selecting another project folder', async () => {
+        const oldRoot = await tempDir('sr-overleaf-old-live-');
+        tempRoots.push(oldRoot);
+        const oldProjectUri = vscode.Uri.parse(`${ROOT_NAME}://test-server/Old%20Project?user=test-user&project=old-project`);
+        const newProjectUri = vscode.Uri.parse(`${ROOT_NAME}://test-server/New%20Project?user=test-user&project=new-project`);
+        await writeText(settingsUri(oldRoot), JSON.stringify({
+            uri: vscode.Uri.file('/tmp/old-project').toString(),
+            serverName: 'test-server',
+            enableCompileNPreview: true,
+            projectName: 'Old Project',
+        }));
+        setWorkspaceFoldersForTest(oldRoot);
+        await setActiveReplicaRoot(oldRoot);
+
+        const calls: string[] = [];
+        const provider = new ProjectManagerProvider({} as any, {
+            getActiveVFS: () => ({origin: oldProjectUri, projectName: 'Old Project'}),
+        } as any);
+        (vscode.window as any).showWarningMessage = async (_message: string, _options: unknown, ...items: string[]) => items[0];
+        (vscode.workspace as any).updateWorkspaceFolders = (start: number, deleteCount: number) => {
+            calls.push(`updateWorkspaceFolders:${start}:${deleteCount}`);
+            setWorkspaceFoldersForTest(vscode.Uri.file(os.tmpdir()));
+            return true;
+        };
+        (vscode.commands as any).executeCommand = async (command: string, arg?: unknown) => {
+            calls.push(command);
+            if (command===`${ROOT_NAME}.remoteFileSystem.deactivateProject`) {
+                calls.push((arg as vscode.Uri).toString());
+            }
+            if (command===`${ROOT_NAME}.remoteFileSystem.activateProject`) {
+                assert.strictEqual((arg as vscode.Uri).toString(), newProjectUri.toString());
+                return { origin: newProjectUri };
+            }
+            if (command===`${ROOT_NAME}.projectSCM.newExactLocalReplicaSCM`) {
+                return undefined;
+            }
+            return undefined;
+        };
+
+        await provider.selectProjectFolderLocalReplica({
+            uri: newProjectUri.toString(),
+            label: 'New Project',
+        } as any);
+
+        const oldDeactivateIndex = calls.indexOf(`${ROOT_NAME}.remoteFileSystem.deactivateProject`);
+        const activateIndex = calls.indexOf(`${ROOT_NAME}.remoteFileSystem.activateProject`);
+        assert.notStrictEqual(oldDeactivateIndex, -1);
+        assert.notStrictEqual(activateIndex, -1);
+        assert.ok(oldDeactivateIndex<activateIndex);
+        assert.ok(calls.includes(oldProjectUri.toString()));
+        assert.ok(calls.includes(newProjectUri.toString()));
+        assert.ok(calls.includes('updateWorkspaceFolders:0:1'));
+        assert.strictEqual(getActiveReplicaRoot(), undefined);
     });
 
     test('uses remote-authoritative cleanup only when resetLocalFilesToRemote is explicit', async () => {

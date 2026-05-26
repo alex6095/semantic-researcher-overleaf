@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.27] - 2026-05-26
+### Added
+- Add a `Disconnect Current Live Project` command for selected Local Replica projects, exposed from the Overleaf status bar and Project Manager view, so the current live Overleaf connection can be cleared without deleting local files.
+- Allow switching to another `Select Project Folder Locally` project after confirming that the previous live project should be disconnected.
+- Add a folder-create action to the Local Replica folder picker, seeded as `<current workspace>/<Overleaf project name>` when a file workspace is open, with `~/Overleaf/<Overleaf project name>` as the no-workspace fallback.
+
+### Fixed
+- Debounce Local Replica folder-picker directory reads and always clear the busy spinner when directory completion fails, preventing the picker from appearing to load forever on slow, invalid, or inaccessible paths.
+- Fall back to non-trash deletion when the VS Code remote file-system provider does not support `useTrash`, fixing initial Local Replica pulls on WSL paths.
+
 ## [0.15.26] - 2026-05-26
 ### Changed
 - Restore guarded startup activation so `Select Project Folder Locally` replicas selected outside the current workspace can reconnect and sync after a VS Code reload/startup. Startup restore only starts an Overleaf project connection when the current window has a saved selected replica root with a valid `.semantic-researcher-overleaf/settings.json` or legacy `.overleaf/settings.json` marker, or when the workspace itself contains a replica marker.

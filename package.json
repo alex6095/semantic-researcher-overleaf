@@ -2,7 +2,7 @@
   "name": "semantic-researcher-overleaf",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.26",
+  "version": "0.15.27",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -70,8 +70,6 @@
   "activationEvents": [
     "onStartupFinished",
     "onFileSystem:semantic-researcher-overleaf",
-    "onView:semantic-researcher-overleaf.projectManager",
-    "onCommand:semantic-researcher-overleaf.projectManager.addServer",
     "workspaceContains:.semantic-researcher-overleaf/settings.json",
     "workspaceContains:.overleaf/settings.json"
   ],
@@ -290,6 +288,13 @@
         "title": "%commands.projectManager.selectProjectFolderLocalReplica.title%",
         "icon": "$(folder-opened)",
         "enablement": "viewItem == project || viewItem == project_in_tag",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.projectManager.disconnectProjectFolderLocalReplica",
+        "title": "%commands.projectManager.disconnectProjectFolderLocalReplica.title%",
+        "icon": "$(debug-disconnect)",
+        "enablement": "semantic-researcher-overleaf.activate",
         "category": "%extension.displayName%"
       },
       {
@@ -692,7 +697,8 @@
       "semantic-researcher-overleaf": [
         {
           "id": "semantic-researcher-overleaf.projectManager",
-          "name": "%views.semantic-researcher-overleaf.projectManager.name%"
+          "name": "%views.semantic-researcher-overleaf.projectManager.name%",
+          "icon": "resources/icons/overleaf_bw.svg"
         }
       ],
       "explorer": [
@@ -739,6 +745,11 @@
           "command": "semantic-researcher-overleaf.projectManager.addServer",
           "when": "view == semantic-researcher-overleaf.projectManager",
           "group": "navigation"
+        },
+        {
+          "command": "semantic-researcher-overleaf.projectManager.disconnectProjectFolderLocalReplica",
+          "when": "view == semantic-researcher-overleaf.projectManager && semantic-researcher-overleaf.activate",
+          "group": "navigation@2"
         },
         {
           "command": "semantic-researcher-overleaf.projectSCM.configSCM",
@@ -891,6 +902,11 @@
           "command": "semantic-researcher-overleaf.projectManager.selectProjectFolderLocalReplica",
           "when": "view == semantic-researcher-overleaf.projectManager && viewItem == project || viewItem == project_in_tag",
           "group": "1_openActions@4"
+        },
+        {
+          "command": "semantic-researcher-overleaf.projectManager.disconnectProjectFolderLocalReplica",
+          "when": "view == semantic-researcher-overleaf.projectManager && semantic-researcher-overleaf.activate && (viewItem == project || viewItem == project_in_tag)",
+          "group": "1_openActions@5"
         },
         {
           "command": "semantic-researcher-overleaf.projectHistory.createLabel",
