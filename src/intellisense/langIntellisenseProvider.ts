@@ -30,13 +30,18 @@ export class LangIntellisenseProvider {
             new MisspellingCheckProvider(vfsm),
         ];
         this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -2);
-        // Enable CSpell
-        const config = vscode.workspace.getConfiguration("cSpell");
-        if (config.inspect("enabledSchemes")!==undefined) {
-            const enabledSchemes = config.get<Record<string, boolean>>("enabledSchemes") || {}; 
-            if (enabledSchemes[ROOT_NAME]!==true) {
-                enabledSchemes[ROOT_NAME] = true; 
-                config.update("enabledSchemes", enabledSchemes, vscode.ConfigurationTarget.Global);
+        // Enable CSpell for Overleaf virtual documents only when CSpell is installed.
+        if (vscode.extensions.getExtension('streetsidesoftware.code-spell-checker')) {
+            const config = vscode.workspace.getConfiguration("cSpell");
+            const inspected = config.inspect<Record<string, boolean>>("enabledSchemes");
+            if (inspected!==undefined) {
+                const enabledSchemes = config.get<Record<string, boolean>>("enabledSchemes") || {};
+                if (enabledSchemes[ROOT_NAME]!==true) {
+                    enabledSchemes[ROOT_NAME] = true;
+                    void config.update("enabledSchemes", enabledSchemes, vscode.ConfigurationTarget.Global).then(undefined, error => {
+                        console.warn('Could not enable CSpell for Overleaf virtual documents:', error);
+                    });
+                }
             }
         }
         

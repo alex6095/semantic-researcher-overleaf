@@ -44,7 +44,7 @@ The user guide is available in [docs/wiki.md](./docs/wiki.md).
 
   In the project list, hover over a project to use the default inline actions: open in the current window, open in a new window, or select an exact local folder for that project. The folder selection action is placed at the right edge for quick local-replica setup.
 
-  Local Replica sync resumes when the extension is activated by the Overleaf Activity Bar, an Overleaf command, an Overleaf virtual workspace, or a workspace that contains `.semantic-researcher-overleaf/settings.json` or legacy `.overleaf/settings.json`. The extension does not use global startup activation, so unrelated VS Code windows stay idle instead of reconnecting to a previously selected external replica in the background.
+  Local Replica sync resumes when the extension is activated by VS Code startup, the Overleaf Activity Bar, an Overleaf command, an Overleaf virtual workspace, or a workspace that contains `.semantic-researcher-overleaf/settings.json` or legacy `.overleaf/settings.json`. Startup activation restores a previously selected external replica from the current window's workspace state when its marker file still exists; otherwise no Overleaf project connection or replica sync is started.
 
   > [!WARNING]
   > Do not use one VS Code window to edit two different Overleaf projects as local LaTeX folders at the same time. Selecting a folder for a second project can switch the active local replica and may leave collaboration or sync state attached to the wrong project. Open each local replica in a separate VS Code window instead.

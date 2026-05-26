@@ -4,6 +4,11 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.26] - 2026-05-26
+### Changed
+- Restore guarded startup activation so `Select Project Folder Locally` replicas selected outside the current workspace can reconnect and sync after a VS Code reload/startup. Startup restore only starts an Overleaf project connection when the current window has a saved selected replica root with a valid `.semantic-researcher-overleaf/settings.json` or legacy `.overleaf/settings.json` marker, or when the workspace itself contains a replica marker.
+- Update Local Replica documentation to distinguish startup activation from actual Overleaf project sync: activation may happen at startup, but sync is gated by a selected replica or workspace marker.
+
 ## [0.15.25] - 2026-05-26
 ### Changed
 - Restore the upstream-style non-bundled extension packaging so activation loads the normal CommonJS `out/**` module graph instead of a single generated bundle. This avoids the activation-time `command ... addServer not found` failure caused by bundled circular intellisense imports.

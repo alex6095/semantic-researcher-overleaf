@@ -2,7 +2,7 @@
   "name": "semantic-researcher-overleaf",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.25",
+  "version": "0.15.26",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -68,6 +68,7 @@
     "local-replica"
   ],
   "activationEvents": [
+    "onStartupFinished",
     "onFileSystem:semantic-researcher-overleaf",
     "onView:semantic-researcher-overleaf.projectManager",
     "onCommand:semantic-researcher-overleaf.projectManager.addServer",
