@@ -9,10 +9,12 @@ import {
     REPLICA_SETTINGS_DIR,
     REPLICA_SETTINGS_FILE,
     ROOT_NAME,
+    STATE_SERVERS_KEY,
 } from '../../consts';
 import { ProjectManagerProvider } from '../../core/projectManagerProvider';
 import { VirtualFileSystem } from '../../core/remoteFileSystemProvider';
 import { LocalReplicaSCMProvider } from '../../scm/localReplicaSCM';
+import { SCMCollectionProvider } from '../../scm/scmCollectionProvider';
 import { EventBus, Events } from '../../utils/eventBus';
 import { getActiveReplicaRoot, pathToLocalUri, setActiveReplicaRoot } from '../../utils/localReplicaWorkspace';
 
@@ -176,6 +178,39 @@ function setWorkspaceFoldersForTest(...roots: vscode.Uri[]) {
 
 function createSCM(remoteRoot: vscode.Uri, localRoot: vscode.Uri, fakeVfs = new FakeVirtualFileSystem(remoteRoot)) {
     return new LocalReplicaSCMProvider(fakeVfs as unknown as VirtualFileSystem, localRoot);
+}
+
+function createExtensionContextStub(): vscode.ExtensionContext {
+    const state = new Map<string, unknown>();
+    const serverName = 'test-server';
+    state.set(STATE_SERVERS_KEY, {
+        [serverName]: {
+            name: serverName,
+            url: 'https://example.test',
+            login: {
+                userId: 'test-user',
+                username: 'test-user',
+                identity: {} as any,
+                projects: [{
+                    id: 'test-project',
+                    name: 'Select Folder Test',
+                    scm: {},
+                }],
+            },
+        },
+    });
+    return {
+        globalState: {
+            get: <T>(key: string, defaultValue?: T) => state.has(key) ? state.get(key) as T : defaultValue as T,
+            update: async (key: string, value: unknown) => {
+                if (value===undefined) {
+                    state.delete(key);
+                } else {
+                    state.set(key, value);
+                }
+            },
+        },
+    } as unknown as vscode.ExtensionContext;
 }
 
 function waitForSyncComplete(
@@ -454,9 +489,9 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, 'stale.tex')), 'stale');
     });
 
-    test('rejects protected same-project folders unless the folder is the current workspace root', async () => {
+    test('allows same-project Git repository roots without emptying them', async () => {
         const remoteRoot = await tempDir('sr-overleaf-remote-');
-        const localRoot = await tempDir('sr-overleaf-protected-same-project-');
+        const localRoot = await tempDir('sr-overleaf-git-same-project-');
         tempRoots.push(remoteRoot, localRoot);
         await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(localRoot, '.git'));
         await writeText(settingsUri(localRoot), JSON.stringify({
@@ -465,7 +500,7 @@ suite('Select Project Folder Local Replica', function () {
             enableCompileNPreview: true,
             projectName: 'Select Folder Test',
         }));
-        setWorkspaceFoldersForTest(localRoot);
+        await writeText(vscode.Uri.joinPath(localRoot, 'stale.tex'), 'stale');
 
         let prompted = false;
         (vscode.window as any).showWarningMessage = async () => {
@@ -473,10 +508,14 @@ suite('Select Project Folder Local Replica', function () {
             return undefined;
         };
 
-        await assert.rejects(() => LocalReplicaSCMProvider.validateExactBaseUri(localRoot.fsPath, {
+        const validated = await LocalReplicaSCMProvider.validateExactBaseUri(localRoot.fsPath, {
             projectUri: remoteRoot,
-        }));
+        });
+
+        assert.strictEqual(validated.fsPath, localRoot.fsPath);
         assert.strictEqual(prompted, false);
+        assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, '.git')), true);
+        assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, 'stale.tex')), 'stale');
     });
 
     test('rejects a folder configured for another project without emptying it', async () => {
@@ -620,6 +659,109 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, 'main.tex')), 'remote live');
         assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(localRoot, 'supplement.pdf')), nextPdf);
         assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, 'figures', 'plot.png')), false);
+    });
+
+    test('keeps replica state consistent when a remote delete arrives after the local file is already missing', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'sample.tex'), 'remote baseline');
+
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
+        await vscode.workspace.fs.delete(localSample);
+        await vscode.workspace.fs.delete(vscode.Uri.joinPath(remoteRoot, 'sample.tex'));
+
+        const applySync = (scm as any).applySync.bind(scm);
+        await applySync('pull', 'delete', '/sample.tex', uriForRelPath(remoteRoot, 'sample.tex'), localSample);
+
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'sample.tex'), 'remote baseline');
+        await applySync('pull', 'update', '/sample.tex', uriForRelPath(remoteRoot, 'sample.tex'), localSample);
+
+        assert.strictEqual(await readText(localSample), 'remote baseline');
+    });
+
+    test('does not recreate a remote file from a stale local event after a remote delete', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'sample.tex'), 'remote baseline');
+
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
+        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
+        await vscode.workspace.fs.delete(remoteSample);
+
+        const applySync = (scm as any).applySync.bind(scm);
+        await applySync('pull', 'delete', '/sample.tex', remoteSample, localSample);
+        assert.strictEqual(await pathExists(localSample), false);
+
+        await writeText(localSample, 'remote baseline');
+        const staleMtime = new Date(Date.now() - 60_000);
+        await fs.utimes(localSample.fsPath, staleMtime, staleMtime);
+        await applySync('push', 'update', '/sample.tex', localSample, remoteSample);
+
+        assert.strictEqual(await pathExists(remoteSample), false);
+        assert.strictEqual(await pathExists(localSample), false);
+    });
+
+    test('allows an intentional same-content restore after a remote delete', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'sample.tex'), 'remote baseline');
+
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
+        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
+        const applySync = (scm as any).applySync.bind(scm);
+
+        await vscode.workspace.fs.delete(remoteSample);
+        await applySync('pull', 'delete', '/sample.tex', remoteSample, localSample);
+        assert.strictEqual(await pathExists(localSample), false);
+
+        await writeText(localSample, 'remote baseline');
+        const restoredMtime = new Date(Date.now() + 60_000);
+        await fs.utimes(localSample.fsPath, restoredMtime, restoredMtime);
+        await applySync('push', 'update', '/sample.tex', localSample, remoteSample);
+
+        assert.strictEqual(await readText(localSample), 'remote baseline');
+        assert.strictEqual(await readText(remoteSample), 'remote baseline');
+    });
+
+    test('clears remote-delete echo state when reset pull rehydrates the same file', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'sample.tex'), 'remote baseline');
+
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
+        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
+        const applySync = (scm as any).applySync.bind(scm);
+
+        await vscode.workspace.fs.delete(remoteSample);
+        await applySync('pull', 'delete', '/sample.tex', remoteSample, localSample);
+        assert.strictEqual(await pathExists(localSample), false);
+
+        await writeText(remoteSample, 'remote baseline');
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await applySync('push', 'update', '/sample.tex', localSample, remoteSample);
+
+        assert.strictEqual(await readText(localSample), 'remote baseline');
+        assert.strictEqual(await readText(remoteSample), 'remote baseline');
     });
 
     test('pushes local delete and rename operations for text and media back to remote', async () => {
@@ -876,6 +1018,79 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, 'paper-renamed.pdf')), true);
         assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, 'local-only.tex')), false);
         assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, '.semantic-researcher-overleaf', 'settings.json')), true);
+    });
+
+    test('remote-authoritative reset deletes visible local-only files while preserving hidden local state', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-hidden-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote text');
+        await writeText(vscode.Uri.joinPath(localRoot, 'main.tex'), 'local stale');
+        await writeText(vscode.Uri.joinPath(localRoot, 'local-only.tex'), 'delete me');
+        await writeText(vscode.Uri.joinPath(localRoot, 'scratch', 'note.tex'), 'delete me too');
+        await writeText(vscode.Uri.joinPath(localRoot, 'scratch', '.keep'), 'keep hidden child');
+        await writeText(vscode.Uri.joinPath(localRoot, '.git', 'config'), 'keep git');
+        await writeText(vscode.Uri.joinPath(localRoot, '.env'), 'keep env');
+        await writeText(vscode.Uri.joinPath(localRoot, '.codex', 'instructions.md'), 'keep codex');
+        await writeText(vscode.Uri.joinPath(localRoot, 'AGENTS.md'), 'keep agents');
+
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, 'main.tex')), 'remote text');
+        assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, 'local-only.tex')), false);
+        assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, 'scratch', 'note.tex')), false);
+        assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, 'scratch', '.keep')), 'keep hidden child');
+        assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, '.git', 'config')), 'keep git');
+        assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, '.env')), 'keep env');
+        assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, '.codex', 'instructions.md')), 'keep codex');
+        assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, 'AGENTS.md')), 'keep agents');
+        assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, '.semantic-researcher-overleaf', 'settings.json')), true);
+    });
+
+    test('does not rerun initial pull when ensuring an already active local replica', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-active-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote v1');
+
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const context = createExtensionContextStub();
+        const collection = new SCMCollectionProvider(fakeVfs as unknown as VirtualFileSystem, context);
+        const originalInitialize = LocalReplicaSCMProvider.prototype.initializeLocalReplica;
+        type InitializeArgs = Parameters<LocalReplicaSCMProvider['initializeLocalReplica']>;
+        let initializeCalls = 0;
+        LocalReplicaSCMProvider.prototype.initializeLocalReplica = async function (
+            this: LocalReplicaSCMProvider,
+            ...args: InitializeArgs
+        ) {
+            initializeCalls += 1;
+            return originalInitialize.apply(this, args);
+        };
+
+        try {
+            const createSCM = (collection as any).createSCM.bind(collection);
+            await createSCM(LocalReplicaSCMProvider, localRoot, true, true, {
+                preserveExistingLocalFiles: false,
+                resetLocalFilesToRemote: true,
+            });
+            assert.strictEqual(initializeCalls, 1);
+
+            await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote v2');
+            (collection as any).suspendSCMsByLabel(LocalReplicaSCMProvider.label, localRoot);
+            await createSCM(LocalReplicaSCMProvider, localRoot, true, true, {
+                preserveExistingLocalFiles: false,
+                resetLocalFilesToRemote: true,
+            });
+
+            assert.strictEqual(initializeCalls, 1);
+            assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, 'main.tex')), 'remote v1');
+        } finally {
+            LocalReplicaSCMProvider.prototype.initializeLocalReplica = originalInitialize;
+            collection.dispose();
+        }
     });
 
     test('blocks remote-derived paths that would escape the selected folder', async () => {

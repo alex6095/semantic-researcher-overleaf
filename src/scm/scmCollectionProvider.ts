@@ -178,7 +178,11 @@ export class SCMCollectionProvider extends vscode.Disposable {
                         baseUri: canonicalScmKey,
                     });
                 }
-                await this.createSCM(scmProto, baseUri, false, enabled);
+                const initializationOptions = scmProto===LocalReplicaSCMProvider ? {
+                    preserveExistingLocalFiles: false,
+                    resetLocalFilesToRemote: true,
+                } : undefined;
+                await this.createSCM(scmProto, baseUri, false, enabled, initializationOptions);
             }
         });
     }
@@ -202,7 +206,6 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     resetLocalFilesToRemote: options?.resetLocalFilesToRemote,
                 });
             }
-            let activated = false;
             if (enabled && (!existing.enabled || existing.triggers.length===0)) {
                 const persist = this.vfs.getProjectSCMPersist(existing.scm.scmKey);
                 if (!persist || persist.label!==scmProto.label) {
@@ -213,14 +216,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
                 this.vfs.setProjectSCMPersist(existing.scm.scmKey, persist);
                 existing.enabled = true;
                 existing.triggers = await existing.scm.triggers;
-                activated = true;
                 this.updateStatus();
-            }
-            if (!activated && existing.scm instanceof LocalReplicaSCMProvider) {
-                await existing.scm.initializeLocalReplica({
-                    preserveExistingLocalFiles: options?.preserveExistingLocalFiles,
-                    resetLocalFilesToRemote: options?.resetLocalFilesToRemote,
-                });
             }
             return existing.scm;
         }
@@ -302,6 +298,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
         this.scms
             .filter(item => (item.scm.constructor as any).label===label)
             .filter(item => keepBaseUri===undefined || item.scm.baseUri.toString()!==keepBaseUri.toString())
+            .filter(item => item.triggers.length!==0)
             .forEach(item => {
                 suspended.push({item, wasEnabled: item.enabled});
                 item.triggers.forEach(trigger => trigger.dispose());
@@ -465,13 +462,17 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     suspended = this.suspendSCMsByLabel(LocalReplicaSCMProvider.label);
                 },
             });
-            const attachOnly = await this.isSameProjectLocalReplica(baseUri);
+            const sameProjectReplica = await this.isSameProjectLocalReplica(baseUri);
+            suspended = [
+                ...suspended,
+                ...this.suspendSCMsByLabel(LocalReplicaSCMProvider.label, baseUri),
+            ];
             const scm = await this.createSCM(LocalReplicaSCMProvider, baseUri, true, true, {
-                preserveExistingLocalFiles: attachOnly,
-                resetLocalFilesToRemote: !attachOnly,
+                preserveExistingLocalFiles: false,
+                resetLocalFilesToRemote: true,
             });
             if (!scm) {
-                if (!attachOnly) {
+                if (!sameProjectReplica) {
                     this.vfs.setProjectSCMPersist(baseUri.toString(), undefined);
                 }
                 await this.restoreSuspendedSCMs(suspended);
@@ -556,7 +557,8 @@ export class SCMCollectionProvider extends vscode.Disposable {
 
     private async ensureLocalReplicaSCM(baseUri: vscode.Uri) {
         return this.createSCM(LocalReplicaSCMProvider, baseUri, true, true, {
-            preserveExistingLocalFiles: true,
+            preserveExistingLocalFiles: false,
+            resetLocalFilesToRemote: true,
         });
     }
 

@@ -31,6 +31,7 @@ import { PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS, getAgentReviewManager } from '
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 const ECHO_WINDOW_MS = 500;
+const REMOTE_DELETE_MTIME_SLOP_MS = 2_000;
 const SYNC_MANIFEST_FILE = `${REPLICA_SETTINGS_DIR}/sync-manifest.json`;
 
 // Single shared output channel for Local Replica sync diagnostics. Lazy-created.
@@ -96,6 +97,11 @@ interface PendingEvent {
     latestUri: vscode.Uri;
 }
 
+interface RemoteDeleteTombstone {
+    digest: string;
+    staleLocalMtime?: number;
+}
+
 interface InitializeLocalReplicaOptions {
     preserveExistingLocalFiles?: boolean;
     resetLocalFilesToRemote?: boolean;
@@ -143,6 +149,10 @@ function bytesEqual(a: Uint8Array, b: Uint8Array): boolean {
     return true;
 }
 
+function normalizeMtimeMs(mtime: number): number {
+    return mtime<10_000_000_000 ? mtime*1000 : mtime;
+}
+
 /**
  * A SCM which tracks exact the changes from the vfs.
  * It keeps no history versions.
@@ -165,6 +175,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // them must NEVER propagate to the remote. Cleared by retryFailedInitialPulls
     // or by ignoreFailedInitialPulls.
     private failedInitialPulls: Set<string> = new Set();
+    // Last synced bytes for paths that were deleted from the remote. If a local
+    // create/update for the exact same bytes arrives after the delete, it is a
+    // stale watcher echo rather than a new user edit and must not recreate the
+    // remote file.
+    private remoteDeleteTombstones: Map<string, RemoteDeleteTombstone> = new Map();
     private initialPullStatus: 'pending' | 'complete' | 'partial' = 'pending';
     private partialPullToastShown = false;
     private syncQueues: Map<string, Promise<void>> = new Map();
@@ -548,7 +563,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 const settingsStatus = await LocalReplicaSCMProvider.validateExistingExactReplicaSettings(baseUri, options?.projectUri);
                 if (settingsStatus==='same-project') {
                     const protectedReason = await LocalReplicaSCMProvider.getProtectedExactBaseUriReasonCode(baseUri);
-                    if (protectedReason!==undefined && protectedReason!=='workspace-root') {
+                    if (
+                        protectedReason!==undefined
+                        && protectedReason!=='workspace-root'
+                        && protectedReason!=='git-repository-root'
+                    ) {
                         await LocalReplicaSCMProvider.rejectDangerousExactBaseUri(baseUri);
                     }
                     return baseUri;
@@ -748,6 +767,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.baseCache[relPath] = new Uint8Array();
         this.seenLocalEntities.add(relPath);
         this.setBypassCacheDigest(relPath, entry.localDigest);
+        this.clearRemoteDelete(relPath);
         return true;
     }
 
@@ -780,6 +800,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             delete this.syncManifest.files[relPath];
             this.syncManifestDirty = true;
         }
+    }
+
+    private clearReplicaState(relPath: string) {
+        delete this.baseCache[relPath];
+        this.seenLocalEntities.delete(relPath);
+        this.removeSyncManifestEntry(relPath);
+    }
+
+    private rememberRemoteDelete(relPath: string, content?: Uint8Array, staleLocalMtime?: number) {
+        if (content===undefined) {
+            this.remoteDeleteTombstones.delete(relPath);
+            return;
+        }
+        this.remoteDeleteTombstones.set(relPath, {
+            digest: contentDigest(content),
+            staleLocalMtime: staleLocalMtime===undefined ? undefined : normalizeMtimeMs(staleLocalMtime),
+        });
+    }
+
+    private clearRemoteDelete(relPath: string) {
+        this.remoteDeleteTombstones.delete(relPath);
     }
 
     private shouldPropagate(action: 'push'|'pull', relPath: string, content?: Uint8Array): boolean {
@@ -914,6 +955,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     this.baseCache[relPath] = localContent;
                     this.seenLocalEntities.add(relPath);
                     this.setBypassCache(relPath, localContent);
+                    this.clearRemoteDelete(relPath);
                     continue;
                 }
 
@@ -937,12 +979,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     await this.writeFile(relPath, remoteContent);
                     this.baseCache[relPath] = remoteContent;
                     this.seenLocalEntities.add(relPath);
+                    this.clearRemoteDelete(relPath);
                     await this.recordSyncManifestEntry(relPath, vfsUri, remoteContent);
                 } else if (this.isLikelyBinaryRelPath(relPath)) {
                     this.setBypassCache(relPath, remoteContent);
                     await this.writeFile(relPath, remoteContent);
                     this.baseCache[relPath] = remoteContent;
                     this.seenLocalEntities.add(relPath);
+                    this.clearRemoteDelete(relPath);
                     await this.recordSyncManifestEntry(relPath, vfsUri, remoteContent);
                 } else {
                     const dmp = new DiffMatchPatch();
@@ -958,6 +1002,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     await this.writeFile(relPath, mergedContent);
                     this.baseCache[relPath] = mergedContent;
                     this.seenLocalEntities.add(relPath);
+                    this.clearRemoteDelete(relPath);
                     // write the merged content to remote
                     if (localPatches.length!==0) {
                         await this.withFileSystemContext(
@@ -973,45 +1018,61 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         });
     }
 
-    private async collectLocalProjectRelPaths(rootUri: vscode.Uri = this.baseUri): Promise<string[]> {
-        const relPaths: string[] = [];
-        const entries = await vscode.workspace.fs.readDirectory(rootUri);
+    private localRelPathFromUri(uri: vscode.Uri): string {
         const basePath = this.baseUri.path.replace(/\/+$/, '');
-        for (const [name, type] of entries) {
-            const childUri = vscode.Uri.joinPath(rootUri, name);
-            if (isLocalReplicaMetadataUri(childUri, this.baseUri)) {
-                continue;
+        return normalizeReplicaPath(uri.path.slice(basePath.length));
+    }
+
+    private shouldPreserveLocalPathForRemoteReset(uri: vscode.Uri): boolean {
+        if (isLocalReplicaMetadataUri(uri, this.baseUri)) {
+            return true;
+        }
+
+        const relPath = this.localRelPathFromUri(uri);
+        const segments = relPath.split('/').filter(Boolean);
+        if (segments.some(segment => segment.startsWith('.'))) {
+            return true;
+        }
+
+        return relPath==='/AGENTS.md' || relPath==='/CLAUDE.md';
+    }
+
+    private async clearLocalProjectEntryForRemoteReset(uri: vscode.Uri): Promise<void> {
+        if (this.shouldPreserveLocalPathForRemoteReset(uri)) {
+            return;
+        }
+
+        const stat = await vscode.workspace.fs.stat(uri);
+        if (stat.type===vscode.FileType.Directory) {
+            const entries = await vscode.workspace.fs.readDirectory(uri);
+            for (const [name] of entries) {
+                await this.clearLocalProjectEntryForRemoteReset(vscode.Uri.joinPath(uri, name));
             }
-            const relPath = normalizeReplicaPath(childUri.path.slice(basePath.length));
-            relPaths.push(relPath);
-            if (type===vscode.FileType.Directory) {
-                relPaths.push(...await this.collectLocalProjectRelPaths(childUri));
+
+            const remainingEntries = await vscode.workspace.fs.readDirectory(uri);
+            if (remainingEntries.length!==0) {
+                return;
             }
         }
-        return relPaths;
+
+        const relPath = this.localRelPathFromUri(uri);
+        this.setBypassCache(relPath, undefined, 'pull');
+        await this.withFileSystemContext(
+            'Delete local file before remote-authoritative sync',
+            uri,
+            () => deleteWithTrashFallback(uri, {recursive: false}),
+        );
     }
 
     private async clearLocalProjectFilesForRemoteReset(): Promise<void> {
-        const relPaths = await this.collectLocalProjectRelPaths();
-        for (const relPath of relPaths) {
-            this.setBypassCache(relPath, undefined, 'pull');
-        }
-
         const entries = await vscode.workspace.fs.readDirectory(this.baseUri);
         for (const [name] of entries) {
-            const childUri = vscode.Uri.joinPath(this.baseUri, name);
-            if (isLocalReplicaMetadataUri(childUri, this.baseUri)) {
-                continue;
-            }
-            await this.withFileSystemContext(
-                'Delete local file before remote-authoritative sync',
-                childUri,
-                () => deleteWithTrashFallback(childUri, {recursive: true}),
-            );
+            await this.clearLocalProjectEntryForRemoteReset(vscode.Uri.joinPath(this.baseUri, name));
         }
 
         this.baseCache = {};
         this.seenLocalEntities.clear();
+        this.remoteDeleteTombstones.clear();
         this.pendingLocalEvents.forEach(pending => clearTimeout(pending.timer));
         this.pendingLocalEvents.clear();
     }
@@ -1199,6 +1260,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         await (async () => {
             if (type==='delete') {
                 const newContent = undefined;
+                const previousBaseContent = this.baseCache[relPath];
 
                 // Layer 3 — suppress a pull-delete for a path we never
                 // authoritatively replicated. The cascade starts here: a VFS
@@ -1210,7 +1272,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (action==='pull') {
                     const localExists = await LocalReplicaSCMProvider.pathExists(toUri);
                     const everReplicated = relPath in this.baseCache;
-                    if (!localExists || !everReplicated || this.failedInitialPulls.has(relPath)) {
+                    if (!localExists) {
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [pull delete applied:local-missing] ${relPath}: ` +
+                            `everReplicated=${everReplicated} failedInitialPull=${this.failedInitialPulls.has(relPath)}`,
+                        );
+                        this.setBypassCache(relPath, undefined);
+                        this.rememberRemoteDelete(relPath, previousBaseContent);
+                        this.clearReplicaState(relPath);
+                        this.failedInitialPulls.delete(relPath);
+                        await this.persistSyncManifest();
+                        return;
+                    }
+                    if (!everReplicated || this.failedInitialPulls.has(relPath)) {
                         getOutputChannel().appendLine(
                             `${new Date().toISOString()} [pull delete suppressed] ${relPath}: ` +
                             `localExists=${localExists} everReplicated=${everReplicated} ` +
@@ -1252,6 +1326,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     outcome = 'suppressed';
                     return;
                 }
+                let staleLocalMtime: number | undefined;
+                if (action==='pull') {
+                    try {
+                        const deleteTargetStat = await vscode.workspace.fs.stat(toUri);
+                        if (deleteTargetStat.type===vscode.FileType.File) {
+                            staleLocalMtime = deleteTargetStat.mtime;
+                        }
+                    } catch {
+                        staleLocalMtime = undefined;
+                    }
+                }
                 if (action==='push') {
                     const decision = await getAgentReviewManager()?.beforeLocalReplicaPush({
                         rootUri: this.baseUri,
@@ -1266,10 +1351,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         return;
                     }
                 }
-                delete this.baseCache[relPath];
-                this.seenLocalEntities.delete(relPath);
+                this.setBypassCache(relPath, undefined);
+                this.rememberRemoteDelete(relPath, previousBaseContent, staleLocalMtime);
+                this.clearReplicaState(relPath);
                 await vscode.workspace.fs.delete(toUri, {recursive:true});
-                this.removeSyncManifestEntry(relPath);
                 await this.persistSyncManifest();
                 if (action==='push') {
                     await getAgentReviewManager()?.afterLocalReplicaPush({
@@ -1318,6 +1403,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         const newContent = action==='pull'
                             ? await this.pullRemoteFile(relPath, fromUri)
                             : await vscode.workspace.fs.readFile(fromUri);
+                        if (action==='push') {
+                            const tombstone = this.remoteDeleteTombstones.get(relPath);
+                            const staleLocalBytes = tombstone!==undefined
+                                && tombstone.digest===contentDigest(newContent)
+                                && tombstone.staleLocalMtime!==undefined
+                                && normalizeMtimeMs(stat.mtime)<=tombstone.staleLocalMtime+REMOTE_DELETE_MTIME_SLOP_MS;
+                            if (staleLocalBytes) {
+                                getOutputChannel().appendLine(
+                                    `${new Date().toISOString()} [push update suppressed:remote-delete-echo] ${relPath}`,
+                                );
+                                this.setBypassCache(relPath, undefined);
+                                try {
+                                    await vscode.workspace.fs.delete(fromUri, {recursive:false});
+                                } catch {
+                                    // The stale local file may already be gone.
+                                }
+                                outcome = 'suppressed';
+                                return;
+                            }
+                        }
                         // Content-equality short-circuit for pull. The bypass
                         // cache already suppresses this case via its sha1
                         // digest, but doing the explicit byte compare here
@@ -1327,19 +1432,40 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         // changed, and (c) emits a forensic [pull noop] log
                         // line that makes "VFS is noisy but content is
                         // stable" diagnosable.
+                        let forcePullWrite = false;
                         if (action==='pull') {
                             const existing = this.baseCache[relPath];
                             if (existing && bytesEqual(existing, newContent)) {
-                                getOutputChannel().appendLine(
-                                    `${new Date().toISOString()} [pull noop] ${relPath} (${newContent.length} bytes, content unchanged)`,
-                                );
+                                const localContent = await this.readFile(relPath);
+                                if (localContent===undefined) {
+                                    forcePullWrite = true;
+                                    getOutputChannel().appendLine(
+                                        `${new Date().toISOString()} [pull repair] ${relPath}: local file missing while remote matches base`,
+                                    );
+                                } else if (bytesEqual(localContent, newContent)) {
+                                    getOutputChannel().appendLine(
+                                        `${new Date().toISOString()} [pull noop] ${relPath} (${newContent.length} bytes, content unchanged)`,
+                                    );
+                                    outcome = 'suppressed';
+                                    return;
+                                } else {
+                                    getOutputChannel().appendLine(
+                                        `${new Date().toISOString()} [pull noop:local-diverged] ${relPath} (${newContent.length} bytes, remote unchanged)`,
+                                    );
+                                    outcome = 'suppressed';
+                                    return;
+                                }
+                            } else if (await this.readFile(relPath)===undefined) {
+                                forcePullWrite = true;
+                            }
+                        }
+                        if (forcePullWrite) {
+                            this.setBypassCache(relPath, newContent, 'pull');
+                        } else {
+                            if (this.bypassSync(action, type, relPath, newContent)) {
                                 outcome = 'suppressed';
                                 return;
                             }
-                        }
-                        if (this.bypassSync(action, type, relPath, newContent)) {
-                            outcome = 'suppressed';
-                            return;
                         }
                         const pushChange = action==='push' ? {
                             rootUri: this.baseUri,
@@ -1365,6 +1491,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         }
                         this.baseCache[relPath] = newContent;
                         this.seenLocalEntities.add(relPath);
+                        this.clearRemoteDelete(relPath);
                         await this.recordSyncManifestEntry(relPath, action==='push' ? toUri : fromUri, newContent);
                         await this.persistSyncManifest();
                         if (action==='push') {
@@ -1589,6 +1716,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 await this.writeFile(relPath, content);
                 this.baseCache[relPath] = content;
                 this.seenLocalEntities.add(relPath);
+                this.clearRemoteDelete(relPath);
                 await this.recordSyncManifestEntry(relPath, vfsUri, content);
                 this.failedInitialPulls.delete(relPath);
                 recovered.push(relPath);
