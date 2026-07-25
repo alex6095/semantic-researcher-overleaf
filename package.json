@@ -2,7 +2,7 @@
   "name": "semantic-researcher-overleaf",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.28",
+  "version": "0.15.29",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -979,6 +979,7 @@
     "fuzzysearch": "^1.0.3",
     "mime-types": "^2.1.35",
     "minimatch": "^9.0.9",
+    "node-diff3": "3.2.1",
     "node-fetch": "^2.7.0",
     "playwright-core": "1.42.1",
     "prettier": "^3.1.1",
@@ -1012,7 +1013,6 @@
     "serialize-javascript": "^7.0.5"
   },
   "extensionKind": [
-    "workspace",
-    "ui"
+    "workspace"
   ]
 }

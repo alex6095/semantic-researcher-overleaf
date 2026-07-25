@@ -4,6 +4,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.29] - 2026-07-25
+### Added
+- Add a durable Local Replica sync manifest and three-way text merging so offline and concurrent local/Overleaf edits can be reconciled without silently discarding either copy.
+- Add compile-barrier coverage for closed files, folders, and binary media, including additions, edits, renames, and deletes that occur without an editor or watcher event.
+- Add an asynchronous local-watcher health monitor. It detects both startup and later event loss, switches to exact-content scans every 750 ms, and stops those scans when watcher delivery recovers.
+
+### Changed
+- Make <kbd>Ctrl</kbd>+<kbd>S</kbd> on a supported source file sync the saved disk bytes and then compile. Manual Compile and PDF Recompile continue to use saved state and never save or include unsaved editor buffers.
+- Run the main extension on the workspace extension host and keep the Remote Pack on the local UI host, isolating Local Replica state correctly in SSH and other remote windows.
+
+### Fixed
+- Queue compile-on-save follow-ups per normalized Overleaf project so saves from another project cannot replace a pending compile, while multiple saves in one project still coalesce.
+- Carry the authoritative remote baseline through serialized Local Replica document writes so a stale closed-document VFS cache cannot apply a collaborator delta twice. If Overleaf advances again, perform one verified three-way merge or persist a conflict without sending an OT update.
+- Correlate document writes with Overleaf's sender `otUpdateApplied` event. A concurrent collaborator OT triggers authoritative readback, while an ACK timeout is accepted only when the remote result proves the local change is present; otherwise it becomes a persisted conflict without automatic retransmission. Failed post-submit readback is also non-retryable, and in-doubt version barriers prevent a delayed sender event from approving a later rejected write.
+- Anchor echo suppression to the current manifest baseline so a legitimate local A-to-B-to-A revert is never mistaken for an old directional echo.
+- Prevent stale Local Replica sessions, delayed I/O, manifest publication races, and old UI callbacks from mutating a newly activated project.
+- Preserve unverified or concurrently edited local and Overleaf copies behind explicit conflict resolution instead of recreating deleted remote files or overwriting local work.
+- Persist path conflicts with their local revisions so reload cannot forget an ambiguous delete or same-content remote recreation.
+- Quarantine one-sided files, media, and folders when upgrading an existing replica without a valid sync baseline, while keeping first-time local-folder imports unchanged.
+- Revalidate file and folder content immediately before pull writes and recursive deletes, and replay changes buffered while startup reconciliation is running.
+- Journal local swaps and remote staged deletes before hiding visible paths, resume them after reload, restore changed open local inodes, retain failed rollbacks, and fall back safely on filesystems without hard-link support.
+- Release unchanged inode guards in the background on Linux only after no open descriptor references them, avoiding healthy compile latency without weakening late-write protection.
+- Propagate rejected Overleaf document creation and media upload operations as sync failures instead of recording them as delivered.
+- Refresh restored clean editors from disk without invoking save participants or reverting an unrelated active editor.
+- Include the Socket.IO project query in the legacy Overleaf handshake so live collaboration connects on current Overleaf deployments.
+- Keep watcher probe timers generation-owned and drain probe I/O during session changes so a slow SSH probe cannot disable the next session's degraded-mode fallback.
+- Reclassify watcher events from current disk state, so platforms that report a deletion as `Change` still remove the Overleaf file. A delayed remote echo can no longer restore a newer local deletion.
+- Preserve a file or folder recreated while its remote deletion is in flight, and queue the recreated state after the delete completes instead of clearing its pending watcher event.
+- Retain and retry a closed-file sync intent when an execution-time local `stat` or read fails transiently; the path remains divergent and emits an explicit error instead of disappearing from the queue.
+- Carry an expected-missing contract into the actual VFS file and folder creation boundary. If a collaborator creates the same path after Local Replica's preflight, accept identical content or persist a file/folder conflict without overwriting either side.
+- Preserve HTTP status on failed create responses so duplicate/ambiguous operations are authoritatively rechecked, transient throttling is retried without resetting the project, and deterministic rejections stop immediately. Failed file downloads now throw instead of masquerading as verified zero-byte content.
+- Retain and retry remote watcher intent when execution-time VFS classification fails transiently, emitting an explicit pull error instead of leaving the local replica stale until another Overleaf event.
+- Emit the complete created subtree after an Overleaf folder rename or move, and rename only the final path component so matching text in parent folder names is not corrupted.
+- Share one in-flight reconnect across concurrent writes rather than resetting project state once per writer.
+- Keep persisted binary conflicts blocked on every watcher push until explicit resolution, including after reload.
+- Serialize Agent Review interception with project activation so an in-flight review cannot publish into the next replica's store.
+
 ## [0.15.27] - 2026-05-26
 ### Added
 - Add a `Disconnect Current Live Project` command for selected Local Replica projects, exposed from the Overleaf status bar and Project Manager view, so the current live Overleaf connection can be cleared without deleting local files.

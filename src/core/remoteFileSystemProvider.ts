@@ -10,6 +10,11 @@ import { EventBus } from '../utils/eventBus';
 import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
 import { canonicalizeOverleafUri, normalizeOverleafQuery } from '../utils/overleafUri';
+import {
+    getActiveReplicaOriginUri,
+    getActiveReplicaRoot,
+} from '../utils/localReplicaWorkspace';
+import { decodeUtf8Text, mergeUtf8Text } from '../utils/threeWayMerge';
 
 const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -109,7 +114,42 @@ export function parseUri(uri: vscode.Uri) {
     return {userId, projectId, serverName, projectName, identifier, pathParts};
 }
 
+export function vfsProjectKey(uri: vscode.Uri) {
+    uri = canonicalizeOverleafUri(uri);
+    if (uri.scheme!==ROOT_NAME) {
+        return uri.with({fragment: ''}).toString();
+    }
+    const {userId, projectId} = parseUri(uri);
+    return `${uri.scheme.toLowerCase()}://${uri.authority.toLowerCase()}` +
+        `?user=${encodeURIComponent(userId ?? '')}&project=${encodeURIComponent(projectId ?? '')}`;
+}
+
 export type VFSConnectionState = 'initial' | 'connected' | 'reconnecting' | 'disconnected';
+
+export class RemoteDocumentMergeConflictError extends Error {}
+export class RemoteDocumentWriteAmbiguousError extends Error {}
+export class RemoteMutationRejectedError extends Error {
+    readonly retryable = false;
+}
+export class RemoteMutationRetryableError extends Error {
+    readonly retryable = true;
+
+    constructor(
+        message: string,
+        readonly requiresAuthoritativeRecheck: boolean,
+    ) {
+        super(message);
+    }
+}
+
+interface PendingDocumentWrite {
+    submittedVersion: number;
+    collaboratorRevision: number;
+    requiresAuthoritativeReconciliation: boolean;
+    appliedVersion?: number;
+    applied: Promise<number | undefined>;
+    resolveApplied: (version?: number) => void;
+}
 
 export class VirtualFileSystem extends vscode.Disposable {
     private root?: ProjectEntity;
@@ -131,7 +171,12 @@ export class VirtualFileSystem extends vscode.Disposable {
     private clientManagerItem?: {manager: ClientManager, triggers: vscode.Disposable[]};
     private scmCollectionItem?: {collection: SCMCollectionProvider, triggers: vscode.Disposable[]};
     private remoteWatchDisposable?: vscode.Disposable;
+    private readonly documentWriteQueues = new Map<string, Promise<void>>();
+    private readonly documentCollaboratorRevisions = new Map<string, number>();
+    private readonly pendingDocumentWrites = new Map<string, PendingDocumentWrite>();
+    private readonly documentInDoubtSenderVersions = new Map<string, number[]>();
     private disposed = false;
+    private static readonly documentAppliedTimeoutMs = 5000;
 
     // Connection state is useful for SCM and UI layers: we don't want to trust
     // "selected" as a proxy for "live".
@@ -144,11 +189,19 @@ export class VirtualFileSystem extends vscode.Disposable {
     public readonly serverName: string;
     public readonly projectId: string;
 
-    constructor(context: vscode.ExtensionContext, uri: vscode.Uri, notify: (events:vscode.FileChangeEvent[])=>void) {
+    constructor(
+        context: vscode.ExtensionContext,
+        uri: vscode.Uri,
+        notify: (events:vscode.FileChangeEvent[])=>void,
+        private readonly isActiveProject?: () => boolean,
+    ) {
         // define the dispose behavior
         super(() => {
             if (this.disposed) { return; }
             this.disposed = true;
+            this.root = undefined;
+            this.initializing = undefined;
+            this._connectionState = 'disconnected';
             // dispose all triggers of clientManager
             this.clientManagerItem?.triggers.forEach((trigger) => trigger.dispose());
             this.clientManagerItem = undefined;
@@ -157,6 +210,12 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.scmCollectionItem = undefined;
             this.remoteWatchDisposable?.dispose();
             this.remoteWatchDisposable = undefined;
+            for (const pending of this.pendingDocumentWrites.values()) {
+                pending.resolveApplied();
+            }
+            this.pendingDocumentWrites.clear();
+            this.documentWriteQueues.clear();
+            this.documentCollaboratorRevisions.clear();
             // disconnect socketio
             try {
                 this.socket.dispose();
@@ -201,29 +260,41 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (this.disposed) {
             throw new Error(`Cannot reconnect disposed Overleaf project ${this.origin.toString()}`);
         }
+        if (this._connectionState==='reconnecting' && this.initializing) {
+            return this.initializing;
+        }
         console.log(`Reconnecting Overleaf project ${this.origin.toString()}: ${reason}`);
         this.setConnectionState('reconnecting');
         this.retryConnection = Math.max(this.retryConnection, 1);
         this.root = undefined;
-        this.initializing = undefined;
-        return this.init();
+        this.initializing = this.initializingPromise;
+        return this.initializing;
     }
 
     async ensureConnectedForWrite(): Promise<void> {
         if (this.connectionState==='connected') {
             return;
         }
+        if (this.initializing) {
+            await this.initializing;
+            return;
+        }
         await this.reconnect('before remote write');
     }
 
     private setConnectionState(next: VFSConnectionState) {
+        if (this.disposed) { return; }
         if (this._connectionState===next) { return; }
         this._connectionState = next;
         this._onDidChangeConnectionEmitter.fire(next);
     }
 
     async init() : Promise<ProjectEntity> {
+        if (this.disposed) {
+            throw vscode.FileSystemError.Unavailable(`Overleaf project is disposed: ${this.origin.toString()}`);
+        }
         if (this.root) {
+            this.ensureActiveManagers();
             return Promise.resolve(this.root);
         }
 
@@ -231,6 +302,32 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.initializing = this.initializingPromise;
         }
         return this.initializing;
+    }
+
+    private ensureActiveManagers(force = false) {
+        if (this.disposed) { return; }
+        const activeCondition = force
+            || this.isActiveProject?.()===true
+            || (vscode.workspace.workspaceFolders ?? []).some(folder =>
+                folder.uri.scheme===ROOT_NAME
+                && vfsProjectKey(folder.uri)===vfsProjectKey(this.origin)
+            );
+        if (!activeCondition) { return; }
+
+        if (!this.clientManagerItem) {
+            const clientManager = new ClientManager(this, this.context, this.publicId||'', this.socket);
+            this.clientManagerItem = {
+                manager: clientManager,
+                triggers: clientManager.triggers,
+            };
+        }
+        if (!this.scmCollectionItem) {
+            const scmCollection = new SCMCollectionProvider(this, this.context);
+            this.scmCollectionItem = {
+                collection: scmCollection,
+                triggers: scmCollection.triggers,
+            };
+        }
     }
 
     private getConnectionFailureMessage(error?: unknown): string {
@@ -249,6 +346,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     private get initializingPromise(): Promise<ProjectEntity> {
+        if (this.disposed) {
+            throw vscode.FileSystemError.Unavailable(`Overleaf project is disposed: ${this.origin.toString()}`);
+        }
         // if retry connection failed 3 times, throw error
         if (this.retryConnection >= 3) {
             const message = this.getConnectionFailureMessage(this.lastConnectionError);
@@ -274,40 +374,29 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.remoteWatch();
         this.root = undefined;
         return this.socket.joinProject(this.projectId).then(async (project) => {
+            if (this.disposed) {
+                throw vscode.FileSystemError.Unavailable(`Overleaf project is disposed: ${this.origin.toString()}`);
+            }
             // fetch project settings
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+            if (this.disposed) {
+                throw vscode.FileSystemError.Unavailable(`Overleaf project is disposed: ${this.origin.toString()}`);
+            }
             project.settings = (await this.api.getProjectSettings(identity, this.projectId)).settings!;
+            if (this.disposed) {
+                throw vscode.FileSystemError.Unavailable(`Overleaf project is disposed: ${this.origin.toString()}`);
+            }
             this.root = project;
             this.retryConnection = 0;
             this.lastConnectionError = undefined;
             this.setConnectionState('connected');
-            const activeCondition = (vscode.workspace.workspaceFolders===undefined) || (vscode.workspace.workspaceFolders?.[0].uri.scheme!==ROOT_NAME) || (vscode.workspace.workspaceFolders?.[0].uri===this.origin);
-            // Register: [collaboration] ClientManager on Statusbar
-            if (activeCondition) {
-                if (this.clientManagerItem?.triggers) {
-                    this.clientManagerItem.triggers.forEach((trigger) => trigger.dispose());
-                    delete this.clientManagerItem;
-                }
-                const clientManager = new ClientManager(this, this.context, this.publicId||'', this.socket);
-                this.clientManagerItem = {
-                    manager: clientManager,
-                    triggers: clientManager.triggers,
-                };
-            }
-            // Register: [scm] SCMCollectionProvider in explorer
-            if (activeCondition) {
-                if (this.scmCollectionItem?.triggers) {
-                    this.scmCollectionItem.triggers.forEach((trigger) => trigger.dispose());
-                    delete this.scmCollectionItem;
-                }
-                const scmCollection = new SCMCollectionProvider(this, this.context);
-                this.scmCollectionItem = {
-                    collection: scmCollection,
-                    triggers: scmCollection.triggers,
-                };
-            }
+            this.ensureActiveManagers();
             return project;
         }).catch((err) => {
+            if (this.disposed) {
+                this.initializing = undefined;
+                throw err;
+            }
             this.lastConnectionError = err instanceof Error ? err : new Error(String(err));
             if (!this.isRetryableConnectionError(err)) {
                 const message = this.getConnectionFailureMessage(err);
@@ -368,10 +457,8 @@ export class VirtualFileSystem extends vscode.Disposable {
     _resolveById(entityId: string, root?: FolderEntity, path?:string):{
         parentFolder: FolderEntity, fileEntity: FileEntity, fileType:FileType, path:string
     } | undefined {
-        if (!this.root) {
-            throw vscode.FileSystemError.FileNotFound();
-        }
-        root = root || this.root.rootFolder[0];
+        root = root || this.root?.rootFolder[0];
+        if (!root) { return undefined; }
         path = path || '/';
 
         if (root._id === entityId) {
@@ -396,8 +483,10 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     walk(filter:(entity:FileEntity)=>boolean): {entity:FileEntity, path:string}[] {
-        const result = [];
-        const folders = this.root ? [{entity:this.root.rootFolder[0], path:'/'}] : [];
+        const result: {entity:FileEntity, path:string}[] = [];
+        const root = this.root?.rootFolder[0];
+        if (!root) { return result; }
+        const folders = [{entity:root, path:'/'}];
 
         // apply filter to root folder
         filter(folders[0].entity) && result.push(folders[0]);
@@ -449,7 +538,36 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    private appendCreatedEntityEvents(
+        events: vscode.FileChangeEvent[],
+        fileType: FileType,
+        entity: FileEntity,
+        entityPath: string,
+    ) {
+        events.push({
+            type: vscode.FileChangeType.Created,
+            uri: this.pathToUri(entityPath),
+        });
+        if (fileType!=='folder') { return; }
+
+        const folder = entity as FolderEntity;
+        for (const [type, key] of Object.entries(FolderKeys) as Array<[FileType, FolderKey]>) {
+            if (type==='outputs') { continue; }
+            for (const child of folder[key] ?? []) {
+                const childPath = `${entityPath.replace(/\/+$/, '')}/${child.name}`;
+                this.appendCreatedEntityEvents(events, type, child, childPath);
+            }
+        }
+    }
+
+    private createdEntityEvents(fileType: FileType, entity: FileEntity, entityPath: string) {
+        const events: vscode.FileChangeEvent[] = [];
+        this.appendCreatedEntityEvents(events, fileType, entity, entityPath);
+        return events;
+    }
+
     private remoteWatch(): void {
+        if (this.disposed) { return; }
         this.remoteWatchDisposable?.dispose();
         this.remoteWatchDisposable = this.socket.updateEventHandlers({
             onDisconnected: () => {
@@ -480,11 +598,16 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const res = this._resolveById(entityId);
                 if (res) {
                     const {fileEntity} = res;
-                    const oldName = fileEntity.name;
+                    const oldPathWithoutTrailingSlash = res.path.replace(/\/+$/, '');
+                    const parentPath = oldPathWithoutTrailingSlash.slice(
+                        0,
+                        oldPathWithoutTrailingSlash.lastIndexOf('/')+1,
+                    );
+                    const newPath = parentPath+newName;
                     fileEntity.name = newName;
                     this.notify([
                         {type: vscode.FileChangeType.Deleted, uri: this.pathToUri(res.path)},
-                        {type: vscode.FileChangeType.Created, uri: this.pathToUri(res.path.replace(oldName, newName))}
+                        ...this.createdEntityEvents(res.fileType, fileEntity, newPath),
                     ]);
                 }
             },
@@ -507,41 +630,16 @@ export class VirtualFileSystem extends vscode.Disposable {
                     this.removeEntity(oldPath.parentFolder, oldPath.fileType, oldPath.fileEntity);
                     this.notify([
                         {type: vscode.FileChangeType.Deleted, uri: this.pathToUri(oldPath.path)},
-                        {type: vscode.FileChangeType.Created, uri: this.pathToUri(newPath.path, oldPath.fileEntity.name)}
+                        ...this.createdEntityEvents(
+                            oldPath.fileType,
+                            oldPath.fileEntity,
+                            `${newPath.path.replace(/\/+$/, '')}/${oldPath.fileEntity.name}`,
+                        ),
                     ]);
                 }
             },
             onFileChanged: (update:UpdateSchema) => {
-                const res = this._resolveById(update.doc);
-                if (res===undefined) { return; }
-
-                const doc = res.fileEntity as DocumentEntity;
-                if (update.v===doc.version) {
-                    doc.version += 1;
-                    if (update.op && doc.remoteCache!==undefined) {
-                        let content = doc.remoteCache;
-                        update.op.forEach((op) => {
-                            if (op.i) {
-                                content = content.slice(0, op.p) + op.i + content.slice(op.p);
-                            } else if (op.d) {
-                                const deleteUtf8 = Buffer.from(op.d, 'ascii').toString('utf-8');
-                                content = content.slice(0, op.p) + content.slice(op.p+deleteUtf8.length);
-                            }
-                        });
-                        const _uri = this.pathToUri(res.path).toString();
-                        const _doc = vscode.workspace.textDocuments.find((doc) => doc.uri.toString()===_uri);
-                        // if doc dirty, local cache should diverge from remote cache
-                        if (_doc && !_doc.isDirty) {doc.localCache = content;}
-                        doc.remoteCache = content;
-                        this.isDirty = true;
-                        this.notify([
-                            {type: vscode.FileChangeType.Changed, uri: this.pathToUri(res.path)}
-                        ]);
-                    }
-                } else {
-                    doc.remoteCache = undefined;
-                    doc.localCache = undefined;
-                }
+                this.applyRemoteDocumentUpdate(update);
             },
             onSpellCheckLanguageUpdated: (language:string) => {
                 if (this.root) {
@@ -577,6 +675,24 @@ export class VirtualFileSystem extends vscode.Disposable {
         await this.scmCollectionItem?.collection.flushPendingLocalPush(localUri);
     }
 
+    public async flushLocalReplicaBeforeCompile(localUris: vscode.Uri[] = []): Promise<void> {
+        const activeReplicaOrigin = getActiveReplicaOriginUri();
+        if (
+            !activeReplicaOrigin
+            || vfsProjectKey(activeReplicaOrigin)!==vfsProjectKey(this.origin)
+        ) {
+            return;
+        }
+
+        this.ensureActiveManagers(true);
+        const collection = this.scmCollectionItem?.collection;
+        const activeReplicaRoot = getActiveReplicaRoot();
+        if (!collection || !activeReplicaRoot) {
+            throw new Error('Active Local Replica manager is not available.');
+        }
+        await collection.flushLocalReplicaBeforeCompile(localUris, activeReplicaRoot);
+    }
+
     async resolve(uri: vscode.Uri): Promise<File> {
         const {fileName, fileEntity, fileType} = await this._resolveUri(uri);
         const readonly = fileEntity?.readonly ? vscode.FilePermission.Readonly : undefined;
@@ -609,6 +725,177 @@ export class VirtualFileSystem extends vscode.Disposable {
             });
         }
         return results;
+    }
+
+    private applyRemoteDocumentUpdate(update: UpdateSchema): void {
+        const res = this._resolveById(update.doc);
+        if (res===undefined) { return; }
+
+        const doc = res.fileEntity as DocumentEntity;
+        const hasOperation = Boolean(update.op?.length);
+        if (hasOperation) {
+            this.documentCollaboratorRevisions.set(
+                doc._id,
+                (this.documentCollaboratorRevisions.get(doc._id) ?? 0) + 1,
+            );
+        }
+
+        const pending = this.pendingDocumentWrites.get(doc._id);
+        const inDoubtVersions = this.documentInDoubtSenderVersions.get(doc._id);
+        let consumedInDoubtSenderEvent = false;
+        if (!hasOperation && inDoubtVersions?.length) {
+            const barrierIndex = inDoubtVersions.findIndex(version => update.v>=version);
+            if (barrierIndex!==-1) {
+                inDoubtVersions.splice(barrierIndex, 1);
+                consumedInDoubtSenderEvent = true;
+                if (inDoubtVersions.length===0) {
+                    this.documentInDoubtSenderVersions.delete(doc._id);
+                }
+            }
+        }
+        if (
+            !hasOperation
+            && !consumedInDoubtSenderEvent
+            && pending
+            && update.v>=pending.submittedVersion
+            && pending.appliedVersion===undefined
+        ) {
+            pending.appliedVersion = update.v;
+            pending.resolveApplied(update.v);
+        }
+
+        if (!hasOperation && doc.version!==undefined && update.v<doc.version) {
+            // An authoritative rejoin can overtake the sender-only applied
+            // event. It carries no operation, so an older version is only a
+            // delayed acknowledgement and cannot change document content.
+            return;
+        }
+
+        if (update.v===doc.version) {
+            doc.version += 1;
+            if (hasOperation && doc.remoteCache!==undefined) {
+                let content = doc.remoteCache;
+                update.op!.forEach((op) => {
+                    if (op.i) {
+                        content = content.slice(0, op.p) + op.i + content.slice(op.p);
+                    } else if (op.d) {
+                        const deleteUtf8 = Buffer.from(op.d, 'ascii').toString('utf-8');
+                        content = content.slice(0, op.p) + content.slice(op.p+deleteUtf8.length);
+                    }
+                });
+                const remoteUri = this.pathToUri(res.path);
+                const openDocument = vscode.workspace.textDocuments.find(
+                    candidate => candidate.uri.toString()===remoteUri.toString(),
+                );
+                if (!openDocument || !openDocument.isDirty) {
+                    doc.localCache = content;
+                }
+                doc.remoteCache = content;
+                this.isDirty = true;
+                this.notify([{type: vscode.FileChangeType.Changed, uri: remoteUri}]);
+            } else if (!hasOperation && !pending) {
+                // A sender acknowledgement without its pending write context
+                // proves that the version advanced, but not what text the
+                // server accepted. Force the next read to rejoin.
+                doc.remoteCache = undefined;
+                doc.localCache = undefined;
+                this.isDirty = true;
+                this.notify([{
+                    type: vscode.FileChangeType.Changed,
+                    uri: this.pathToUri(res.path),
+                }]);
+            }
+        } else {
+            doc.remoteCache = undefined;
+            doc.localCache = undefined;
+            // A missed or out-of-order OT update invalidates the cache, but
+            // Local Replica still needs a file event so its pull path joins
+            // the document again and reads the authoritative server text.
+            this.isDirty = true;
+            this.notify([{
+                type: vscode.FileChangeType.Changed,
+                uri: this.pathToUri(res.path),
+            }]);
+        }
+    }
+
+    private async enqueueDocumentWrite<T>(docId: string, task: () => Promise<T>): Promise<T> {
+        const previous = this.documentWriteQueues.get(docId) ?? Promise.resolve();
+        const result = previous
+            .catch(() => undefined)
+            .then(task);
+        const settled = result.then(
+            () => undefined,
+            () => undefined,
+        );
+        this.documentWriteQueues.set(docId, settled);
+        try {
+            return await result;
+        } finally {
+            if (this.documentWriteQueues.get(docId)===settled) {
+                this.documentWriteQueues.delete(docId);
+            }
+        }
+    }
+
+    private async waitForDocumentApplied(
+        pending: PendingDocumentWrite,
+        timeoutMs: number,
+    ): Promise<number | undefined> {
+        if (pending.appliedVersion!==undefined) {
+            return pending.appliedVersion;
+        }
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+            return await Promise.race([
+                pending.applied,
+                new Promise<undefined>(resolve => {
+                    timer = setTimeout(() => resolve(undefined), timeoutMs);
+                }),
+            ]);
+        } finally {
+            if (timer) {
+                clearTimeout(timer);
+            }
+        }
+    }
+
+    private async refreshDocumentFromServer(
+        uri: vscode.Uri,
+        doc: DocumentEntity,
+    ): Promise<Uint8Array> {
+        for (let attempt = 0; attempt<3; attempt++) {
+            const response = await this.socket.joinDoc(doc._id);
+            if (this.disposed) {
+                throw vscode.FileSystemError.Unavailable(
+                    `Overleaf project is disposed: ${this.origin.toString()}`,
+                );
+            }
+            if (doc.version!==undefined && doc.version>response.version) {
+                continue;
+            }
+            const content = response.docLines.join('\n');
+            doc.version = response.version;
+            doc.remoteCache = content;
+            doc.localCache = content;
+            this.isDirty = true;
+            return new TextEncoder().encode(content);
+        }
+        throw new RemoteDocumentWriteAmbiguousError(
+            `Could not obtain a current Overleaf revision for ${uri.path}.`,
+        );
+    }
+
+    private desiredChangeIsPresent(
+        submittedRemote: Uint8Array,
+        desired: Uint8Array,
+        authoritative: Uint8Array,
+    ): boolean {
+        if (Buffer.from(desired).equals(Buffer.from(authoritative))) {
+            return true;
+        }
+        const merged = mergeUtf8Text(submittedRemote, desired, authoritative);
+        return merged!==undefined && Buffer.from(merged).equals(Buffer.from(authoritative));
     }
 
     async openFile(uri: vscode.Uri): Promise<Uint8Array> {
@@ -654,7 +941,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                 EventBus.fire('fileWillOpenEvent', {uri});
                 return res.content;
             } else {
-                return new Uint8Array(0);
+                throw vscode.FileSystemError.Unavailable(
+                    `Could not download Overleaf file "${fileEntity.name}".`,
+                );
             }
         }
     }
@@ -670,8 +959,12 @@ export class VirtualFileSystem extends vscode.Disposable {
 
         if (content.length===0) {
             const _res = await this.api.addDoc(identity, this.projectId, parentFolder._id, fileName);
-            if (_res.type==='success') {
+            if (_res.type==='success' && _res.entity!==undefined) {
                 res = _res.entity;
+            } else {
+                const message = _res.message ?? `Could not create Overleaf document "${fileName}".`;
+                vscode.window.showErrorMessage(message);
+                throw this.createMutationResponseError(message, _res.status);
             }
         } else {
             const parentFolderId = parentFolder._id;
@@ -679,9 +972,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (_res.type==='success' && _res.entity!==undefined) {
                 res = _res.entity;
             } else {
-                if (_res.message!==undefined) {
-                    vscode.window.showErrorMessage(_res.message);
-                }
+                const message = _res.message ?? `Could not upload Overleaf file "${fileName}".`;
+                vscode.window.showErrorMessage(message);
+                throw this.createMutationResponseError(message, _res.status);
             }
         }
         if (res && res._type) {
@@ -689,7 +982,21 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.notify([
                 {type: vscode.FileChangeType.Created, uri: uri},
             ]);
+            return;
         }
+        const message = `Overleaf returned an invalid entity while creating "${fileName}".`;
+        vscode.window.showErrorMessage(message);
+        throw new RemoteMutationRetryableError(message, true);
+    }
+
+    private createMutationResponseError(message: string, status?: number): Error {
+        if (status===408 || status===409 || (status!==undefined && status>=500)) {
+            return new RemoteMutationRetryableError(message, true);
+        }
+        if (status===423 || status===425 || status===429) {
+            return new RemoteMutationRetryableError(message, false);
+        }
+        return new RemoteMutationRejectedError(message);
     }
 
     async refreshLinkedFile(uri: vscode.Uri) {
@@ -824,79 +1131,355 @@ export class VirtualFileSystem extends vscode.Disposable {
         ]);
     }
 
+    private async updateDocument(
+        uri: vscode.Uri,
+        doc: DocumentEntity,
+        content: Uint8Array,
+        remoteBaseline?: Uint8Array,
+    ): Promise<Uint8Array> {
+        return this.enqueueDocumentWrite(
+            doc._id,
+            () => this.updateDocumentSerial(uri, doc, content, remoteBaseline),
+        );
+    }
+
+    private async updateDocumentSerial(
+        uri: vscode.Uri,
+        doc: DocumentEntity,
+        content: Uint8Array,
+        remoteBaseline?: Uint8Array,
+    ): Promise<Uint8Array> {
+        if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
+            await this.openFile(uri);
+        }
+        if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
+            throw new Error(`Remote document cache is not initialized for ${uri.toString()}`);
+        }
+
+        const desiredText = decodeUtf8Text(content);
+        if (desiredText===undefined) {
+            throw new Error(`Remote document content is not mergeable UTF-8 for ${uri.toString()}`);
+        }
+
+        const dmp = new DiffMatchPatch();
+        let mergeRes: string;
+        if (remoteBaseline!==undefined) {
+            const baselineText = decodeUtf8Text(remoteBaseline);
+            if (baselineText===undefined) {
+                throw new Error(`Remote document baseline is not mergeable UTF-8 for ${uri.toString()}`);
+            }
+            if (doc.remoteCache===baselineText || doc.remoteCache===desiredText) {
+                mergeRes = desiredText;
+            } else {
+                const merged = mergeUtf8Text(
+                    remoteBaseline,
+                    content,
+                    new TextEncoder().encode(doc.remoteCache),
+                );
+                if (merged===undefined) {
+                    throw new RemoteDocumentMergeConflictError(
+                        `Overleaf changed ${uri.path} again before the rebased Local Replica write could be applied.`,
+                    );
+                }
+                mergeRes = new TextDecoder().decode(merged);
+            }
+        } else {
+            const patches = dmp.patch_make(doc.localCache, doc.remoteCache);
+            mergeRes = dmp.patch_apply(patches, desiredText)[0] as string;
+        }
+
+        let writtenContent = new TextEncoder().encode(mergeRes);
+        if (mergeRes===doc.remoteCache) {
+            doc.localCache = mergeRes;
+            return writtenContent;
+        }
+
+        const submittedVersion = doc.version;
+        const submittedRemoteText = doc.remoteCache;
+        const submittedRemote = new TextEncoder().encode(submittedRemoteText);
+        const update = {
+            doc: doc._id,
+            lastV: doc.lastVersion,
+            v: submittedVersion,
+            // Reference: services/web/frontend/js/vendor/libs/sharejs.js#L1288
+            hash: (()=>{
+                if (!doc.mtime || Date.now()-doc.mtime>5000) {
+                    doc.mtime = Date.now();
+                    return require('crypto').createHash('sha1').update(
+                        "blob " + mergeRes.length + "\x00" + mergeRes
+                    ).digest('hex');
+                }
+            })() as string,
+            op: (()=>{
+                const remoteCacheAscii = Buffer.from(doc.remoteCache, 'utf-8').toString('utf-8');
+                const mergeResAscii = Buffer.from(mergeRes, 'utf-8').toString('utf-8');
+                let currentPos = 0;
+                return dmp.diff_main(remoteCacheAscii, mergeResAscii)
+                            .map((part) => {
+                                // part[0] === -1: delete, 0: equal, 1: insert; part[1]: compared content
+                                const incCount = part[0] === -1 ? 0 : part[1].length;
+                                currentPos += incCount;
+                                if (part[0] !== 0) {
+                                    return {
+                                        p: currentPos - incCount,
+                                        i: part[0] ===  1 ?  part[1] : undefined,
+                                        d: part[0] === -1 ?  part[1] : undefined,
+                                    };
+                                }
+                            })
+                            .filter(x => x) as any;
+            })(),
+        };
+        this.isDirty = (update.op && update.op.length) ? true : false;
+
+        let resolveApplied!: (version?: number) => void;
+        const pending: PendingDocumentWrite = {
+            submittedVersion,
+            collaboratorRevision: this.documentCollaboratorRevisions.get(doc._id) ?? 0,
+            requiresAuthoritativeReconciliation:
+                (this.documentInDoubtSenderVersions.get(doc._id)?.length ?? 0)>0,
+            applied: new Promise<number | undefined>(resolve => {
+                resolveApplied = resolve;
+            }),
+            resolveApplied: version => resolveApplied(version),
+        };
+        this.pendingDocumentWrites.set(doc._id, pending);
+
+        let acknowledgementError: unknown;
+        let alternativeWriteAccepted = false;
+        let acknowledgementWasExplicitlyRejected = false;
+        try {
+            try {
+                await this.socket.applyOtUpdate(doc._id, update);
+            } catch (error) {
+                acknowledgementError = error;
+            }
+
+            alternativeWriteAccepted = acknowledgementError===undefined
+                && this.socket.isUsingAlternativeConnectionScheme;
+            acknowledgementWasExplicitlyRejected = acknowledgementError instanceof Error
+                && acknowledgementError.message!=='timeout';
+            const appliedVersion = alternativeWriteAccepted
+                ? submittedVersion
+                : await this.waitForDocumentApplied(
+                    pending,
+                    acknowledgementError===undefined
+                        && !pending.requiresAuthoritativeReconciliation
+                        ? VirtualFileSystem.documentAppliedTimeoutMs
+                        : 0,
+                );
+            const collaboratorRevision = this.documentCollaboratorRevisions.get(doc._id) ?? 0;
+            const canUseSubmittedResult = alternativeWriteAccepted
+                || (
+                    !acknowledgementWasExplicitlyRejected
+                    && !pending.requiresAuthoritativeReconciliation
+                    && appliedVersion!==undefined
+                    && collaboratorRevision===pending.collaboratorRevision
+                    && doc.version===appliedVersion+1
+                    && doc.remoteCache===submittedRemoteText
+                );
+
+            if (canUseSubmittedResult) {
+                doc.localCache = mergeRes;
+                doc.remoteCache = mergeRes;
+            } else {
+                let authoritative: Uint8Array;
+                try {
+                    authoritative = await this.refreshDocumentFromServer(uri, doc);
+                } catch (error) {
+                    doc.remoteCache = undefined;
+                    doc.localCache = undefined;
+                    if (error instanceof RemoteDocumentWriteAmbiguousError) {
+                        throw error;
+                    }
+                    throw new RemoteDocumentWriteAmbiguousError(
+                        `Overleaf could not reconcile the submitted document update for ${uri.path}: ` +
+                        `${error instanceof Error ? error.message : String(error)}`,
+                    );
+                }
+                if (
+                    appliedVersion===undefined
+                    && !this.desiredChangeIsPresent(submittedRemote, writtenContent, authoritative)
+                ) {
+                    if (
+                        acknowledgementWasExplicitlyRejected
+                        && Buffer.from(authoritative).equals(Buffer.from(submittedRemote))
+                    ) {
+                        throw acknowledgementError;
+                    }
+                    throw new RemoteDocumentWriteAmbiguousError(
+                        `Overleaf could not prove whether the document update for ${uri.path} was applied.`,
+                    );
+                }
+                writtenContent = authoritative;
+            }
+        } finally {
+            if (
+                !alternativeWriteAccepted
+                && !acknowledgementWasExplicitlyRejected
+                && pending.appliedVersion===undefined
+            ) {
+                const barriers = this.documentInDoubtSenderVersions.get(doc._id) ?? [];
+                barriers.push(submittedVersion);
+                this.documentInDoubtSenderVersions.set(doc._id, barriers);
+            }
+            if (this.pendingDocumentWrites.get(doc._id)===pending) {
+                this.pendingDocumentWrites.delete(doc._id);
+            }
+            pending.resolveApplied();
+        }
+
+        doc.lastVersion = submittedVersion;
+        setTimeout(() => {
+            this.notify([
+                {type: vscode.FileChangeType.Changed, uri: uri}
+            ]);
+        }, 10);
+        return writtenContent;
+    }
+
+    async writeFileFromRemoteBaseline(
+        uri: vscode.Uri,
+        content: Uint8Array,
+        remoteBaseline?: Uint8Array,
+        expectedRemoteMissing = false,
+    ): Promise<Uint8Array> {
+        await this.ensureConnectedForWrite();
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        if (expectedRemoteMissing) {
+            if (fileType) {
+                if (fileType==='doc' || fileType==='file') {
+                    const remoteContent = await this.readCreateVerificationContent(
+                        uri,
+                        fileType,
+                        fileEntity,
+                    );
+                    if (Buffer.compare(Buffer.from(remoteContent), Buffer.from(content))===0) {
+                        return content;
+                    }
+                }
+                throw new RemoteDocumentMergeConflictError(
+                    `Overleaf path appeared while the local file was being created: ${uri.path}`,
+                );
+            }
+            try {
+                await this.createFile(uri, content, false);
+                return content;
+            } catch (error) {
+                if ((error as {retryable?: boolean})?.retryable===false) {
+                    throw error;
+                }
+                if (
+                    error instanceof RemoteMutationRetryableError
+                    && !error.requiresAuthoritativeRecheck
+                ) {
+                    throw error;
+                }
+                await this.reconnect(`verify create-if-missing: ${uri.path}`);
+                const refreshed = await this._resolveUri(uri);
+                if (refreshed.fileType) {
+                    if (refreshed.fileType==='doc' || refreshed.fileType==='file') {
+                        const remoteContent = await this.readCreateVerificationContent(
+                            uri,
+                            refreshed.fileType,
+                            refreshed.fileEntity,
+                        );
+                        if (Buffer.compare(Buffer.from(remoteContent), Buffer.from(content))===0) {
+                            return content;
+                        }
+                    }
+                    throw new RemoteDocumentMergeConflictError(
+                        `Overleaf path appeared while the local file was being created: ${uri.path}`,
+                    );
+                }
+                throw error;
+            }
+        }
+        if (fileType==='doc' && fileEntity) {
+            const doc = fileEntity as DocumentEntity;
+            if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
+                await this.openFile(uri);
+            }
+            const effectiveBaseline = remoteBaseline
+                ?? (doc.remoteCache===undefined
+                    ? undefined
+                    : new TextEncoder().encode(doc.remoteCache));
+            return this.updateDocument(uri, doc, content, effectiveBaseline);
+        }
+        await this.writeFile(uri, content, true, true);
+        return content;
+    }
+
+    private async readCreateVerificationContent(
+        uri: vscode.Uri,
+        fileType: 'doc' | 'file',
+        fileEntity?: FileEntity,
+    ): Promise<Uint8Array> {
+        if (!fileEntity) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
+        if (fileType==='doc') {
+            return this.refreshDocumentFromServer(uri, fileEntity as DocumentEntity);
+        }
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const response = await this.api.getFile(identity, this.projectId, fileEntity._id);
+        if (response.type==='success' && response.content!==undefined) {
+            return response.content;
+        }
+        throw vscode.FileSystemError.Unavailable(
+            `Could not verify Overleaf file "${fileEntity.name}".`,
+        );
+    }
+
+    async createDirectoryIfMissing(uri: vscode.Uri): Promise<void> {
+        await this.ensureConnectedForWrite();
+        const current = await this._resolveUri(uri);
+        if (current.fileType==='folder') {
+            return;
+        }
+        if (current.fileType) {
+            throw new RemoteDocumentMergeConflictError(
+                `Overleaf path has a different type while the local folder was being created: ${uri.path}`,
+            );
+        }
+        try {
+            await this.mkdir(uri);
+        } catch (error) {
+            if ((error as {retryable?: boolean})?.retryable===false) {
+                throw error;
+            }
+            if (
+                error instanceof RemoteMutationRetryableError
+                && !error.requiresAuthoritativeRecheck
+            ) {
+                throw error;
+            }
+            await this.reconnect(`verify folder create-if-missing: ${uri.path}`);
+            const refreshed = await this._resolveUri(uri);
+            if (refreshed.fileType==='folder') {
+                return;
+            }
+            if (refreshed.fileType) {
+                throw new RemoteDocumentMergeConflictError(
+                    `Overleaf path has a different type while the local folder was being created: ${uri.path}`,
+                );
+            }
+            throw error;
+        }
+    }
+
     async writeFile(uri: vscode.Uri, content:Uint8Array, create:boolean, overwrite:boolean) {
         await this.ensureConnectedForWrite();
         const {fileType, fileEntity} = await this._resolveUri(uri);
 
-        // if non-exists --> create it
         if (!fileType && create) {
             return this.createFile(uri, content, true);
         }
-
-        // if exists but not doc --> create new
         if (fileType && fileType!=='doc' && create) {
             return this.createFile(uri, content, overwrite);
         }
-
-        // if exists and is doc --> update
-        if (fileType && fileType==='doc' && fileEntity) {
-            const doc = fileEntity as DocumentEntity;
-            const _content = new TextDecoder().decode(content);
-            if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
-                await this.openFile(uri);
-            }
-            if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
-                throw new Error(`Remote document cache is not initialized for ${uri.toString()}`);
-            }
-            const dmp = new DiffMatchPatch();
-            const patches = dmp.patch_make(doc.localCache,  doc.remoteCache);
-
-            const mergeResArray = dmp.patch_apply(patches, _content);
-            const mergeRes = mergeResArray[0] as string;
-            const update = {
-                doc: doc._id,
-                lastV: doc.lastVersion,
-                v: doc.version,
-                // Reference: services/web/frontend/js/vendor/libs/sharejs.js#L1288
-                hash: (()=>{
-                    if (!doc.mtime || Date.now()-doc.mtime>5000) {
-                        doc.mtime = Date.now();
-                        return require('crypto').createHash('sha1').update(
-                            "blob " + mergeRes.length + "\x00" + mergeRes
-                        ).digest('hex');
-                    }
-                })() as string,
-                op: (()=>{
-                    const remoteCacheAscii = Buffer.from(doc.remoteCache, 'utf-8').toString('utf-8');
-                    const mergeResAscii = Buffer.from(mergeRes, 'utf-8').toString('utf-8');
-                    let currentPos = 0;
-                    return dmp.diff_main(remoteCacheAscii, mergeResAscii)
-                                .map((part) => {
-                                    // part[0] === -1: delete, 0: equal, 1: insert; part[1]: compared content
-                                    const incCount = part[0] === -1 ? 0 : part[1].length;
-                                    currentPos += incCount;
-                                    // add op when content not equal
-                                    if (part[0] !== 0) {
-                                        return {
-                                            p: currentPos - incCount,
-                                            i: part[0] ===  1 ?  part[1] : undefined,
-                                            d: part[0] === -1 ?  part[1] : undefined,
-                                        };
-                                    }
-                                })
-                                .filter(x => x) as any;
-                })(),
-            };
-            this.isDirty = (update.op && update.op.length) ? true : false;
-            await this.socket.applyOtUpdate(doc._id, update);
-            doc.localCache = mergeRes;
-            doc.remoteCache = mergeRes;
-            setTimeout(() => {
-                this.notify([
-                    {type: vscode.FileChangeType.Changed, uri: uri}
-                ]);
-            }, 10);
-            doc.lastVersion = doc.version;                
+        if (fileType==='doc' && fileEntity) {
+            await this.updateDocument(uri, fileEntity as DocumentEntity, content);
         }
     }
 
@@ -906,15 +1489,21 @@ export class VirtualFileSystem extends vscode.Disposable {
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
         const res = await this.api.addFolder(identity, this.projectId, folderName, parentFolderId);
 
-        if (res.type==='success' && res.entity!==undefined) {
-            this.insertEntity(parentFolder, 'folder', res.entity as FolderEntity);
-            this.notify([
-                {type: vscode.FileChangeType.Created, uri: uri},
-            ]);
-        } else {
-            if (res.message!==undefined) {
-                vscode.window.showErrorMessage(res.message);
+        if (res.type==='success') {
+            if (res.entity!==undefined) {
+                this.insertEntity(parentFolder, 'folder', res.entity as FolderEntity);
+                this.notify([
+                    {type: vscode.FileChangeType.Created, uri: uri},
+                ]);
+                return;
             }
+            const message = `Overleaf returned an invalid entity while creating "${folderName}".`;
+            vscode.window.showErrorMessage(message);
+            throw new RemoteMutationRetryableError(message, true);
+        } else {
+            const message = res.message ?? `Could not create Overleaf folder "${folderName}".`;
+            vscode.window.showErrorMessage(message);
+            throw this.createMutationResponseError(message, res.status);
         }
     }
 
@@ -929,10 +1518,12 @@ export class VirtualFileSystem extends vscode.Disposable {
                     {type: vscode.FileChangeType.Deleted, uri: uri},
                 ]);
             } else {
-                if (res.message!==undefined) {
-                    vscode.window.showErrorMessage(res.message);
-                }
+                const message = res.message ?? `Could not delete Overleaf ${fileType} "${fileEntity.name}".`;
+                vscode.window.showErrorMessage(message);
+                throw vscode.FileSystemError.Unavailable(message);
             }
+        } else {
+            throw vscode.FileSystemError.FileNotFound(uri);
         }
     }
 
@@ -943,9 +1534,10 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (oldPath.fileType && oldPath.fileEntity && oldPath.fileEntity) {
             // delete existence firstly
             if (newPath.fileType && newPath.fileEntity) {
-                if (!force) { return; }
+                if (!force) {
+                    throw vscode.FileSystemError.FileExists(newUri);
+                }
                 await this.remove(newUri, true);
-                this.removeEntity(newPath.parentFolder, newPath.fileType, newPath.fileEntity);
             }
             // rename or move
             let res = undefined;
@@ -968,10 +1560,13 @@ export class VirtualFileSystem extends vscode.Disposable {
                     {type: vscode.FileChangeType.Created, uri: newUri},
                 ]);
             } else {
-                if (res?.message!==undefined) {
-                    vscode.window.showErrorMessage(res.message);
-                }
+                const message = res?.message
+                    ?? `Could not rename Overleaf ${oldPath.fileType} "${oldPath.fileEntity.name}".`;
+                vscode.window.showErrorMessage(message);
+                throw vscode.FileSystemError.Unavailable(message);
             }
+        } else {
+            throw vscode.FileSystemError.FileNotFound(oldUri);
         }
     }
 
@@ -1325,11 +1920,12 @@ export interface ActiveConnectionChange {
     state: VFSConnectionState,
 }
 
-export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
+export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vscode.Disposable {
     private _emitter = new vscode.EventEmitter<vscode.FileChangeEvent[]>();
     readonly onDidChangeFile: vscode.Event<vscode.FileChangeEvent[]> = this._emitter.event;
 
     private vfss: {[key:string]:VirtualFileSystem};
+    private disposed = false;
 
     private _activeVFS: VirtualFileSystem | undefined;
     private _activeConnectionSubscription?: vscode.Disposable;
@@ -1342,6 +1938,7 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     getActiveVFS(): VirtualFileSystem | undefined {
+        if (this.disposed) { return undefined; }
         return this._activeVFS?.isDisposed ? undefined : this._activeVFS;
     }
 
@@ -1351,6 +1948,10 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     private setActiveVFS(vfs: VirtualFileSystem | undefined) {
+        if (this.disposed) {
+            vfs?.dispose();
+            return;
+        }
         if (this._activeVFS===vfs) { return; }
         this._activeConnectionSubscription?.dispose();
         this._activeVFS = vfs;
@@ -1365,16 +1966,26 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     private getVFS(uri: vscode.Uri): Promise<VirtualFileSystem> {
+        if (this.disposed) {
+            return Promise.reject(vscode.FileSystemError.Unavailable('Overleaf file system provider is disposed.'));
+        }
         uri = canonicalizeOverleafUri(uri);
-        const vfs = this.vfss[ uri.query ];
+        const key = vfsProjectKey(uri);
+        const vfs = this.vfss[key];
         if (vfs && !vfs.isDisposed) {
             return Promise.resolve(vfs);
         } else {
             if (vfs?.isDisposed) {
-                delete this.vfss[uri.query];
+                delete this.vfss[key];
             }
-            const newVfs = new VirtualFileSystem(this.context, uri, this.notify.bind(this));
-            this.vfss[ uri.query ] = newVfs;
+            let newVfs: VirtualFileSystem;
+            newVfs = new VirtualFileSystem(
+                this.context,
+                uri,
+                this.notify.bind(this),
+                () => this._activeVFS===newVfs,
+            );
+            this.vfss[key] = newVfs;
             return Promise.resolve(newVfs);
         }
     }
@@ -1384,36 +1995,59 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider {
     }
 
     async activateProject(uri: vscode.Uri): Promise<VirtualFileSystem> {
+        if (this.disposed) {
+            throw vscode.FileSystemError.Unavailable('Overleaf file system provider is disposed.');
+        }
         uri = canonicalizeOverleafUri(uri);
-        Object.entries(this.vfss).forEach(([query, vfs]) => {
-            if (query!==uri.query) {
+        const targetKey = vfsProjectKey(uri);
+        Object.entries(this.vfss).forEach(([key, vfs]) => {
+            if (key!==targetKey) {
                 if (this._activeVFS===vfs) { this.setActiveVFS(undefined); }
                 vfs.dispose();
-                delete this.vfss[query];
+                delete this.vfss[key];
             }
         });
 
         const vfs = await this.prefetch(uri);
+        if (this.disposed) {
+            vfs.dispose();
+            throw vscode.FileSystemError.Unavailable('Overleaf file system provider is disposed.');
+        }
         this.setActiveVFS(vfs);
         await vfs.init();
         return vfs;
     }
 
     async deactivateProject(uri?: vscode.Uri): Promise<void> {
-        const targetQuery = uri ? canonicalizeOverleafUri(uri).query : this._activeVFS?.origin.query;
-        if (!targetQuery) { return; }
+        if (this.disposed) { return; }
+        const targetKey = uri ? vfsProjectKey(uri) : this._activeVFS ? vfsProjectKey(this._activeVFS.origin) : undefined;
+        if (!targetKey) { return; }
 
-        const vfs = this.vfss[targetQuery];
+        const vfs = this.vfss[targetKey];
         if (vfs===undefined) { return; }
         if (this._activeVFS===vfs) {
             this.setActiveVFS(undefined);
         }
         vfs.dispose();
-        delete this.vfss[targetQuery];
+        delete this.vfss[targetKey];
     }
 
     notify(events :vscode.FileChangeEvent[]) {
+        if (this.disposed) { return; }
         this._emitter.fire(events);
+    }
+
+    dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this._activeConnectionSubscription?.dispose();
+        this._activeConnectionSubscription = undefined;
+        this._activeVFS = undefined;
+        const vfss = Object.values(this.vfss);
+        this.vfss = {};
+        vfss.forEach(vfs => vfs.dispose());
+        this._emitter.dispose();
+        this._onDidChangeActiveConnectionEmitter.dispose();
     }
 
     stat(uri: vscode.Uri): Thenable<vscode.FileStat> {

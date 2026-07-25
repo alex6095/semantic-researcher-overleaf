@@ -169,6 +169,7 @@ export interface ProjectSettingsSchema {
 
 export interface ResponseSchema {
     type: 'success' | 'error';
+    status?: number;
     raw?: ArrayBuffer;
     message?: string;
     userInfo?: {userId:string, userEmail:string};
@@ -241,10 +242,14 @@ export class BaseAPI {
 
     // Reference: "github:overleaf/overleaf/services/web/frontend/js/ide/connection/ConnectionManager.js#L137"
     _initSocketV0(identity:Identity, query?:string) {
-        const url = new URL(this.url).origin + (query ?? '');
+        const url = new URL(this.url).origin;
         return (require('socket.io-client').connect as any)(url, {
             reconnect: false,
             'force new connection': true,
+            // The v2 Overleaf handshake requires projectId on the HTTP
+            // handshake itself. Supplying the parsed query explicitly avoids
+            // depending on the legacy 0.9 client preserving a URL suffix.
+            query: query?.replace(/^\?/, '') ?? '',
             extraHeaders: {
                 'Origin': new URL(this.url).origin,
                 'Cookie': identity.cookies,
@@ -292,6 +297,7 @@ export class BaseAPI {
         } else {
             return {
                 type: 'error',
+                status: Number(res.status),
                 message: `${res.status}: `+await res.text()
             };
         }
@@ -399,6 +405,7 @@ export class BaseAPI {
             res = res || { status:'undefined', text:()=>'' };
             return {
                 type: 'error',
+                status: Number(res.status),
                 message: `${res.status}: `+await res.text()
             };
         }
@@ -423,7 +430,10 @@ export class BaseAPI {
             else if (res.status===206) {
                 content.push(await res.buffer());
             } else {
-                break;
+                const detail = await res.text();
+                throw new Error(
+                    `Overleaf download failed (${res.status})${detail ? `: ${detail}` : ''}`,
+                );
             }
         };
 

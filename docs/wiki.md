@@ -168,6 +168,8 @@ Please follow the steps below to setup a local replica and open the project loca
 
 If you already have a specific local folder that should become the replica root itself, hover over the project and click the rightmost inline `Select Project Folder Locally ...` action, or right click on the project and select `Select Project Folder Locally ...`.
 
+![Local Replica files synchronized to Overleaf](assets/demo08-local-replica-overleaf.gif)
+
 This command differs from `Open Project Locally ...` in two important ways:
 
 1. the selected folder is used directly as the replica root, so `.semantic-researcher-overleaf/settings.json` and the synced project files will be created inside that exact folder;
@@ -175,10 +177,14 @@ This command differs from `Open Project Locally ...` in two important ways:
 
 The extension activates after VS Code startup, when you open the Overleaf Activity Bar, run an Overleaf command, open an Overleaf virtual workspace, or open a workspace that contains `.semantic-researcher-overleaf/settings.json` or legacy `.overleaf/settings.json`. Startup activation restores a previously selected external replica from the current window's workspace state when its marker file still exists. If no selected replica or workspace marker is found, the extension does not start an Overleaf project connection or replica sync.
 
-> [!WARNING]
-> Do not select local folders for two different Overleaf projects in the same VS Code window. The extension currently keeps one active local replica root per window; selecting a folder for another project changes that active root and can cause collaboration, history, compile, or sync operations to resolve against the wrong local LaTeX folder.
+Files written directly to the selected folder are part of the replica even when they were never opened in VS Code. This includes source files and binary media created, changed, renamed, or deleted by a shell command or coding agent. Collaborator changes in Overleaf are pulled back to disk. A lightweight watcher handles the normal path, a content scan takes over if watcher delivery fails, and every compile checks saved disk state before it starts.
+
+The replica stores its synchronization baseline and conflicts under `.semantic-researcher-overleaf`. Text is merged only when a verified three-way merge is clean. Concurrent binary changes, ambiguous deletes, and other cases without a safe common-base decision are preserved as conflicts instead of silently choosing the local or Overleaf copy.
+
+> [!IMPORTANT]
+> The extension keeps one active Local Replica per VS Code window. Selecting a folder for another project asks to disconnect the current live replica first; disconnecting leaves its local files in place and clears the old project's live hooks before the new project is activated.
 >
-> If you need to work on two local replicas at once, open each project in a separate VS Code window. Avoid editing both local LaTeX folders from one workspace.
+> If you need to work on two live replicas at once, open each project in a separate VS Code window.
 
 ## Basic Usage
 
@@ -408,7 +414,7 @@ The project-irrelevant configurations of the extension can be found in the VS Co
 
 ![screenshot-vscode-configurations](assets/screenshot-vscode-configurations.png)
 
-- **"Compile On Save"**: This configuration is used to enable/disable the compile on save feature. The default value is `true`.
+- **"Compile On Save"**: This configuration enables or disables compilation after a supported source file is saved with <kbd>Ctrl</kbd>+<kbd>S</kbd>. In Local Replica mode, the saved disk state (including closed files and media changed by local tools or agents) is synchronized before compilation. Manual **Compile Project** and PDF **Recompile** use the last saved state; they do not save or include unsaved editor buffers. The default value is `true`.
 - **Compile Output Folder Name**: This configuration is used to change the name of the output folder. The default value is `.output`. It takes effect after restarting VS Code.
 - **Invisible Mode: Chat Message Refresh Interval**: This configuration is used to change the refresh interval of the chat messages in the invisible mode. The default value is `3` (3 seconds).
 - **Invisible Mode: History Refresh Interval**: This configuration is used to change the refresh interval of the history of changes in the invisible mode. The default value is `3` (3 seconds).

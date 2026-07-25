@@ -237,18 +237,55 @@ export class SocketIOAPI {
                 };
                 this.recordErrorHandler = socketErrorHandler;
                 this.socketErrorHandlers.add(socketErrorHandler);
-                this.socket.on('joinProjectResponse', (res:any) => {
+                this.socket.on('joinProjectResponse', (...args:any[]) => {
                     this.socketErrorHandlers.delete(socketErrorHandler);
                     if (this.recordErrorHandler===socketErrorHandler) {
                         this.recordErrorHandler = undefined;
                     }
-                    const publicId = res.publicId as string;
-                    const project = res.project as ProjectEntity;
+                    const parsed = this.parseJoinProjectResponse(args);
+                    if (!parsed) {
+                        const shape = args.map(value => {
+                            if (Array.isArray(value)) {
+                                return `array(${value.length})`;
+                            }
+                            if (value && typeof value==='object') {
+                                return `object(${Object.keys(value).sort().join(',')})`;
+                            }
+                            return typeof value;
+                        }).join(', ');
+                        reject(new Error(`Invalid joinProjectResponse payload: ${shape}`));
+                        return;
+                    }
+                    const {publicId, project} = parsed;
                     EventBus.fire('socketioConnectedEvent', {publicId});
                     resolve(project);
                 });
             });
         }
+    }
+
+    private parseJoinProjectResponse(
+        args: any[],
+    ): {publicId: string; project: ProjectEntity} | undefined {
+        const values = args.flatMap(value => Array.isArray(value) ? value : [value]);
+        const containers = values.filter(value => value && typeof value==='object');
+        const project = [
+            ...containers.map(value => value.project),
+            ...containers.map(value => value.data?.project),
+            ...containers,
+        ].find(candidate =>
+            candidate
+            && typeof candidate==='object'
+            && Array.isArray(candidate.rootFolder)
+        ) as ProjectEntity | undefined;
+        if (!project) { return undefined; }
+
+        const publicId = containers
+            .map(value => value.publicId ?? value.public_id ?? value.data?.publicId)
+            .find(value => typeof value==='string')
+            ?? values.find(value => typeof value==='string')
+            ?? '';
+        return {publicId, project};
     }
 
     disconnect() {

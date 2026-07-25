@@ -1,11 +1,16 @@
 import * as vscode from 'vscode';
-import { RemoteFileSystemProvider, parseUri } from '../core/remoteFileSystemProvider';
+import {
+    RemoteFileSystemProvider,
+    parseUri,
+    vfsProjectKey,
+} from '../core/remoteFileSystemProvider';
 import { ROOT_NAME, ELEGANT_NAME, OUTPUT_FOLDER_NAME, PDF_VIEW_TYPE, getConfiguredValue } from '../consts';
 import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
 import { EventBus } from '../utils/eventBus';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 import { getActiveReplicaOriginUri, isWithinActiveReplica } from '../utils/localReplicaWorkspace';
+import { formatUnknownError } from '../utils/errorMessage';
 
 // map string level to severity
 const severityMap: Record<string, vscode.DiagnosticSeverity> = {
@@ -16,6 +21,7 @@ const severityMap: Record<string, vscode.DiagnosticSeverity> = {
 
 // Match the document class in the tex file
 const documentClassRegex = new RegExp(/\\documentclass(?:\[[^\[\]\{\}]*\])?\{([^\[\]\{\}]+)\}/);
+const compileOnSaveExtensionRegex = /\.(tex|ltx|ctx|bib|sty|cls|bbx|cbx|bst|def|cfg|clo|fd)$/i;
 
 const pdfViewRecord: {
     [key: string]: {
@@ -120,6 +126,11 @@ export class CompileManager {
     private diagnosticProvider: CompileDiagnosticProvider;
     private compileAsDraft: boolean = false;
     private compileStopOnFirstError: boolean = false;
+    private pendingSavedCompiles = new Map<string, {
+        projectUri: vscode.Uri;
+        localUris: Map<string, vscode.Uri>;
+    }>();
+    private drainingPendingSavedCompiles = false;
 
     constructor(
         private vfsm: RemoteFileSystemProvider,
@@ -161,8 +172,11 @@ export class CompileManager {
         return undefined;
     }
 
-    async update(status: 'success'|'compiling'|'failed'|'alert') {
-        const uri = await CompileManager.check();
+    async update(
+        status: 'success'|'compiling'|'failed'|'alert',
+        projectUri?: vscode.Uri,
+    ) {
+        const uri = projectUri ?? await CompileManager.check();
         if (uri) {
             this.inCompiling = status === 'compiling';
             // Broadcast compile state to any open PDF webviews for this project
@@ -211,37 +225,100 @@ export class CompileManager {
         return uri;
     }
 
-    private async saveProjectDocuments(uri: vscode.Uri) {
-        const {identifier} = parseUri(uri);
-        const savedLocalReplicaDocs: vscode.Uri[] = [];
-        const dirtyDocs = vscode.workspace.textDocuments.filter(doc => doc.isDirty);
-        for (const doc of dirtyDocs) {
-            if (doc.uri.scheme===ROOT_NAME) {
-                try {
-                    if (parseUri(doc.uri).identifier===identifier) {
-                        await doc.save();
-                    }
-                } catch {}
-            } else if (doc.uri.scheme==='file' && isWithinActiveReplica(doc.uri)) {
-                if (await doc.save()) {
-                    savedLocalReplicaDocs.push(doc.uri);
-                }
-            }
-        }
-        return savedLocalReplicaDocs;
+    private warnLocalReplicaPrecompileFlushFailed(error: unknown) {
+        vscode.window.showWarningMessage(
+            vscode.l10n.t(
+                'Compile canceled: Local Replica sync did not finish. {message}',
+                {message: formatUnknownError(error)},
+            ),
+        );
     }
 
-    async compile(force:boolean=false) {
-        if (this.inCompiling) { return; }
+    private resolveProjectUri(uri?: vscode.Uri) {
+        return CompileManager.check(uri);
+    }
 
-        const uri = await this.update('compiling');
+    private queueSavedCompile(projectUri: vscode.Uri, localUris: readonly vscode.Uri[]) {
+        const projectKey = vfsProjectKey(projectUri);
+        let pending = this.pendingSavedCompiles.get(projectKey);
+        if (!pending) {
+            pending = {
+                projectUri,
+                localUris: new Map(),
+            };
+            this.pendingSavedCompiles.set(projectKey, pending);
+        }
+        for (const uri of localUris) {
+            pending.localUris.set(uri.toString(), uri);
+        }
+    }
+
+    private async flushSavedDocumentsWhileCompiling(
+        projectUri: vscode.Uri,
+        localUris: readonly vscode.Uri[],
+    ) {
+        this.queueSavedCompile(projectUri, localUris);
+        try {
+            const vfs = await this.vfsm.prefetch(projectUri);
+            await vfs.flushLocalReplicaBeforeCompile([...localUris]);
+        } catch (error) {
+            this.warnLocalReplicaPrecompileFlushFailed(error);
+        }
+    }
+
+    private async drainPendingSavedCompiles() {
+        if (this.drainingPendingSavedCompiles) { return; }
+        this.drainingPendingSavedCompiles = true;
+        try {
+            while (this.pendingSavedCompiles.size>0) {
+                const next = this.pendingSavedCompiles.entries().next().value as
+                    | [string, {
+                        projectUri: vscode.Uri;
+                        localUris: Map<string, vscode.Uri>;
+                    }]
+                    | undefined;
+                if (!next) { break; }
+                const [projectKey, pending] = next;
+                this.pendingSavedCompiles.delete(projectKey);
+                await this.compile(
+                    true,
+                    [...pending.localUris.values()],
+                    pending.projectUri,
+                );
+            }
+        } finally {
+            this.drainingPendingSavedCompiles = false;
+        }
+    }
+
+    async compile(
+        force:boolean=false,
+        savedLocalReplicaUris: readonly vscode.Uri[] = [],
+        projectUri?: vscode.Uri,
+        queueIfBusy=false,
+    ) {
+        const uri = projectUri ?? await CompileManager.check();
         if (!uri) { return; }
-        const savedLocalReplicaDocs = await this.saveProjectDocuments(uri);
+        if (this.inCompiling) {
+            if (savedLocalReplicaUris.length>0) {
+                // Ctrl+S is a delivery barrier even while another compile is
+                // running. Flush the saved disk state now and queue one
+                // follow-up compile so the latest save is not dropped.
+                await this.flushSavedDocumentsWhileCompiling(uri, savedLocalReplicaUris);
+            } else if (queueIfBusy) {
+                this.queueSavedCompile(uri, []);
+            }
+            return;
+        }
+        await this.update('compiling', uri);
 
         const work = this.vfsm.prefetch(uri)
             .then(async (vfs) => {
-                for (const localUri of savedLocalReplicaDocs) {
-                    await vfs.flushPendingLocalPush(localUri);
+                try {
+                    await vfs.flushLocalReplicaBeforeCompile([...savedLocalReplicaUris]);
+                } catch (error) {
+                    this.warnLocalReplicaPrecompileFlushFailed(error);
+                    throw error;
                 }
                 const content = new TextDecoder().decode( await vfs?.openFile(uri) );
                 const match = RegExp(documentClassRegex).exec(content);
@@ -252,15 +329,15 @@ export class CompileManager {
             .then(async (res) => {
                 switch (res) {
                     case undefined:
-                        await this.update('success');
+                        await this.update('success', uri);
                         break;
                     case false:
-                        await this.update('failed');
+                        await this.update('failed', uri);
                         break;
                     case true:
                         return true;
                     default:
-                        await this.update('alert');
+                        await this.update('alert', uri);
                         break;
                 }
             })
@@ -271,9 +348,9 @@ export class CompileManager {
             )
             .then(async (hasError) => {
                 if (hasError) {
-                    await this.update('failed');
+                    await this.update('failed', uri);
                 } else {
-                    await this.update('success');
+                    await this.update('success', uri);
                 }
                 // refresh pdf
                 const { identifier } = parseUri(uri);
@@ -288,7 +365,7 @@ export class CompileManager {
                 // terminal update(); surface as failed so the next compile()
                 // isn't permanently locked out by the inCompiling guard.
                 if (this.inCompiling) {
-                    await this.update('failed');
+                    await this.update('failed', uri);
                 }
             });
 
@@ -296,6 +373,7 @@ export class CompileManager {
             {location: vscode.ProgressLocation.Window, title: vscode.l10n.t('Compiling LaTeX')},
             () => work,
         );
+        await this.drainPendingSavedCompiles();
     }
 
     async stopCompile() {
@@ -303,7 +381,7 @@ export class CompileManager {
         if (uri && this.inCompiling) {
             const vfs = await this.vfsm.prefetch(uri);
             await vfs.stopCompile();
-            await this.update('failed');
+            await this.update('failed', uri);
         }
     }
 
@@ -503,6 +581,24 @@ export class CompileManager {
         }
     }
 
+    private async compileSavedDocument(document: vscode.TextDocument) {
+        const uri = await this.resolveProjectUri(document.uri);
+        const vfs = uri && await this.vfsm.prefetch(uri);
+        const compileCondition = vscode.workspace.getConfiguration(`${ROOT_NAME}.compileOnSave`).get('enabled', true);
+        const postfixCondition = compileOnSaveExtensionRegex.test(document.fileName);
+        if (!compileCondition || !postfixCondition || vfs?.isInvisibleMode!==false) {
+            return;
+        }
+
+        // Saving is the only editor action that contributes an in-memory
+        // buffer to a compile. Manual/PDF-viewer Compile works from the last
+        // saved disk/VFS state.
+        const savedLocalReplicaUris = document.uri.scheme==='file'
+            ? [document.uri]
+            : [];
+        await this.compile(true, savedLocalReplicaUris, uri, true);
+    }
+
     get triggers() {
         return [
             // register status bar
@@ -516,23 +612,7 @@ export class CompileManager {
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setCompiler`, () => this.setCompiler()),
             vscode.commands.registerCommand(`${ROOT_NAME}.compileManager.setRootDoc`, () => this.setRootDoc()),
             // register compile conditions
-            vscode.workspace.onDidSaveTextDocument(async (e) => {
-                const uri = await CompileManager.check.bind(this)(e.uri);
-                const vfs = uri && await this.vfsm.prefetch(uri);
-                const compileCondition = vscode.workspace.getConfiguration(`${ROOT_NAME}.compileOnSave`).get('enabled', true);
-                const postfixCondition = e.fileName.match(/\.tex$|\.sty$|\.cls$|\.bib$/i);
-                if (compileCondition && postfixCondition && vfs?.isInvisibleMode===false) {
-                    // Local-replica saves race the SCM debounce: the local
-                    // watcher push to VFS is debounced (EVENT_COALESCE_MS),
-                    // so without flushing we'd compile the previous VFS state
-                    // and vfs.compile() would also short-circuit because
-                    // isDirty=true isn't set yet. Flush, then force-compile.
-                    if (e.uri.scheme==='file' && isWithinActiveReplica(e.uri)) {
-                        await vfs.flushPendingLocalPush(e.uri);
-                    }
-                    this.compile(true);
-                }
-            }),
+            vscode.workspace.onDidSaveTextDocument(e => this.compileSavedDocument(e)),
             EventBus.on('compilerUpdateEvent', () => {
                 this.compile(true);
             }),

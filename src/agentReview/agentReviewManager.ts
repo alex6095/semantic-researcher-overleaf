@@ -33,7 +33,7 @@ function relPathToFs(relPath: string) {
 
 export function initializeAgentReviewManager(context: vscode.ExtensionContext) {
     singleton = new AgentReviewManager(context);
-    context.subscriptions.push(...singleton.triggers);
+    context.subscriptions.push(singleton, ...singleton.triggers);
     void singleton.activate(getActiveReplicaRoot());
     return singleton;
 }
@@ -42,7 +42,7 @@ export function getAgentReviewManager() {
     return singleton;
 }
 
-export class AgentReviewManager {
+export class AgentReviewManager implements vscode.Disposable {
     private readonly saveClassifier: SaveClassifier;
     private readonly workspaceInstructionManager: AgentReviewWorkspaceInstructionManager;
     private readonly proposalStore: AgentReviewProposalStore;
@@ -51,6 +51,10 @@ export class AgentReviewManager {
     private activeRoot?: vscode.Uri;
     private importTimer?: NodeJS.Timeout;
     private config: AgentReviewConfig = getAgentReviewConfig();
+    private disposed = false;
+    private activationGeneration = 0;
+    private activationQueue: Promise<void> = Promise.resolve();
+    private importQueue: Promise<void> = Promise.resolve();
 
     constructor(private readonly context: vscode.ExtensionContext) {
         this.saveClassifier = new SaveClassifier(context);
@@ -66,17 +70,38 @@ export class AgentReviewManager {
         this.editorProvider = new AgentReviewEditorProvider(this.proposalStore, this.saveClassifier);
     }
 
-    async activate(rootUri: vscode.Uri | undefined) {
+    activate(rootUri: vscode.Uri | undefined): Promise<void> {
+        const generation = ++this.activationGeneration;
+        this.stopImportTimer();
+        const activation = this.activationQueue
+            .catch(() => undefined)
+            .then(() => this.performActivation(rootUri, generation));
+        this.activationQueue = activation;
+        return activation;
+    }
+
+    private isActivationCurrent(generation: number) {
+        return !this.disposed && generation===this.activationGeneration;
+    }
+
+    private async performActivation(rootUri: vscode.Uri | undefined, generation: number) {
+        await this.importQueue.catch(() => undefined);
+        if (!this.isActivationCurrent(generation)) { return; }
         this.activeRoot = rootUri;
-        this.config = await this.resolveConfig(rootUri);
+        const config = await this.resolveConfig(rootUri);
+        if (!this.isActivationCurrent(generation)) { return; }
+        this.config = config;
         await vscode.commands.executeCommand('setContext', `${ROOT_NAME}.agentReviewActive`, !!rootUri && this.config.enabled);
+        if (!this.isActivationCurrent(generation)) { return; }
         if (!rootUri || !this.config.enabled) {
             this.stopImportTimer();
             if (rootUri) {
                 await this.workspaceInstructionManager.disable(rootUri);
+                if (!this.isActivationCurrent(generation)) { return; }
                 // Aggressively abort in-flight drafts so any agent session still
                 // running post-toggle fails fast instead of wasting tokens.
                 await this.workspaceInstructionManager.abortOwnedDrafts(rootUri);
+                if (!this.isActivationCurrent(generation)) { return; }
             }
             this.editorProvider.setActiveRoot(undefined);
             await this.editorProvider.deactivateEditors();
@@ -84,17 +109,49 @@ export class AgentReviewManager {
         }
 
         await this.proposalStore.ensureStorage(rootUri);
+        if (!this.isActivationCurrent(generation)) { return; }
         await this.proposalStore.migrateLegacy(rootUri);
+        if (!this.isActivationCurrent(generation)) { return; }
         await this.proposalStore.load(rootUri);
+        if (!this.isActivationCurrent(generation)) { return; }
         await this.workspaceInstructionManager.ensure(rootUri);
+        if (!this.isActivationCurrent(generation)) { return; }
         void this.workspaceInstructionManager.cleanupOldDrafts();
         this.editorProvider.setActiveRoot(rootUri);
         await this.importAgentReviewDrafts();
+        if (!this.isActivationCurrent(generation)) { return; }
         this.startImportTimer();
     }
 
-    async beforeLocalReplicaPush(change: LocalReplicaPushChange): Promise<LocalReplicaPushDecision> {
+    beforeLocalReplicaPush(change: LocalReplicaPushChange): Promise<LocalReplicaPushDecision> {
+        const operation = this.activationQueue
+            .catch(() => undefined)
+            .then(() => this.performBeforeLocalReplicaPush(change));
+        this.activationQueue = operation.then(
+            () => undefined,
+            () => undefined,
+        );
+        return operation;
+    }
+
+    private async performBeforeLocalReplicaPush(
+        change: LocalReplicaPushChange,
+    ): Promise<LocalReplicaPushDecision> {
+        if (this.disposed) {
+            return {kind: 'allow'};
+        }
+        const generation = this.activationGeneration;
+        const rootUri = this.activeRoot;
+        if (!rootUri || rootUri.toString()!==change.rootUri.toString()) {
+            return {kind: 'allow'};
+        }
+        const isCurrentRoot = () =>
+            this.isActivationCurrent(generation)
+            && this.activeRoot?.toString()===rootUri.toString();
         this.config = await this.resolveConfig(change.rootUri);
+        if (!isCurrentRoot()) {
+            return {kind: 'block', reason: 'Agent review workspace changed'};
+        }
         if (!this.config.enabled) {
             return {kind: 'allow'};
         }
@@ -115,17 +172,26 @@ export class AgentReviewManager {
         }
 
         const openDraft = await this.workspaceInstructionManager.latestOpenDraft(change.rootUri);
+        if (!isCurrentRoot()) {
+            return {kind: 'block', reason: 'Agent review workspace changed'};
+        }
         if (!openDraft) {
             return {kind: 'allow'};
         }
 
         const baselinePath = path.join(openDraft.baselineRoot, relPathToFs(relPath));
         if (!await pathExists(baselinePath)) {
+            if (!isCurrentRoot()) {
+                return {kind: 'block', reason: 'Agent review workspace changed'};
+            }
             vscode.window.showWarningMessage(`Blocked agent-originated source write without baseline: ${relPath}`);
             return {kind: 'block', reason: 'Agent source write blocked without baseline'};
         }
 
         const baseline = await fs.readFile(baselinePath);
+        if (!isCurrentRoot()) {
+            return {kind: 'block', reason: 'Agent review workspace changed'};
+        }
         await this.proposalStore.createDirectWriteProposal(
             change.rootUri,
             relPath,
@@ -133,11 +199,15 @@ export class AgentReviewManager {
             change.type==='delete' ? undefined : change.content,
         );
         await this.restoreSourceFile(change.localUri, baseline);
+        if (!isCurrentRoot()) {
+            return {kind: 'block', reason: 'Agent review workspace changed'};
+        }
         vscode.window.showWarningMessage(`Converted direct agent write into a review proposal: ${relPath}`);
         return {kind: 'block', reason: 'Agent source write quarantined'};
     }
 
     async afterLocalReplicaPush(change: LocalReplicaPushChange): Promise<void> {
+        if (this.disposed) { return; }
         const saveIntent = this.saveClassifier.getRecentSaveIntent(change.localUri, change.content, 60000);
         if (saveIntent?.kind==='agentReviewAccept') {
             const acceptedHunks = saveIntent.acceptedHunks
@@ -156,6 +226,7 @@ export class AgentReviewManager {
     }
 
     async afterLocalReplicaPushFailed(change: LocalReplicaPushChange): Promise<void> {
+        if (this.disposed) { return; }
         const saveIntent = this.saveClassifier.getRecentSaveIntent(change.localUri, change.content, 60000);
         if (saveIntent?.kind==='agentReviewAccept') {
             const acceptedHunks = saveIntent.acceptedHunks
@@ -173,17 +244,54 @@ export class AgentReviewManager {
         }
     }
 
-    async importAgentReviewDrafts() {
-        this.config = await this.resolveConfig(this.activeRoot);
-        if (!this.activeRoot || !this.config.enabled) {
+    importAgentReviewDrafts(): Promise<void> {
+        const rootUri = this.activeRoot;
+        const generation = this.activationGeneration;
+        const importTask = this.importQueue
+            .catch(() => undefined)
+            .then(() => this.performDraftImport(rootUri, generation));
+        this.importQueue = importTask;
+        return importTask;
+    }
+
+    private async performDraftImport(
+        rootUri: vscode.Uri | undefined,
+        generation: number,
+    ) {
+        if (
+            !rootUri
+            || !this.isActivationCurrent(generation)
+            || this.activeRoot?.toString()!==rootUri.toString()
+        ) {
             return;
         }
-        const submittedDrafts = await this.workspaceInstructionManager.submittedDrafts(this.activeRoot);
+        const config = await this.resolveConfig(rootUri);
+        if (
+            !config.enabled
+            || !this.isActivationCurrent(generation)
+            || this.activeRoot?.toString()!==rootUri.toString()
+        ) {
+            return;
+        }
+        this.config = config;
+        const submittedDrafts = await this.workspaceInstructionManager.submittedDrafts(rootUri);
+        if (
+            !this.isActivationCurrent(generation)
+            || this.activeRoot?.toString()!==rootUri.toString()
+        ) {
+            return;
+        }
         const imported = await this.proposalStore.importSubmittedDrafts(
-            this.activeRoot,
+            rootUri,
             submittedDrafts,
             draft => this.workspaceInstructionManager.markDraftImported(draft),
         );
+        if (
+            !this.isActivationCurrent(generation)
+            || this.activeRoot?.toString()!==rootUri.toString()
+        ) {
+            return;
+        }
         if (imported.length>0) {
             vscode.window.showInformationMessage(`Imported ${imported.length} agent review proposal${imported.length===1 ? '' : 's'}.`);
         }
@@ -252,12 +360,13 @@ export class AgentReviewManager {
     }
 
     private onReplicaSettingsChanged(uri: vscode.Uri) {
-        if (this.isActiveReplicaSettingsUri(uri)) {
+        if (!this.disposed && this.isActiveReplicaSettingsUri(uri)) {
             void this.activate(getActiveReplicaRoot());
         }
     }
 
     private startImportTimer() {
+        if (this.disposed) { return; }
         this.stopImportTimer();
         this.importTimer = setInterval(() => {
             void this.importAgentReviewDrafts();
@@ -317,5 +426,18 @@ export class AgentReviewManager {
             vscode.commands.registerCommand(`${ROOT_NAME}.agentReview.disable`, () =>
                 this.setEnabledForActiveReplica(false)),
         ];
+    }
+
+    dispose() {
+        if (this.disposed) { return; }
+        this.disposed = true;
+        this.activationGeneration += 1;
+        this.stopImportTimer();
+        this.activeRoot = undefined;
+        this.internalRestoreUntil.clear();
+        if (singleton===this) {
+            singleton = undefined;
+        }
+        void vscode.commands.executeCommand('setContext', `${ROOT_NAME}.agentReviewActive`, false);
     }
 }

@@ -26,7 +26,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
     // Register: [core] RemoteFileSystemProvider
     const remoteFileSystemProvider = new RemoteFileSystemProvider(context);
-    context.subscriptions.push( ...remoteFileSystemProvider.triggers );
+    context.subscriptions.push(remoteFileSystemProvider, ...remoteFileSystemProvider.triggers);
     configureLocalReplicaWorkspace(context);
 
     // Register: [core] ProjectManagerProvider on Activitybar
@@ -118,6 +118,7 @@ export async function activate(context: vscode.ExtensionContext) {
     let queuedActiveReplicaSyncKey: string | undefined;
     let activeReplicaSyncTimer: NodeJS.Timeout | undefined;
     let initializingLocalReplicaWorkspace = true;
+    let extensionDisposed = false;
 
     const getActiveReplicaSyncTarget = (): ActiveReplicaSyncTarget | undefined => {
         const uri = getActiveReplicaOriginUri();
@@ -134,10 +135,11 @@ export async function activate(context: vscode.ExtensionContext) {
 
     const runActiveReplicaSync = async (initialTarget: ActiveReplicaSyncTarget) => {
         let target: ActiveReplicaSyncTarget | undefined = initialTarget;
-        while (target) {
+        while (target && !extensionDisposed) {
             activeReplicaSyncKey = target.key;
             queuedActiveReplicaSyncKey = undefined;
             await remoteFileSystemProvider.activateProject(target.uri);
+            if (extensionDisposed) { return; }
 
             const latestTarget = getActiveReplicaSyncTarget();
             if (latestTarget?.key===target.key) {
@@ -153,6 +155,9 @@ export async function activate(context: vscode.ExtensionContext) {
     };
 
     const syncActiveReplicaProject = () => {
+        if (extensionDisposed) {
+            return Promise.resolve();
+        }
         const target = getActiveReplicaSyncTarget();
         if (!target) {
             return Promise.resolve();
@@ -166,7 +171,9 @@ export async function activate(context: vscode.ExtensionContext) {
 
         activeReplicaSyncPromise = runActiveReplicaSync(target)
         .catch(error => {
-            console.error('Active Local Replica sync failed:', error);
+            if (!extensionDisposed) {
+                console.error('Active Local Replica sync failed:', error);
+            }
         })
         .finally(() => {
             activeReplicaSyncPromise = undefined;
@@ -177,6 +184,7 @@ export async function activate(context: vscode.ExtensionContext) {
     };
 
     const scheduleActiveReplicaProjectSync = (delayMs: number) => {
+        if (extensionDisposed) { return; }
         if (activeReplicaSyncTimer) {
             clearTimeout(activeReplicaSyncTimer);
         }
@@ -196,6 +204,7 @@ export async function activate(context: vscode.ExtensionContext) {
             }
         }),
         new vscode.Disposable(() => {
+            extensionDisposed = true;
             if (activeReplicaSyncTimer) {
                 clearTimeout(activeReplicaSyncTimer);
                 activeReplicaSyncTimer = undefined;
@@ -204,12 +213,16 @@ export async function activate(context: vscode.ExtensionContext) {
     );
 
     void initializeLocalReplicaWorkspace().then(async () => {
+        if (extensionDisposed) { return; }
         initializingLocalReplicaWorkspace = false;
         await agentReviewManager.activate(getActiveReplicaRoot());
+        if (extensionDisposed) { return; }
         scheduleActiveReplicaProjectSync(1500);
     }).catch(error => {
         initializingLocalReplicaWorkspace = false;
-        console.error('Local Replica workspace initialization failed:', error);
+        if (!extensionDisposed) {
+            console.error('Local Replica workspace initialization failed:', error);
+        }
     });
 }
 
@@ -218,4 +231,5 @@ export function deactivate() {
     vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activateCompile`, false);
     vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activeReplicaEditor`, false);
     vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activeReplicaCompileEditor`, false);
+    vscode.commands.executeCommand('setContext', `${ROOT_NAME}.agentReviewActive`, false);
 }

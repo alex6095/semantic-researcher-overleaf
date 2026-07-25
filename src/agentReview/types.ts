@@ -14,6 +14,8 @@ export const PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS = [
     `**/${REPLICA_SETTINGS_DIR}/**`,
     '**/.overleaf',
     '**/.overleaf/**',
+    '**/.sr-overleaf-*',
+    '**/.sr-overleaf-*/**',
 ];
 
 export const AGENT_REVIEW_SUPPORTED_EXTENSIONS = [

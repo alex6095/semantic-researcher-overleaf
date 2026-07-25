@@ -19,6 +19,11 @@ export interface LocalReplicaSettings {
     projectName: string,
 }
 
+export type ReplicaSettingsSnapshotResult =
+    | {status: 'ok', settings: LocalReplicaSettings}
+    | {status: 'missing'}
+    | {status: 'unavailable', error: unknown};
+
 const ACTIVE_REPLICA_ROOT_KEY = `${ROOT_NAME}.activeReplicaRoot`;
 const LEGACY_ACTIVE_REPLICA_ROOT_KEY = `${LEGACY_EXTENSION_NAMESPACE}.activeReplicaRoot`;
 const SUPPRESSED_AUTO_RESTORE_ROOT_KEY = `${ROOT_NAME}.suppressedActiveReplicaRoot`;
@@ -87,6 +92,25 @@ async function readSettingsFileSnapshot(settingsUri: vscode.Uri): Promise<LocalR
     }
 }
 
+function isFileNotFoundError(error: unknown): boolean {
+    const code = typeof error==='object' && error!==null && 'code' in error
+        ? String((error as {code?: unknown}).code)
+        : '';
+    return code==='FileNotFound' || code==='ENOENT';
+}
+
+async function inspectSettingsFileSnapshot(settingsUri: vscode.Uri): Promise<ReplicaSettingsSnapshotResult> {
+    try {
+        const content = await vscode.workspace.fs.readFile(settingsUri);
+        const settings = JSON.parse(new TextDecoder().decode(content)) as LocalReplicaSettings;
+        return {status: 'ok', settings: normalizeSettings(settings)};
+    } catch (error) {
+        return isFileNotFoundError(error)
+            ? {status: 'missing'}
+            : {status: 'unavailable', error};
+    }
+}
+
 async function backupLegacySettings(rootUri: vscode.Uri) {
     const legacySettingsUri = vscode.Uri.joinPath(rootUri, LEGACY_REPLICA_SETTINGS_FILE);
     const backupUri = vscode.Uri.joinPath(rootUri, LEGACY_REPLICA_SETTINGS_BACKUP_FILE);
@@ -138,6 +162,25 @@ async function readSettingsSnapshotFromRoot(rootUri: vscode.Uri): Promise<LocalR
 
     const legacySettingsUri = vscode.Uri.joinPath(rootUri, LEGACY_REPLICA_SETTINGS_FILE);
     return readSettingsFileSnapshot(legacySettingsUri);
+}
+
+async function inspectSettingsSnapshotFromRoot(rootUri: vscode.Uri): Promise<ReplicaSettingsSnapshotResult> {
+    const current = await inspectSettingsFileSnapshot(vscode.Uri.joinPath(rootUri, REPLICA_SETTINGS_FILE));
+    if (current.status==='ok') {
+        return current;
+    }
+
+    const legacy = await inspectSettingsFileSnapshot(vscode.Uri.joinPath(rootUri, LEGACY_REPLICA_SETTINGS_FILE));
+    if (legacy.status==='ok') {
+        return legacy;
+    }
+    if (current.status==='unavailable') {
+        return current;
+    }
+    if (legacy.status==='unavailable') {
+        return legacy;
+    }
+    return {status: 'missing'};
 }
 
 export function normalizeLocalReplicaRelPath(relPath: string): string | undefined {
@@ -350,6 +393,16 @@ export async function readReplicaSettingsSnapshot(rootUri?: vscode.Uri) {
         return undefined;
     }
     return readSettingsSnapshotFromRoot(activeReplicaRoot);
+}
+
+export async function inspectReplicaSettingsSnapshot(
+    rootUri?: vscode.Uri,
+): Promise<ReplicaSettingsSnapshotResult> {
+    const resolvedRoot = rootUri ?? activeReplicaRoot;
+    if (!resolvedRoot) {
+        return {status: 'missing'};
+    }
+    return inspectSettingsSnapshotFromRoot(resolvedRoot);
 }
 
 export async function pathToLocalUri(path: string, rootUri?: vscode.Uri): Promise<vscode.Uri | undefined> {
