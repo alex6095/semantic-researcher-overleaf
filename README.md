@@ -44,7 +44,7 @@ The user guide is available in [docs/wiki.md](./docs/wiki.md).
 
   In the project list, hover over a project to use the default inline actions: open in the current window, open in a new window, or select an exact local folder for that project. The folder selection action is placed at the right edge for quick local-replica setup.
 
-    <img src="https://raw.githubusercontent.com/alex6095/semantic-researcher-overleaf/master/docs/assets/demo08-local-replica-overleaf.gif" height=400px/>
+    <img src="https://raw.githubusercontent.com/alex6095/semantic-researcher-overleaf/master/docs/assets/demo10-select-project-folder-locally.gif" height=400px/>
 
   Files written directly on disk, including unopened source files and images written by coding agents, synchronize to Overleaf. Overleaf collaborator changes synchronize back to the selected folder. The replica records a durable baseline and reports a conflict when both sides changed and a safe merge cannot be proven.
 
@@ -56,6 +56,8 @@ The user guide is available in [docs/wiki.md](./docs/wiki.md).
 ### How to Login in Browser
 
 Choose **Login in Browser** from the login method list. The extension opens a Chrome, Edge, or Chromium window and navigates to the Overleaf project page, which shows the login page when needed. Sign in there as usual, including Google, SSO, or two-factor authentication. Once Overleaf reaches the project page, the extension reads the browser session cookies and completes the same cookie login flow automatically.
+
+<img src="https://raw.githubusercontent.com/alex6095/semantic-researcher-overleaf/master/docs/assets/demo09-login-in-browser.gif" height=400px/>
 
 In a local VS Code window, no extra extension is needed. In a VS Code Remote window, install **Semantic Researcher Overleaf Remote Pack** locally so the remote extension can ask your desktop VS Code to open the local browser. For VSIX installs, install the main extension in the remote window and the Remote Pack VSIX in the local desktop VS Code. If the browser is not found automatically, set `semantic-researcher-overleaf.auth.browserPath` for the main extension or `semantic-researcher-overleaf-remote-pack.browserPath` for the Remote Pack.
 

@@ -38,7 +38,7 @@ Notice that if you have logged in to the server, the login information will be r
 
 ### Login to Server
 
-![screenshot-login-to-server](assets/screenshot-login-to-server.png)
+![Login in Browser method selected](assets/screenshot-login-in-browser.png)
 
 There are currently three ways to login to the server: login in browser, login with email and password, and login with cookies. **Login in Browser** is the recommended default because it lets you use the same Overleaf sign-in flow you already trust in your desktop browser.
 
@@ -51,6 +51,8 @@ If you can login via email and password on the web browser, you can also login v
 
 #### Login in Browser
 Choose **Login in Browser** from the login method list. The extension opens a Chrome, Edge, or Chromium window and navigates to the Overleaf project page, which shows the login page when needed. Sign in there as usual, including Google, SSO, or two-factor authentication. Once Overleaf reaches the project page, the extension reads the browser session cookies and completes the same cookie login flow automatically.
+
+![Login in Browser walkthrough](assets/demo09-login-in-browser.gif)
 
 In a local VS Code window, no extra extension is needed. In a VS Code Remote window, install **Semantic Researcher Overleaf Remote Pack** locally so the remote extension can ask your desktop VS Code to open the local browser. For VSIX installs, install the main extension in the remote window and the Remote Pack VSIX in the local desktop VS Code. If the browser is not found automatically, set `semantic-researcher-overleaf.auth.browserPath` for the main extension or `semantic-researcher-overleaf-remote-pack.browserPath` for the Remote Pack.
 
@@ -168,12 +170,14 @@ Please follow the steps below to setup a local replica and open the project loca
 
 If you already have a specific local folder that should become the replica root itself, hover over the project and click the rightmost inline `Select Project Folder Locally ...` action, or right click on the project and select `Select Project Folder Locally ...`.
 
-![Local Replica files synchronized to Overleaf](assets/demo08-local-replica-overleaf.gif)
+![Select Project Folder Locally walkthrough](assets/demo10-select-project-folder-locally.gif)
 
 This command differs from `Open Project Locally ...` in two important ways:
 
 1. the selected folder is used directly as the replica root, so `.semantic-researcher-overleaf/settings.json` and the synced project files will be created inside that exact folder;
 2. the selected folder becomes the active local replica root for the current VS Code window, so local history, chat, collaboration helpers, compile / preview actions, and intellisense-related features resolve against that exact folder without replacing the current window.
+
+![Selected folder active as a Local Replica](assets/screenshot-select-project-folder-locally.png)
 
 The extension activates after VS Code startup, when you open the Overleaf Activity Bar, run an Overleaf command, open an Overleaf virtual workspace, or open a workspace that contains `.semantic-researcher-overleaf/settings.json` or legacy `.overleaf/settings.json`. Startup activation restores a previously selected external replica from the current window's workspace state when its marker file still exists. If no selected replica or workspace marker is found, the extension does not start an Overleaf project connection or replica sync.
 
