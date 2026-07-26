@@ -1,10 +1,13 @@
 import * as vscode from 'vscode';
 import * as os from 'os';
 import * as nodePath from 'path';
-import { VirtualFileSystem, vfsProjectKey } from '../core/remoteFileSystemProvider';
+import { VirtualFileSystem, parseUri, vfsProjectKey } from '../core/remoteFileSystemProvider';
 
 import { BaseSCM, CommitItem, SettingItem } from ".";
-import { LocalReplicaSCMProvider } from './localReplicaSCM';
+import {
+    LocalReplicaOwnershipUnavailableError,
+    LocalReplicaSCMProvider,
+} from './localReplicaSCM';
 import { LocalGitBridgeSCMProvider } from './localGitBridgeSCM'; 
 import { HistoryViewProvider } from './historyViewProvider';
 import { GlobalStateManager } from '../utils/globalStateManager';
@@ -13,10 +16,15 @@ import { ROOT_NAME } from '../consts';
 import { formatUnknownError } from '../utils/errorMessage';
 import { stringifyOverleafUri } from '../utils/overleafUri';
 import {
+    clearReplicaRemovalTombstone,
     getActiveReplicaRoot,
+    hasReplicaRemovalTombstone,
     inspectReplicaSettingsSnapshot,
     readReplicaSettingsSnapshot,
+    restoreReplicaAutoRestoreRoot,
     setActiveReplicaRoot,
+    suppressReplicaAutoRestoreRoot,
+    writeReplicaRemovalTombstone,
 } from '../utils/localReplicaWorkspace';
 
 const supportedSCMs = [
@@ -67,6 +75,7 @@ interface CreateSCMOptions {
     replaceExistingLabel?: string;
     preserveExistingLocalFiles?: boolean;
     resetLocalFilesToRemote?: boolean;
+    beforeActivation?: () => Promise<void>;
 }
 
 interface PromptBaseUriOptions {
@@ -76,9 +85,65 @@ interface PromptBaseUriOptions {
     createFolderName?: string;
 }
 
+interface SCMCollectionOptions {
+    restorePersistedSCMs?: boolean;
+}
+
 function parsePersistedBaseUri(baseUri: string): vscode.Uri {
     const uri = vscode.Uri.parse(baseUri);
     return uri.scheme==='' ? vscode.Uri.file(baseUri) : uri;
+}
+
+export async function removeDetachedLocalReplicaSCM(
+    context: vscode.ExtensionContext,
+    projectUri: vscode.Uri,
+    scmKey: string,
+    baseUri: vscode.Uri,
+): Promise<void> {
+    const {serverName, userId, projectId, projectName} = parseUri(projectUri);
+    if (!serverName || !userId || !projectId) {
+        throw new Error('Cannot identify the Overleaf project for Local Replica removal.');
+    }
+    const persistenceVFS = {
+        origin: projectUri,
+        serverName,
+        projectName,
+        projectId,
+        getProjectSCMPersist: (key: string) =>
+            GlobalStateManager.getServerProjectSCMPersists(
+                context,
+                serverName,
+                userId,
+                projectId,
+            )[key],
+        setProjectSCMPersist: (key: string, persist: any) =>
+            GlobalStateManager.updateServerProjectSCMPersist(
+                context,
+                serverName,
+                userId,
+                projectId,
+                key,
+                persist,
+            ),
+    } as unknown as VirtualFileSystem;
+    const detached = new LocalReplicaSCMProvider(persistenceVFS, baseUri);
+    await detached.prepareRemovalAndHoldOwnership();
+    try {
+        await writeReplicaRemovalTombstone(baseUri, projectUri);
+        await suppressReplicaAutoRestoreRoot(baseUri);
+        try {
+            await persistenceVFS.setProjectSCMPersist(scmKey, undefined);
+        } catch (error) {
+            await clearReplicaRemovalTombstone(baseUri);
+            await restoreReplicaAutoRestoreRoot(baseUri);
+            throw error;
+        }
+        await detached.confirmRemovalPersistenceDeleted();
+    } catch (error) {
+        throw error;
+    } finally {
+        await detached.finishRemoval();
+    }
 }
 
 export class SCMCollectionProvider extends vscode.Disposable {
@@ -86,6 +151,10 @@ export class SCMCollectionProvider extends vscode.Disposable {
     private readonly scms: SCMRecord[] = [];
     private readonly pendingSCMs = new Map<string, Promise<BaseSCM | undefined>>();
     private readonly pendingSCMInstances = new Set<BaseSCM>();
+    private readonly ownershipRetryTimers = new Map<
+        LocalReplicaSCMProvider,
+        ReturnType<typeof setTimeout>
+    >();
     private readonly statusBarItem: vscode.StatusBarItem;
     private readonly statusListener: vscode.Disposable;
     private initSCMsPromise: Promise<void>;
@@ -95,6 +164,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
     constructor(
         private readonly vfs: VirtualFileSystem,
         private readonly context: vscode.ExtensionContext,
+        options: SCMCollectionOptions = {},
     ) {
         // define the dispose behavior
         super(() => {
@@ -112,6 +182,13 @@ export class SCMCollectionProvider extends vscode.Disposable {
             });
             this.pendingSCMInstances.clear();
             this.pendingSCMs.clear();
+            for (const timer of this.ownershipRetryTimers.values()) {
+                clearTimeout(timer);
+            }
+            this.ownershipRetryTimers.clear();
+            this.statusListener?.dispose();
+            this.statusBarItem?.dispose();
+            this.historyDataProvider?.dispose();
         });
 
         this.core = new CoreSCMProvider( vfs );
@@ -119,7 +196,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
         this.statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
         this.statusBarItem.command = `${ROOT_NAME}.projectSCM.configSCM`;
         this.statusListener = EventBus.on('scmStatusChangeEvent', () => {this.updateStatus();});
-        this.initSCMsPromise = this.initSCMs();
+        this.initSCMsPromise = options.restorePersistedSCMs===false
+            ? Promise.resolve()
+            : this.initSCMs();
     }
 
     private updateStatus() {
@@ -168,6 +247,98 @@ export class SCMCollectionProvider extends vscode.Disposable {
         }
 
         this.statusBarItem.show();
+    }
+
+    private cancelOwnershipRetry(scm: LocalReplicaSCMProvider) {
+        const timers = this.ownershipRetryTimers;
+        if (!timers) { return; }
+        const timer = timers.get(scm);
+        if (timer) {
+            clearTimeout(timer);
+            timers.delete(scm);
+        }
+    }
+
+    private scheduleOwnershipRetry(item: SCMRecord) {
+        if (
+            this.disposed
+            || !item.enabled
+            || !this.scms.includes(item)
+            || !(item.scm instanceof LocalReplicaSCMProvider)
+            || this.ownershipRetryTimers.has(item.scm)
+        ) {
+            return;
+        }
+        const scm = item.scm;
+        const timer = setTimeout(() => {
+            if (this.ownershipRetryTimers.get(scm)!==timer) { return; }
+            this.ownershipRetryTimers.delete(scm);
+            void (async () => {
+                if (
+                    this.disposed
+                    || !item.enabled
+                    || !this.scms.includes(item)
+                    || item.triggers.length!==0
+                ) {
+                    return;
+                }
+                let removed: boolean;
+                try {
+                    removed = await hasReplicaRemovalTombstone(
+                        scm.baseUri,
+                        this.vfs.origin,
+                    );
+                } catch (error) {
+                    scm.markWaitingForOwnership(
+                        `removal state unavailable: ${formatUnknownError(error)}`,
+                    );
+                    this.scheduleOwnershipRetry(item);
+                    return;
+                }
+                const persist = this.vfs.getProjectSCMPersist(scm.scmKey);
+                if (
+                    removed
+                    || !persist
+                    || persist.label!==LocalReplicaSCMProvider.label
+                    || persist.baseUri!==scm.baseUri.toString()
+                ) {
+                    await scm.deactivate();
+                    const index = this.scms.indexOf(item);
+                    if (index!==-1) {
+                        this.scms.splice(index, 1);
+                    }
+                    this.updateStatus();
+                    return;
+                }
+                try {
+                    const triggers = await scm.triggers;
+                    if (
+                        this.disposed
+                        || !item.enabled
+                        || !this.scms.includes(item)
+                    ) {
+                        triggers.forEach(trigger => trigger.dispose());
+                        await scm.deactivate();
+                        return;
+                    }
+                    item.triggers = triggers;
+                    this.updateStatus();
+                } catch (error) {
+                    if (error instanceof LocalReplicaOwnershipUnavailableError) {
+                        scm.markWaitingForOwnership(error.message);
+                        this.scheduleOwnershipRetry(item);
+                        return;
+                    }
+                    scm.markWaitingForOwnership(formatUnknownError(error));
+                    console.error(
+                        `Local Replica ownership retry failed for ${scm.baseUri.toString()}:`,
+                        error,
+                    );
+                }
+            })();
+        }, 1_000);
+        timer.unref?.();
+        this.ownershipRetryTimers.set(scm, timer);
     }
 
     // Flush any pending Local Replica push for a local URI so compile-on-save
@@ -223,7 +394,12 @@ export class SCMCollectionProvider extends vscode.Disposable {
     }
 
     private async initSCMs(): Promise<void> {
-        const scmPersists = GlobalStateManager.getServerProjectSCMPersists(this.context, this.vfs.serverName, this.vfs.projectId);
+        const scmPersists = GlobalStateManager.getServerProjectSCMPersists(
+            this.context,
+            this.vfs.serverName,
+            this.vfs._userId,
+            this.vfs.projectId,
+        );
         const regularPersists: Array<{
             scmProto: SupportedSCM;
             baseUri: vscode.Uri;
@@ -320,7 +496,11 @@ export class SCMCollectionProvider extends vscode.Disposable {
 
         for (const candidate of localReplicaCandidates) {
             if (candidate===selectedLocalReplica) { continue; }
-            this.vfs.setProjectSCMPersist(candidate.scmKey, undefined);
+            await this.removeDetachedPersistedSCM(
+                candidate.scmKey,
+                candidate.baseUri,
+                LocalReplicaSCMProvider.label,
+            );
             console.warn(
                 `Removed duplicate Local Replica mapping ${candidate.baseUri.toString()} ` +
                 `for ${expectedProjectUri}.`,
@@ -347,6 +527,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
         newSCM=false,
         enabled=true,
         options?: CreateSCMOptions,
+        preparedSCM?: BaseSCM,
     ) {
         if (this.disposed) { return undefined; }
         const scmRecordKey = `${scmProto.label}:${baseUri.toString()}`;
@@ -355,6 +536,20 @@ export class SCMCollectionProvider extends vscode.Disposable {
             && (item.scm.constructor as any).label===scmProto.label
         );
         if (existing) {
+            if (preparedSCM && preparedSCM!==existing.scm) {
+                throw new Error(
+                    `Prepared SCM does not match the existing mapping for ${baseUri.toString()}.`,
+                );
+            }
+            if (newSCM) {
+                await this.vfs.setProjectSCMPersist(existing.scm.scmKey, {
+                    enabled,
+                    label: scmProto.label,
+                    baseUri: existing.scm.baseUri.toString(),
+                    settings: {} as JSON,
+                });
+            }
+            await options?.beforeActivation?.();
             if (existing.scm instanceof LocalReplicaSCMProvider) {
                 existing.scm.setInitializationOptions({
                     preserveExistingLocalFiles: options?.preserveExistingLocalFiles,
@@ -364,11 +559,11 @@ export class SCMCollectionProvider extends vscode.Disposable {
             if (enabled && (!existing.enabled || existing.triggers.length===0)) {
                 const persist = this.vfs.getProjectSCMPersist(existing.scm.scmKey);
                 if (!persist || persist.label!==scmProto.label) {
-                    this.removeSCM(existing);
+                    await this.removeSCM(existing);
                     return undefined;
                 }
                 persist.enabled = true;
-                this.vfs.setProjectSCMPersist(existing.scm.scmKey, persist);
+                await this.vfs.setProjectSCMPersist(existing.scm.scmKey, persist);
                 existing.enabled = true;
                 const triggers = await existing.scm.triggers;
                 if (this.disposed) {
@@ -386,7 +581,14 @@ export class SCMCollectionProvider extends vscode.Disposable {
             return pendingSCM;
         }
 
-        const creation = this.createSCMRecord(scmProto, baseUri, newSCM, enabled, options);
+        const creation = this.createSCMRecord(
+            scmProto,
+            baseUri,
+            newSCM,
+            enabled,
+            options,
+            preparedSCM,
+        );
         this.pendingSCMs.set(scmRecordKey, creation);
         try {
             return await creation;
@@ -403,9 +605,16 @@ export class SCMCollectionProvider extends vscode.Disposable {
         newSCM=false,
         enabled=true,
         options?: CreateSCMOptions,
+        preparedSCM?: BaseSCM,
     ) {
         if (this.disposed) { return undefined; }
-        const scm = new scmProto(this.vfs, baseUri);
+        const scm = preparedSCM ?? new scmProto(this.vfs, baseUri);
+        if (
+            scm.baseUri.toString()!==baseUri.toString()
+            || (scm.constructor as any).label!==scmProto.label
+        ) {
+            throw new Error(`Prepared SCM does not match ${scmProto.label}:${baseUri.toString()}.`);
+        }
         this.pendingSCMInstances.add(scm);
         if (scm instanceof LocalReplicaSCMProvider) {
             scm.setInitializationOptions({
@@ -413,17 +622,16 @@ export class SCMCollectionProvider extends vscode.Disposable {
                 resetLocalFilesToRemote: options?.resetLocalFilesToRemote,
             });
         }
-        // insert into global state
-        if (newSCM) {
-            this.vfs.setProjectSCMPersist(scm.scmKey, {
-                enabled: enabled,
-                label: scmProto.label,
-                baseUri: scm.baseUri.toString(),
-                settings: {} as JSON,
-            });
-        }
-        // insert into collection
         try {
+            if (newSCM) {
+                await this.vfs.setProjectSCMPersist(scm.scmKey, {
+                    enabled: enabled,
+                    label: scmProto.label,
+                    baseUri: scm.baseUri.toString(),
+                    settings: {} as JSON,
+                });
+            }
+            await options?.beforeActivation?.();
             const triggers = enabled ? await scm.triggers : [];
             if (this.disposed) {
                 triggers.forEach(trigger => trigger.dispose());
@@ -442,6 +650,25 @@ export class SCMCollectionProvider extends vscode.Disposable {
             // and losing the selected Local Replica path is worse than surfacing the error.
             if (scm instanceof LocalReplicaSCMProvider) {
                 scm.deactivate();
+                if (
+                    error instanceof LocalReplicaOwnershipUnavailableError
+                    && enabled
+                    && !this.disposed
+                ) {
+                    const persist = this.vfs.getProjectSCMPersist(scm.scmKey);
+                    if (
+                        persist
+                        && persist.label===scmProto.label
+                        && persist.baseUri===scm.baseUri.toString()
+                    ) {
+                        const item: SCMRecord = {scm, enabled, triggers: []};
+                        this.scms.push(item);
+                        scm.markWaitingForOwnership(error.message);
+                        this.scheduleOwnershipRetry(item);
+                        this.updateStatus();
+                        return scm;
+                    }
+                }
             }
             const message = formatUnknownError(error);
             console.error(`"${scmProto.label}" creation failed for ${baseUri.toString()}:`, error);
@@ -452,35 +679,182 @@ export class SCMCollectionProvider extends vscode.Disposable {
         }
     }
 
-    private removeSCM(item: SCMRecord) {
-        const index = this.scms.indexOf(item);
-        if (index!==-1) {
-            // remove from collection
-            if (item.scm instanceof LocalReplicaSCMProvider) {
-                item.scm.deactivate();
+    private async removePersistedSCM(
+        scmKey: string,
+        baseUri: vscode.Uri,
+        label: string,
+    ): Promise<void> {
+        const localReplica = label===LocalReplicaSCMProvider.label;
+        if (localReplica) {
+            await writeReplicaRemovalTombstone(baseUri, this.vfs.origin);
+            await suppressReplicaAutoRestoreRoot(baseUri);
+        }
+        try {
+            await this.vfs.setProjectSCMPersist(scmKey, undefined);
+        } catch (error) {
+            if (localReplica) {
+                await clearReplicaRemovalTombstone(baseUri);
+                await restoreReplicaAutoRestoreRoot(baseUri);
             }
-            item.triggers.forEach(trigger => trigger.dispose());
-            this.scms.splice(index, 1);
-            // remove from global state
-            this.vfs.setProjectSCMPersist(item.scm.scmKey, undefined);
-            this.updateStatus();
+            throw error;
         }
     }
 
-    private suspendSCMsByLabel(label: string, keepBaseUri?: vscode.Uri): SuspendedSCMRecord[] {
+    private async removeDetachedPersistedSCM(
+        scmKey: string,
+        baseUri: vscode.Uri,
+        label: string,
+    ): Promise<void> {
+        if (label!==LocalReplicaSCMProvider.label) {
+            await this.removePersistedSCM(scmKey, baseUri, label);
+            return;
+        }
+        const detached = new LocalReplicaSCMProvider(this.vfs, baseUri);
+        await detached.prepareRemovalAndHoldOwnership();
+        try {
+            await this.removePersistedSCM(scmKey, baseUri, label);
+            await detached.confirmRemovalPersistenceDeleted();
+        } finally {
+            await detached.finishRemoval();
+        }
+    }
+
+    private async restoreSCMAfterFailedStop(item: SCMRecord): Promise<void> {
+        item.triggers.forEach(trigger => trigger.dispose());
+        item.triggers = [];
+        if (!item.enabled || !this.scms.includes(item) || this.disposed) {
+            return;
+        }
+        try {
+            item.triggers = await item.scm.triggers;
+        } catch (error) {
+            console.error(
+                `Could not restore "${(item.scm.constructor as any).label}" after a failed stop ` +
+                `for ${item.scm.baseUri.toString()}:`,
+                error,
+            );
+        }
+    }
+
+    private async removeSCM(item: SCMRecord): Promise<boolean> {
+        const index = this.scms.indexOf(item);
+        if (index===-1) { return false; }
+        if (item.scm instanceof LocalReplicaSCMProvider) {
+            this.cancelOwnershipRetry(item.scm);
+        }
+        try {
+            if (item.scm instanceof LocalReplicaSCMProvider) {
+                await item.scm.prepareRemovalAndHoldOwnership();
+            }
+            try {
+                await this.removePersistedSCM(
+                    item.scm.scmKey,
+                    item.scm.baseUri,
+                    (item.scm.constructor as any).label,
+                );
+                if (item.scm instanceof LocalReplicaSCMProvider) {
+                    await item.scm.confirmRemovalPersistenceDeleted();
+                }
+                item.triggers.forEach(trigger => trigger.dispose());
+                this.scms.splice(index, 1);
+                this.updateStatus();
+                return true;
+            } finally {
+                if (item.scm instanceof LocalReplicaSCMProvider) {
+                    await item.scm.finishRemoval();
+                }
+            }
+        } catch (error) {
+            if (item.scm instanceof LocalReplicaSCMProvider) {
+                await this.restoreSCMAfterFailedStop(item);
+                if (item.enabled && item.triggers.length===0) {
+                    this.scheduleOwnershipRetry(item);
+                }
+            }
+            throw error;
+        }
+    }
+
+    public async removeLocalReplicaSCM(
+        scmKey: string,
+        baseUri: vscode.Uri,
+    ): Promise<void> {
+        const pendingDrains: Promise<void>[] = [];
+        for (const pending of this.pendingSCMInstances) {
+            if (
+                pending instanceof LocalReplicaSCMProvider
+                && (
+                    pending.scmKey===scmKey
+                    || pending.baseUri.toString()===baseUri.toString()
+                )
+            ) {
+                pendingDrains.push(pending.deactivateAndDrain());
+            }
+        }
+        await Promise.all(pendingDrains);
+        const pendingCreation = this.pendingSCMs.get(
+            `${LocalReplicaSCMProvider.label}:${baseUri.toString()}`,
+        );
+        if (pendingCreation) {
+            await pendingCreation;
+        }
+        await this.initSCMsPromise;
+        const item = this.scms.find(candidate =>
+            candidate.scm instanceof LocalReplicaSCMProvider
+            && (
+                candidate.scm.scmKey===scmKey
+                || candidate.scm.baseUri.toString()===baseUri.toString()
+            )
+        );
+        if (item) {
+            await this.removeSCM(item);
+        } else {
+            const detached = new LocalReplicaSCMProvider(this.vfs, baseUri);
+            await detached.prepareRemovalAndHoldOwnership();
+            try {
+                await this.removePersistedSCM(
+                    scmKey,
+                    baseUri,
+                    LocalReplicaSCMProvider.label,
+                );
+                await detached.confirmRemovalPersistenceDeleted();
+            } finally {
+                await detached.finishRemoval();
+            }
+        }
+    }
+
+    private async suspendSCMsByLabel(
+        label: string,
+        keepBaseUri?: vscode.Uri,
+    ): Promise<SuspendedSCMRecord[]> {
         const suspended: SuspendedSCMRecord[] = [];
-        this.scms
+        const candidates = this.scms
             .filter(item => (item.scm.constructor as any).label===label)
             .filter(item => keepBaseUri===undefined || item.scm.baseUri.toString()!==keepBaseUri.toString())
-            .filter(item => item.triggers.length!==0)
-            .forEach(item => {
-                suspended.push({item, wasEnabled: item.enabled});
+            .filter(item =>
+                item.triggers.length!==0
+                || (
+                    item.scm instanceof LocalReplicaSCMProvider
+                    && this.ownershipRetryTimers.has(item.scm)
+                )
+            );
+        for (const item of candidates) {
+            suspended.push({item, wasEnabled: item.enabled});
+            try {
                 if (item.scm instanceof LocalReplicaSCMProvider) {
-                    item.scm.deactivate();
+                    this.cancelOwnershipRetry(item.scm);
+                    await item.scm.deactivateAndDrain();
                 }
                 item.triggers.forEach(trigger => trigger.dispose());
                 item.triggers = [];
-            });
+            } catch (error) {
+                item.triggers.forEach(trigger => trigger.dispose());
+                item.triggers = [];
+                await this.restoreSuspendedSCMs(suspended);
+                throw error;
+            }
+        }
         this.updateStatus();
         return suspended;
     }
@@ -493,23 +867,44 @@ export class SCMCollectionProvider extends vscode.Disposable {
             try {
                 item.triggers = await item.scm.triggers;
             } catch (error) {
+                if (
+                    item.scm instanceof LocalReplicaSCMProvider
+                    && error instanceof LocalReplicaOwnershipUnavailableError
+                ) {
+                    item.scm.markWaitingForOwnership(error.message);
+                    this.scheduleOwnershipRetry(item);
+                    continue;
+                }
                 console.error(`Could not restore "${(item.scm.constructor as any).label}" watcher for ${item.scm.baseUri.toString()}:`, error);
             }
         }
         this.updateStatus();
     }
 
-    private removeSCMsByLabel(label: string, keepBaseUri?: vscode.Uri) {
-        [...this.scms]
+    private async removeSCMsByLabel(label: string, keepBaseUri?: vscode.Uri) {
+        const activeItems = [...this.scms]
             .filter(item => (item.scm.constructor as any).label===label)
-            .filter(item => keepBaseUri===undefined || item.scm.baseUri.toString()!==keepBaseUri.toString())
-            .forEach(item => this.removeSCM(item));
+            .filter(item => keepBaseUri===undefined || item.scm.baseUri.toString()!==keepBaseUri.toString());
+        for (const item of activeItems) {
+            await this.removeSCM(item);
+        }
 
-        const scmPersists = GlobalStateManager.getServerProjectSCMPersists(this.context, this.vfs.serverName, this.vfs.projectId);
-        Object.entries(scmPersists)
+        const scmPersists = GlobalStateManager.getServerProjectSCMPersists(
+            this.context,
+            this.vfs.serverName,
+            this.vfs._userId,
+            this.vfs.projectId,
+        );
+        const inactivePersists = Object.entries(scmPersists)
             .filter(([_scmKey, scmPersist]) => scmPersist.label===label)
-            .filter(([_scmKey, scmPersist]) => keepBaseUri===undefined || scmPersist.baseUri!==keepBaseUri.toString())
-            .forEach(([scmKey]) => this.vfs.setProjectSCMPersist(scmKey, undefined));
+            .filter(([_scmKey, scmPersist]) => keepBaseUri===undefined || scmPersist.baseUri!==keepBaseUri.toString());
+        for (const [scmKey, scmPersist] of inactivePersists) {
+            await this.removeDetachedPersistedSCM(
+                scmKey,
+                parsePersistedBaseUri(scmPersist.baseUri),
+                label,
+            );
+        }
 
         this.updateStatus();
     }
@@ -609,7 +1004,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
         .then(async (baseUri) => {
             if (baseUri) {
                 if (options?.replaceExistingLabel) {
-                    this.removeSCMsByLabel(options.replaceExistingLabel);
+                    await this.removeSCMsByLabel(options.replaceExistingLabel);
                 }
                 const scm = await this.createSCM(scmProto, baseUri, true, true, options);
                 if (scm) {
@@ -636,33 +1031,90 @@ export class SCMCollectionProvider extends vscode.Disposable {
 
         let suspended: SuspendedSCMRecord[] = [];
         let baseUri: vscode.Uri | undefined;
+        let createdSCM: LocalReplicaSCMProvider | undefined;
+        let preparedSelectionSCM: LocalReplicaSCMProvider | undefined;
         try {
             baseUri = await LocalReplicaSCMProvider.validateExactBaseUri(selectedPath || '', {
                 projectUri: this.vfs.origin,
-                beforeEmpty: () => {
-                    suspended = this.suspendSCMsByLabel(LocalReplicaSCMProvider.label);
+                beforeEmpty: async () => {
+                    suspended = await this.suspendSCMsByLabel(
+                        LocalReplicaSCMProvider.label,
+                    );
                 },
             });
             const sameProjectReplica = await this.isSameProjectLocalReplica(baseUri);
             suspended = [
                 ...suspended,
-                ...this.suspendSCMsByLabel(LocalReplicaSCMProvider.label, baseUri),
+                ...await this.suspendSCMsByLabel(
+                    LocalReplicaSCMProvider.label,
+                    baseUri,
+                ),
             ];
-            const scm = await this.createSCM(LocalReplicaSCMProvider, baseUri, true, true, {
+            const existingSelection = this.scms.find(item =>
+                item.scm instanceof LocalReplicaSCMProvider
+                && item.scm.baseUri.toString()===baseUri!.toString()
+            )?.scm;
+            preparedSelectionSCM = existingSelection instanceof LocalReplicaSCMProvider
+                ? existingSelection
+                : new LocalReplicaSCMProvider(this.vfs, baseUri);
+            preparedSelectionSCM.setInitializationOptions({
                 preserveExistingLocalFiles: sameProjectReplica,
                 resetLocalFilesToRemote: !sameProjectReplica,
             });
+            await preparedSelectionSCM.prepareExplicitSelectionAndHoldOwnership();
+            const scm = await this.createSCM(LocalReplicaSCMProvider, baseUri, true, true, {
+                preserveExistingLocalFiles: sameProjectReplica,
+                resetLocalFilesToRemote: !sameProjectReplica,
+                beforeActivation: () => clearReplicaRemovalTombstone(baseUri!),
+            }, preparedSelectionSCM);
             if (!scm) {
-                if (!sameProjectReplica) {
-                    this.vfs.setProjectSCMPersist(baseUri.toString(), undefined);
-                }
+                await preparedSelectionSCM.deactivate();
+                await this.removeLocalReplicaSCM(baseUri.toString(), baseUri);
                 await this.restoreSuspendedSCMs(suspended);
                 return undefined;
             }
-            this.removeSCMsByLabel(LocalReplicaSCMProvider.label, baseUri);
+            if (!(scm instanceof LocalReplicaSCMProvider)) {
+                throw new Error('Exact Local Replica selection created an unexpected SCM type.');
+            }
+            createdSCM = scm;
+            await this.removeSCMsByLabel(LocalReplicaSCMProvider.label, baseUri);
             vscode.window.showInformationMessage( vscode.l10n.t('"{scm}" created: {uri}.', {scm:LocalReplicaSCMProvider.label, uri: decodeURI(scm.baseUri.toString()) }) );
             return scm;
         } catch (error) {
+            if (createdSCM) {
+                const createdItem = this.scms.find(item => item.scm===createdSCM);
+                if (createdItem) {
+                    try {
+                        await this.removeSCM(createdItem);
+                    } catch (cleanupError) {
+                        try {
+                            await createdSCM.deactivateAndDrain();
+                        } catch (stopError) {
+                            console.error(
+                                `Could not stop failed replacement Local Replica ` +
+                                `${createdSCM.baseUri.toString()}:`,
+                                stopError,
+                            );
+                        }
+                        createdItem.triggers.forEach(trigger => trigger.dispose());
+                        createdItem.triggers = [];
+                        console.error(
+                            `Could not remove failed replacement Local Replica ` +
+                            `${createdSCM.baseUri.toString()}:`,
+                            cleanupError,
+                        );
+                    }
+                }
+            }
+            if (preparedSelectionSCM && preparedSelectionSCM!==createdSCM) {
+                await preparedSelectionSCM.deactivate().catch(stopError => {
+                    console.error(
+                        `Could not release prepared Local Replica selection ` +
+                        `${preparedSelectionSCM!.baseUri.toString()}:`,
+                        stopError,
+                    );
+                });
+            }
             await this.restoreSuspendedSCMs(suspended);
             console.error(`Exact Local Replica creation failed${baseUri ? ` for ${baseUri.toString()}` : ''}:`, error);
             return undefined;
@@ -712,9 +1164,22 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     const scmIndex = this.scms.indexOf(scmItem);
                     this.scms[scmIndex].enabled = persist.enabled;
                     if (persist.enabled) {
-                        scmItem.triggers = await scmItem.scm.triggers;
+                        try {
+                            scmItem.triggers = await scmItem.scm.triggers;
+                        } catch (error) {
+                            if (
+                                scmItem.scm instanceof LocalReplicaSCMProvider
+                                && error instanceof LocalReplicaOwnershipUnavailableError
+                            ) {
+                                scmItem.scm.markWaitingForOwnership(error.message);
+                                this.scheduleOwnershipRetry(scmItem);
+                            } else {
+                                throw error;
+                            }
+                        }
                     } else {
                         if (scmItem.scm instanceof LocalReplicaSCMProvider) {
+                            this.cancelOwnershipRetry(scmItem.scm);
                             scmItem.scm.deactivate();
                         }
                         scmItem.triggers.forEach(trigger => trigger.dispose());
@@ -731,7 +1196,15 @@ export class SCMCollectionProvider extends vscode.Disposable {
                             'No',
                         )==='Yes'
                     ) {
-                        this.removeSCM(scmItem);
+                        try {
+                            await this.removeSCM(scmItem);
+                        } catch (error) {
+                            vscode.window.showErrorMessage(vscode.l10n.t(
+                                'Local Replica removal was stopped: {message}',
+                                {message: formatUnknownError(error)},
+                            ));
+                            return;
+                        }
                         if (
                             scmItem.scm instanceof LocalReplicaSCMProvider
                             && getActiveReplicaRoot()?.toString()===scmItem.scm.baseUri.toString()
@@ -755,6 +1228,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
     }
 
     private async ensureLocalReplicaSCM(baseUri: vscode.Uri) {
+        if (await hasReplicaRemovalTombstone(baseUri, this.vfs.origin)) {
+            return undefined;
+        }
         const persist = this.vfs.getProjectSCMPersist(baseUri.toString());
         const enabled = persist?.enabled ?? true;
         return this.createSCM(LocalReplicaSCMProvider, baseUri, persist===undefined, enabled, {

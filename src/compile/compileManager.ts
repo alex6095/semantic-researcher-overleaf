@@ -358,12 +358,15 @@ export class CompileManager {
                     (record) => record.doc.refresh()
                 );
             })
-            .catch(async () => {
+            .catch(async (error) => {
                 // Either the intentional Promise.reject() flow-break (terminal
                 // update() already fired) or an actual exception mid-chain.
                 // If inCompiling is still set the chain failed before any
                 // terminal update(); surface as failed so the next compile()
                 // isn't permanently locked out by the inCompiling guard.
+                if (error!==undefined) {
+                    console.error('Compile workflow failed.', formatUnknownError(error));
+                }
                 if (this.inCompiling) {
                     await this.update('failed', uri);
                 }

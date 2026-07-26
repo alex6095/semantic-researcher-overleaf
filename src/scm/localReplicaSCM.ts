@@ -1,6 +1,7 @@
 import * as crypto from 'crypto';
 import {constants as nodeFsConstants} from 'fs';
 import * as nodeFs from 'fs/promises';
+import * as nodeNet from 'net';
 import * as os from 'os';
 import * as nodePath from 'path';
 import * as vscode from 'vscode';
@@ -16,6 +17,7 @@ import {
 import { normalizeReplicaPath } from '../agentReview/types';
 import {
     getActiveReplicaRoot,
+    hasReplicaRemovalTombstone,
     isLocalReplicaMetadataUri,
     localUriToPath,
     normalizeLocalReplicaRelPath,
@@ -40,6 +42,10 @@ const IGNORE_SETTING_KEY = 'ignore-patterns';
 const ECHO_WINDOW_MS = 500;
 const REMOTE_DELETE_MTIME_SLOP_MS = 2_000;
 const SYNC_MANIFEST_FILE = `${REPLICA_SETTINGS_DIR}/sync-manifest.json`;
+const SYNC_OWNER_FILE = 'sync-owner.json';
+const SYNC_OWNER_REPAIR_FILE = 'sync-owner.repair.json';
+const LEGACY_SYNC_OWNER_DIRECTORY = 'sync-owner';
+const LEGACY_SYNC_OWNER_FILE = 'owner.json';
 
 // Single shared output channel for Local Replica sync diagnostics. Lazy-created.
 let sharedOutput: vscode.OutputChannel | undefined;
@@ -79,7 +85,29 @@ async function deleteWithTrashFallback(uri: vscode.Uri, options?: {recursive?: b
     }
 }
 
-type FileCache = {date:number, hash:string};
+type FileCache = {date:number, hash:string, type:'update'|'delete'};
+type LocalPathIdentitySnapshot = {
+    entries: Array<{path: string; identity: string}>;
+    finalStat: {
+        isFile: boolean;
+        isDirectory: boolean;
+        ctimeMs: number;
+        mtimeMs: number;
+        size: number;
+        dev: string;
+        ino: string;
+    };
+};
+type StagedDetachedLocalGuard = {
+    record: LocalReplicaOperationRecord;
+    guardPath: string;
+    detachedGuardPath: string;
+    detachedRecordPath: string;
+};
+type DetachedLocalGuardRecord = LocalReplicaOperationRecord & {
+    detachedAt: string;
+    mappingRemovalCommittedAt?: string;
+};
 
 const DELETE_DIGEST = '\0';
 
@@ -99,6 +127,8 @@ interface SyncManifestDirectoryEntry {
 interface SyncManifestConflictEntry {
     reason: string;
     localDigest: string;
+    remoteKind?: PathRevision['kind'];
+    remoteRevision?: string;
     updatedAt: string;
 }
 
@@ -141,9 +171,12 @@ interface LocalReplicaOperationRecord {
 interface RemoteDeleteOperationRecord {
     version: 1;
     id: string;
+    kind?: 'delete' | 'replace';
     relPath: string;
     stagingRelPath: string;
     expectedRevision: string;
+    replacementRevision?: string;
+    supersededByRevision?: string;
     createdAt: string;
 }
 
@@ -174,6 +207,34 @@ interface ApplySyncOptions {
     reason?: string;
     resolveConflict?: boolean;
     deferConflictResolution?: boolean;
+    acceptUnchangedLocalConflictState?: boolean;
+    skipDirectoryDescendants?: boolean;
+}
+
+interface SyncOwnerRecord {
+    version: 4;
+    token: string;
+    pid: number;
+    hostname: string;
+    hostId: string;
+    projectKey: string;
+    rootKey: string;
+    port: number;
+    createdAt: string;
+}
+
+interface SyncOwnerRepairRecord {
+    version: 2;
+    token: string;
+    pid: number;
+    hostname: string;
+    hostId: string;
+    createdAt: string;
+}
+
+interface ConflictResolutionProof {
+    conflictPath: string;
+    remoteState: PathRevision;
 }
 
 export interface LocalReplicaPrecompileFlushResult {
@@ -201,6 +262,7 @@ type ProtectedExactBaseUriReasonCode =
 class LocalReplicaFolderSelectionCancelledError extends Error {}
 class LocalReplicaFolderSelectionRejectedError extends Error {}
 class ConcurrentReplicaChangeError extends Error {}
+export class LocalReplicaOwnershipUnavailableError extends Error {}
 
 function definedInitializationOptions(options?: InitializeLocalReplicaOptions): InitializeLocalReplicaOptions {
     return Object.fromEntries(
@@ -238,6 +300,8 @@ function normalizeMtimeMs(mtime: number): number {
  */
 export class LocalReplicaSCMProvider extends BaseSCM {
     public static readonly label = vscode.l10n.t('Local Replica');
+    private static readonly processSyncOwners = new Map<string, LocalReplicaSCMProvider>();
+    private static syncOwnerHostIdPromise?: Promise<string>;
 
     public readonly iconPath: vscode.ThemeIcon = new vscode.ThemeIcon('folder-library');
 
@@ -304,13 +368,34 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private pendingLocalEvents: Map<string, PendingEvent> = new Map();
     private inFlightSessionIO = new Set<Promise<unknown>>();
     private localGuardCleanupPromises = new Map<string, Promise<void>>();
+    private deferredSyncWork = new Set<Promise<void>>();
+    private preQueueSyncWork = new Set<Promise<void>>();
+    private activationPromise?: Promise<vscode.Disposable[]>;
+    private removalPendingGeneration?: number;
+    private removalDrainPromise?: Promise<void>;
+    private removalOwnershipHeld = false;
+    private stagedDetachedLocalGuards: StagedDetachedLocalGuard[] = [];
+    private removalAcceptedSyncErrors = new Map<string, {
+        generation: number;
+        error: string;
+    }>();
+    private syncOwnerToken?: string;
+    private syncOwnerServer?: nodeNet.Server;
+    private syncOwnerHeartbeat?: ReturnType<typeof setInterval>;
+    private syncOwnerReleasePromise?: Promise<void>;
+    private localRootRealPath?: string;
     private syncGeneration = 0;
     private syncSessionActive = false;
     private static readonly eventCoalesceMs = 250;
     private static readonly eventMaxWaitMs = 2000;
+    private static readonly localClassificationRetryDelays = [0, 25, 100, 300];
     private static readonly watcherProbeTimeoutMs = 750;
     private static readonly watcherHealthIntervalMs = 1000;
     private static readonly fallbackScanIntervalMs = 750;
+    private static readonly syncOwnerHeartbeatMs = 10_000;
+    private static readonly syncOwnerPortBase = 10_000;
+    private static readonly syncOwnerPortRange = 10_000;
+    private static readonly syncOwnerPortAttempts = 64;
     private static readonly maxMergeBaselineBytes = 5 * 1024 * 1024;
     private initializationOptions: InitializeLocalReplicaOptions = {};
     private ignorePatterns: string[] = [
@@ -344,6 +429,947 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         super(vfs, baseUri);
     }
 
+    private static async ownershipMarkerSnapshot(
+        markerPath: string,
+    ): Promise<string | undefined> {
+        const snapshot: string[] = [];
+        const visit = async (filePath: string, relativePath: string): Promise<void> => {
+            const stat = await nodeFs.lstat(filePath);
+            if (stat.isFile()) {
+                const content = await nodeFs.readFile(filePath);
+                snapshot.push(
+                    `file\0${relativePath}\0${stat.size}\0` +
+                    crypto.createHash('sha256').update(content).digest('hex'),
+                );
+                return;
+            }
+            if (stat.isDirectory()) {
+                snapshot.push(`directory\0${relativePath}`);
+                const entries = await nodeFs.readdir(filePath);
+                for (const entry of entries.sort((left, right) => left.localeCompare(right))) {
+                    await visit(
+                        nodePath.join(filePath, entry),
+                        relativePath ? `${relativePath}/${entry}` : entry,
+                    );
+                }
+                return;
+            }
+            snapshot.push(`other\0${relativePath}\0${stat.mode}\0${stat.size}`);
+        };
+        try {
+            await visit(markerPath, '');
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code==='ENOENT') { return undefined; }
+            throw error;
+        }
+        return crypto.createHash('sha256').update(snapshot.join('\n')).digest('hex');
+    }
+
+    private static async readOwnerRecordFile(filePath: string): Promise<unknown> {
+        return nodeFs.readFile(filePath, 'utf8')
+            .then(content => {
+                try {
+                    return JSON.parse(content);
+                } catch {
+                    return undefined;
+                }
+            })
+            .catch(error => {
+                if ((error as NodeJS.ErrnoException).code==='ENOENT') { return undefined; }
+                throw error;
+            });
+    }
+
+    private static async acquireOwnershipRepairLock(
+        settingsDirectoryPath: string,
+    ): Promise<() => Promise<void>> {
+        await nodeFs.mkdir(settingsDirectoryPath, {recursive: true});
+        const hostId = await LocalReplicaSCMProvider.getSyncOwnerHostId();
+        await LocalReplicaSCMProvider.recoverStaleOwnershipRepairLock(
+            settingsDirectoryPath,
+            hostId,
+        );
+        const token = crypto.randomUUID();
+        const repairPath = nodePath.join(settingsDirectoryPath, SYNC_OWNER_REPAIR_FILE);
+        const claimPath = `${repairPath}.claim-${token}`;
+        const record = JSON.stringify({
+            version: 2,
+            token,
+            pid: process.pid,
+            hostname: os.hostname(),
+            hostId,
+            createdAt: new Date().toISOString(),
+        });
+        let handle: nodeFs.FileHandle | undefined;
+        try {
+            handle = await nodeFs.open(claimPath, 'wx', 0o600);
+            await handle.writeFile(record, 'utf8');
+            await handle.sync();
+        } finally {
+            await handle?.close();
+        }
+        try {
+            await nodeFs.link(claimPath, repairPath);
+        } catch (error) {
+            await nodeFs.unlink(claimPath).catch(() => undefined);
+            if ((error as NodeJS.ErrnoException).code==='EEXIST') {
+                throw new Error(
+                    'Another Local Replica ownership repair is already in progress.',
+                );
+            }
+            throw error;
+        }
+        await nodeFs.unlink(claimPath).catch(cleanupError => {
+            if ((cleanupError as NodeJS.ErrnoException).code==='ENOENT') { return; }
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [ownership repair claim cleanup failed] ` +
+                `${claimPath}: ${formatUnknownError(cleanupError)}`,
+            );
+        });
+
+        return async () => {
+            const current = await LocalReplicaSCMProvider.readOwnerRecordFile(repairPath);
+            if (
+                !current
+                || typeof current!=='object'
+                || (current as {token?: unknown}).token!==token
+            ) {
+                return;
+            }
+            const releasePath = `${repairPath}.release-${token}`;
+            try {
+                await nodeFs.rename(repairPath, releasePath);
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code!=='ENOENT') { throw error; }
+            }
+            await nodeFs.unlink(releasePath).catch(error => {
+                if ((error as NodeJS.ErrnoException).code!=='ENOENT') { throw error; }
+            });
+        };
+    }
+
+    private static isValidSyncOwnerRepairRecord(
+        value: unknown,
+    ): value is SyncOwnerRepairRecord {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const record = value as Partial<SyncOwnerRepairRecord>;
+        return record.version===2
+            && typeof record.token==='string'
+            && /^[a-f0-9-]{16,128}$/.test(record.token)
+            && Number.isSafeInteger(record.pid)
+            && record.pid!>0
+            && typeof record.hostname==='string'
+            && record.hostname.length>0
+            && record.hostname.length<=255
+            && typeof record.hostId==='string'
+            && /^[a-f0-9]{64}$/.test(record.hostId)
+            && typeof record.createdAt==='string'
+            && Number.isFinite(Date.parse(record.createdAt));
+    }
+
+    private static processIsAlive(pid: number): boolean {
+        try {
+            process.kill(pid, 0);
+            return true;
+        } catch (error) {
+            return (error as NodeJS.ErrnoException).code!=='ESRCH';
+        }
+    }
+
+    private static async recoverStaleOwnershipRepairLock(
+        settingsDirectoryPath: string,
+        expectedHostId?: string,
+    ): Promise<boolean> {
+        const hostId = expectedHostId
+            ?? await LocalReplicaSCMProvider.getSyncOwnerHostId();
+        const repairPath = nodePath.join(settingsDirectoryPath, SYNC_OWNER_REPAIR_FILE);
+        const record = await LocalReplicaSCMProvider.readOwnerRecordFile(repairPath);
+        if (record===undefined) { return false; }
+        if (!LocalReplicaSCMProvider.isValidSyncOwnerRepairRecord(record)) {
+            throw new Error(
+                'Local Replica ownership repair has an incomplete lock. ' +
+                'Preserving it because its owner cannot be identified safely.',
+            );
+        }
+        if (record.hostId!==hostId) {
+            throw new LocalReplicaOwnershipUnavailableError(
+                `Local Replica ownership repair belongs to process ${record.pid} ` +
+                `on ${record.hostname}. Cross-host stale takeover is disabled.`,
+            );
+        }
+        if (LocalReplicaSCMProvider.processIsAlive(record.pid)) {
+            throw new LocalReplicaOwnershipUnavailableError(
+                `Local Replica ownership repair is active in process ${record.pid}.`,
+            );
+        }
+
+        const stalePath = `${repairPath}.stale-${crypto.randomUUID()}`;
+        try {
+            await nodeFs.rename(repairPath, stalePath);
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code==='ENOENT') { return false; }
+            throw error;
+        }
+        const moved = await LocalReplicaSCMProvider.readOwnerRecordFile(stalePath);
+        if (
+            !LocalReplicaSCMProvider.isValidSyncOwnerRepairRecord(moved)
+            || moved.token!==record.token
+        ) {
+            await nodeFs.link(stalePath, repairPath).catch(() => undefined);
+            throw new Error(
+                `The Local Replica ownership repair lock changed during recovery. ` +
+                `It was preserved at ${stalePath}.`,
+            );
+        }
+        await nodeFs.unlink(stalePath);
+        return true;
+    }
+
+    public static async repairOwnershipMarker(baseUri: vscode.Uri): Promise<boolean> {
+        if (baseUri.scheme!=='file') {
+            throw new Error('Local Replica ownership repair requires a local file folder.');
+        }
+        const settingsDirectoryPath = nodePath.join(baseUri.fsPath, REPLICA_SETTINGS_DIR);
+        const ownerFilePath = nodePath.join(settingsDirectoryPath, SYNC_OWNER_FILE);
+        const legacyOwnerDirectoryPath = nodePath.join(
+            settingsDirectoryPath,
+            LEGACY_SYNC_OWNER_DIRECTORY,
+        );
+        const hostId = await LocalReplicaSCMProvider.getSyncOwnerHostId();
+        await LocalReplicaSCMProvider.recoverStaleOwnershipRepairLock(
+            settingsDirectoryPath,
+            hostId,
+        );
+        const orphanNames = await nodeFs.readdir(settingsDirectoryPath)
+            .catch(error => (error as NodeJS.ErrnoException).code==='ENOENT' ? [] : Promise.reject(error));
+        const candidateDescriptors = [
+            {
+                markerPath: ownerFilePath,
+                legacy: false,
+                quarantined: false,
+            },
+            {
+                markerPath: legacyOwnerDirectoryPath,
+                legacy: true,
+                quarantined: false,
+            },
+            ...orphanNames
+                .filter(name =>
+                    name.startsWith(`${SYNC_OWNER_FILE}.repair-`)
+                    || name.startsWith(`${LEGACY_SYNC_OWNER_DIRECTORY}.repair-`)
+                )
+                .map(name => ({
+                    markerPath: nodePath.join(settingsDirectoryPath, name),
+                    legacy: name.startsWith(`${LEGACY_SYNC_OWNER_DIRECTORY}.repair-`),
+                    quarantined: true,
+                })),
+        ];
+        const candidates = (
+            await Promise.all(candidateDescriptors.map(
+                async descriptor => ({
+                    ...descriptor,
+                    snapshot: await LocalReplicaSCMProvider.ownershipMarkerSnapshot(
+                        descriptor.markerPath,
+                    ),
+                }),
+            ))
+        ).filter(candidate => candidate.snapshot!==undefined);
+        if (candidates.length>1) {
+            throw new Error(
+                'Both current and legacy Local Replica ownership markers exist. ' +
+                'Repair was stopped without changing either marker.',
+            );
+        }
+        const candidate = candidates[0];
+        const markerPath = candidate?.markerPath;
+        const before = candidate?.snapshot;
+        if (!markerPath || !before) {
+            void vscode.window.showInformationMessage(
+                vscode.l10n.t('This folder has no Local Replica ownership marker to repair.'),
+            );
+            return false;
+        }
+
+        const recordPath = candidate.legacy
+            ? nodePath.join(markerPath, LEGACY_SYNC_OWNER_FILE)
+            : markerPath;
+        const owner = await LocalReplicaSCMProvider.readOwnerRecordFile(recordPath);
+        const repairableDeadLegacyOwner = (
+            LocalReplicaSCMProvider.isLegacySyncOwnerRecord(owner)
+            && (owner as SyncOwnerRecord).hostId===hostId
+            && !LocalReplicaSCMProvider.processIsAlive((owner as SyncOwnerRecord).pid)
+        );
+        if (
+            LocalReplicaSCMProvider.isValidSyncOwnerRecord(owner)
+            || (
+                LocalReplicaSCMProvider.isLegacySyncOwnerRecord(owner)
+                && !repairableDeadLegacyOwner
+            )
+        ) {
+            throw new Error(
+                'The ownership marker may belong to a live owner and cannot be repaired manually. ' +
+                'Close or disconnect its owning VS Code window.',
+            );
+        }
+
+        const repairAction = vscode.l10n.t('Repair Ownership Marker');
+        const choice = await vscode.window.showWarningMessage(
+            vscode.l10n.t(
+                'Repair this incomplete or legacy Local Replica ownership marker? ' +
+                'Continue only after every VS Code window and remote host using this folder is closed.',
+            ),
+            {modal: true},
+            repairAction,
+        );
+        if (choice!==repairAction) { return false; }
+
+        const releaseRepairLock = await LocalReplicaSCMProvider.acquireOwnershipRepairLock(
+            settingsDirectoryPath,
+        );
+        try {
+            const confirmed = await LocalReplicaSCMProvider.ownershipMarkerSnapshot(
+                markerPath,
+            );
+            const confirmedOwner = await LocalReplicaSCMProvider.readOwnerRecordFile(
+                recordPath,
+            );
+            if (
+                confirmed!==before
+                || LocalReplicaSCMProvider.isValidSyncOwnerRecord(confirmedOwner)
+                || (
+                    LocalReplicaSCMProvider.isLegacySyncOwnerRecord(confirmedOwner)
+                    && !(
+                        (confirmedOwner as SyncOwnerRecord).hostId===hostId
+                        && !LocalReplicaSCMProvider.processIsAlive(
+                            (confirmedOwner as SyncOwnerRecord).pid,
+                        )
+                    )
+                )
+            ) {
+                throw new Error(
+                    'The Local Replica ownership marker changed during confirmation. ' +
+                    'Repair was cancelled.',
+                );
+            }
+
+            const quarantinePath = candidate.quarantined
+                ? markerPath
+                : `${markerPath}.repair-${crypto.randomUUID()}`;
+            if (!candidate.quarantined) {
+                await nodeFs.rename(markerPath, quarantinePath);
+            }
+            const moved = await LocalReplicaSCMProvider.ownershipMarkerSnapshot(quarantinePath);
+            const movedRecordPath = candidate.legacy
+                ? nodePath.join(quarantinePath, LEGACY_SYNC_OWNER_FILE)
+                : quarantinePath;
+            const movedOwner = await LocalReplicaSCMProvider.readOwnerRecordFile(
+                movedRecordPath,
+            );
+            if (
+                moved!==before
+                || LocalReplicaSCMProvider.isValidSyncOwnerRecord(movedOwner)
+                || (
+                    LocalReplicaSCMProvider.isLegacySyncOwnerRecord(movedOwner)
+                    && !(
+                        (movedOwner as SyncOwnerRecord).hostId===hostId
+                        && !LocalReplicaSCMProvider.processIsAlive(
+                            (movedOwner as SyncOwnerRecord).pid,
+                        )
+                    )
+                )
+            ) {
+                throw new Error(
+                    'The Local Replica ownership marker changed during repair. ' +
+                    `It was preserved at ${quarantinePath}.`,
+                );
+            }
+            await nodeFs.rm(quarantinePath, {recursive: true, force: true});
+            void vscode.window.showInformationMessage(
+                vscode.l10n.t('The invalid Local Replica ownership marker was repaired.'),
+            );
+            return true;
+        } finally {
+            await releaseRepairLock();
+        }
+    }
+
+    private get syncOwnerFilePath(): string {
+        return nodePath.join(this.settingsDirectoryUri.fsPath, SYNC_OWNER_FILE);
+    }
+
+    private get syncOwnerRepairFilePath(): string {
+        return nodePath.join(this.settingsDirectoryUri.fsPath, SYNC_OWNER_REPAIR_FILE);
+    }
+
+    private get legacySyncOwnerDirectoryPath(): string {
+        return nodePath.join(
+            this.settingsDirectoryUri.fsPath,
+            LEGACY_SYNC_OWNER_DIRECTORY,
+        );
+    }
+
+    private static isSyncOwnerRecordVersion(
+        value: unknown,
+        version: 3 | 4,
+    ): value is SyncOwnerRecord {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const record = value as Partial<SyncOwnerRecord>;
+        return record.version===version
+            && typeof record.token==='string'
+            && /^[a-f0-9-]{16,128}$/.test(record.token)
+            && Number.isSafeInteger(record.pid)
+            && record.pid!>0
+            && typeof record.hostname==='string'
+            && record.hostname.length>0
+            && record.hostname.length<=255
+            && typeof record.hostId==='string'
+            && /^[a-f0-9]{64}$/.test(record.hostId)
+            && typeof record.projectKey==='string'
+            && record.projectKey.length>0
+            && record.projectKey.length<=16_384
+            && typeof record.rootKey==='string'
+            && /^[a-f0-9]{64}$/.test(record.rootKey)
+            && Number.isSafeInteger(record.port)
+            && record.port!>=LocalReplicaSCMProvider.syncOwnerPortBase
+            && record.port!<(
+                LocalReplicaSCMProvider.syncOwnerPortBase
+                +LocalReplicaSCMProvider.syncOwnerPortRange
+            )
+            && typeof record.createdAt==='string'
+            && Number.isFinite(Date.parse(record.createdAt));
+    }
+
+    private static isValidSyncOwnerRecord(value: unknown): value is SyncOwnerRecord {
+        return LocalReplicaSCMProvider.isSyncOwnerRecordVersion(value, 4);
+    }
+
+    private static isLegacySyncOwnerRecord(value: unknown): boolean {
+        return LocalReplicaSCMProvider.isSyncOwnerRecordVersion(value, 3);
+    }
+
+    private async readSyncOwnerRecord(): Promise<SyncOwnerRecord | undefined> {
+        try {
+            const content = await nodeFs.readFile(this.syncOwnerFilePath, 'utf8');
+            const parsed = JSON.parse(content);
+            return LocalReplicaSCMProvider.isValidSyncOwnerRecord(parsed)
+                ? parsed
+                : undefined;
+        } catch (error) {
+            if (
+                this.isNodeErrorCode(error, 'ENOENT')
+                || error instanceof SyntaxError
+            ) {
+                return undefined;
+            }
+            throw error;
+        }
+    }
+
+    private isOwnerProcessAlive(
+        record: SyncOwnerRecord,
+        hostId: string,
+    ): boolean | undefined {
+        if (record.hostId!==hostId) {
+            return undefined;
+        }
+        try {
+            process.kill(record.pid, 0);
+            return true;
+        } catch (error) {
+            return this.isNodeErrorCode(error, 'ESRCH') ? false : true;
+        }
+    }
+
+    private static getSyncOwnerHostId(): Promise<string> {
+        if (!LocalReplicaSCMProvider.syncOwnerHostIdPromise) {
+            LocalReplicaSCMProvider.syncOwnerHostIdPromise = (async () => {
+                const systemIdentityPaths = process.platform==='linux'
+                    ? ['/etc/machine-id', '/proc/self/cgroup']
+                    : [];
+                const systemIdentity = await Promise.all(systemIdentityPaths.map(
+                    filePath => nodeFs.readFile(filePath, 'utf8')
+                        .then(value => value.trim())
+                        .catch(() => ''),
+                ));
+                const networkIdentity = Object.values(os.networkInterfaces())
+                    .flatMap(records => records ?? [])
+                    .filter(record => !record.internal && record.mac!=='00:00:00:00:00:00')
+                    .map(record => record.mac.toLocaleLowerCase('en-US'))
+                    .sort();
+                const identity = [
+                    process.platform,
+                    process.arch,
+                    os.hostname(),
+                    ...systemIdentity,
+                    ...networkIdentity,
+                ].join('\n');
+                return crypto.createHash('sha256').update(identity).digest('hex');
+            })();
+        }
+        return LocalReplicaSCMProvider.syncOwnerHostIdPromise;
+    }
+
+    private syncOwnerHostId(): Promise<string> {
+        return LocalReplicaSCMProvider.getSyncOwnerHostId();
+    }
+
+    private async syncOwnerRootKey(): Promise<string> {
+        const realPath = await nodeFs.realpath(this.baseUri.fsPath);
+        const normalizedPath = process.platform==='win32'
+            ? realPath.toLocaleLowerCase('en-US')
+            : realPath;
+        return crypto.createHash('sha256').update(normalizedPath).digest('hex');
+    }
+
+    private syncOwnerPorts(rootKey: string): number[] {
+        const range = LocalReplicaSCMProvider.syncOwnerPortRange;
+        const start = Number.parseInt(rootKey.slice(0, 8), 16)%range;
+        let step = (Number.parseInt(rootKey.slice(8, 16), 16)%range)|1;
+        const gcd = (left: number, right: number): number => {
+            while (right!==0) {
+                [left, right] = [right, left%right];
+            }
+            return left;
+        };
+        while (gcd(step, range)!==1) {
+            step = (step+2)%range;
+            if (step===0) { step = 1; }
+        }
+        return Array.from(
+            {length: LocalReplicaSCMProvider.syncOwnerPortAttempts},
+            (_, index) => LocalReplicaSCMProvider.syncOwnerPortBase
+                +((start+(index*step))%range),
+        );
+    }
+
+    private probeSyncOwner(port: number): Promise<SyncOwnerRecord | undefined> {
+        return new Promise(resolve => {
+            let payload = '';
+            let settled = false;
+            const socket = nodeNet.createConnection({host: '127.0.0.1', port});
+            socket.unref();
+            const finish = () => {
+                if (settled) { return; }
+                settled = true;
+                clearTimeout(timeout);
+                socket.destroy();
+                try {
+                    const parsed = JSON.parse(payload);
+                    resolve(LocalReplicaSCMProvider.isValidSyncOwnerRecord(parsed)
+                        ? parsed
+                        : undefined);
+                } catch {
+                    resolve(undefined);
+                }
+            };
+            const timeout = setTimeout(finish, 500);
+            timeout.unref?.();
+            socket.on('data', chunk => {
+                payload += chunk.toString('utf8');
+                if (payload.length>64*1024) {
+                    payload = '';
+                    finish();
+                }
+            });
+            socket.once('end', finish);
+            socket.once('error', finish);
+        });
+    }
+
+    private async listenSyncOwnerServer(
+        ownerBase: Omit<SyncOwnerRecord, 'port'>,
+    ): Promise<{owner: SyncOwnerRecord; server: nodeNet.Server}> {
+        for (const port of this.syncOwnerPorts(ownerBase.rootKey)) {
+            const owner: SyncOwnerRecord = {...ownerBase, port};
+            const server = nodeNet.createServer(socket => {
+                socket.on('error', () => undefined);
+                socket.end(JSON.stringify(owner));
+            });
+            server.unref();
+            try {
+                await new Promise<void>((resolve, reject) => {
+                    const onError = (error: Error) => {
+                        server.off('listening', onListening);
+                        reject(error);
+                    };
+                    const onListening = () => {
+                        server.off('error', onError);
+                        resolve();
+                    };
+                    server.once('error', onError);
+                    server.once('listening', onListening);
+                    server.listen({
+                        host: '127.0.0.1',
+                        port,
+                        exclusive: true,
+                    });
+                });
+            } catch (error) {
+                if (!this.isNodeErrorCode(error, 'EADDRINUSE')) { throw error; }
+                const existingOwner = await this.probeSyncOwner(port);
+                if (existingOwner?.rootKey===owner.rootKey) {
+                    throw new LocalReplicaOwnershipUnavailableError(
+                        `Local Replica folder is already active in process ` +
+                        `${existingOwner.pid} on ${existingOwner.hostname}. ` +
+                        'Keep only one VS Code window connected to this Local Replica.',
+                    );
+                }
+                continue;
+            }
+            server.on('error', error => {
+                if (this.syncOwnerServer!==server) { return; }
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [sync ownership server failed] ` +
+                    `${this.baseUri.toString()}: ${formatUnknownError(error)}`,
+                );
+                this.deactivateSyncSession();
+            });
+            return {owner, server};
+        }
+        throw new Error(
+            'Local Replica could not reserve any deterministic host ownership port. ' +
+            'Close conflicting local services or select a different folder.',
+        );
+    }
+
+    private closeSyncOwnerServer(server: nodeNet.Server): Promise<void> {
+        if (!server.listening) { return Promise.resolve(); }
+        return new Promise((resolve, reject) => {
+            server.close(error => {
+                if (error) {
+                    reject(error);
+                    return;
+                }
+                resolve();
+            });
+        });
+    }
+
+    private clearSyncOwnerHeartbeat() {
+        if (this.syncOwnerHeartbeat) {
+            clearInterval(this.syncOwnerHeartbeat);
+            this.syncOwnerHeartbeat = undefined;
+        }
+    }
+
+    private handleLostSyncOwnership(token: string, reason: string) {
+        if (this.syncOwnerToken!==token) { return; }
+        this.clearSyncOwnerHeartbeat();
+        this.deactivateSyncSession();
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [sync ownership lost] ${this.baseUri.toString()}: ${reason}`,
+        );
+        void vscode.window.showWarningMessage(
+            vscode.l10n.t(
+                'Local Replica sync stopped because another VS Code window owns this folder. ' +
+                'Keep only one window connected to this Local Replica.',
+            ),
+        );
+    }
+
+    private startSyncOwnerHeartbeat(token: string) {
+        this.clearSyncOwnerHeartbeat();
+        this.syncOwnerHeartbeat = setInterval(() => {
+            void (async () => {
+                const owner = await this.readSyncOwnerRecord();
+                if (owner?.token!==token) {
+                    this.handleLostSyncOwnership(token, 'owner token changed');
+                    return;
+                }
+                await nodeFs.utimes(this.syncOwnerFilePath, new Date(), new Date());
+            })().catch(error => {
+                if (this.isNodeErrorCode(error, 'ENOENT')) {
+                    this.handleLostSyncOwnership(token, 'owner file disappeared');
+                    return;
+                }
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [sync ownership heartbeat failed] ` +
+                    `${this.baseUri.toString()}: ${formatUnknownError(error)}`,
+                );
+            });
+        }, LocalReplicaSCMProvider.syncOwnerHeartbeatMs);
+        this.syncOwnerHeartbeat.unref?.();
+    }
+
+    private installSyncOwnerClaim(claimPath: string): Promise<void> {
+        return nodeFs.link(claimPath, this.syncOwnerFilePath);
+    }
+
+    private cleanupSyncOwnerClaim(claimPath: string): Promise<void> {
+        return nodeFs.unlink(claimPath);
+    }
+
+    private async removeOwnedSyncOwnerLock(token: string): Promise<boolean> {
+        const owner = await this.readSyncOwnerRecord();
+        if (owner?.token!==token) { return false; }
+        const releasePath = `${this.syncOwnerFilePath}.release-${token}`;
+        try {
+            await nodeFs.rename(this.syncOwnerFilePath, releasePath);
+        } catch (error) {
+            if (this.isNodeErrorCode(error, 'ENOENT')) { return false; }
+            throw error;
+        }
+        await nodeFs.unlink(releasePath).catch(cleanupError => {
+            if (this.isNodeErrorCode(cleanupError, 'ENOENT')) { return; }
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [released ownership cleanup failed] ` +
+                `${releasePath}: ${formatUnknownError(cleanupError)}`,
+            );
+        });
+        return true;
+    }
+
+    private async acquireSyncOwnership(): Promise<void> {
+        await this.syncOwnerReleasePromise;
+        if (this.syncOwnerToken) {
+            const owner = await this.readSyncOwnerRecord();
+            if (
+                this.syncOwnerServer?.listening
+                && owner?.token===this.syncOwnerToken
+            ) {
+                return;
+            }
+            throw new Error(
+                'Local Replica ownership release is incomplete. ' +
+                'Retry deactivation before starting another sync session.',
+            );
+        }
+
+        const processOwner = LocalReplicaSCMProvider.processSyncOwners.get(
+            this.syncOwnerFilePath,
+        );
+        if (processOwner && processOwner!==this) {
+            if (
+                processOwner.removalDrainPromise
+                || processOwner.removalOwnershipHeld
+            ) {
+                throw new LocalReplicaOwnershipUnavailableError(
+                    'Local Replica removal is holding folder ownership.',
+                );
+            }
+            processOwner.deactivateSyncSession();
+            await processOwner.syncOwnerReleasePromise;
+        }
+
+        await nodeFs.mkdir(this.settingsDirectoryUri.fsPath, {recursive: true});
+        const hostId = await this.syncOwnerHostId();
+        await LocalReplicaSCMProvider.recoverStaleOwnershipRepairLock(
+            this.settingsDirectoryUri.fsPath,
+            hostId,
+        );
+        const legacyMarkerExists = await nodeFs.stat(this.legacySyncOwnerDirectoryPath)
+            .then(() => true)
+            .catch(error => {
+                if (this.isNodeErrorCode(error, 'ENOENT')) { return false; }
+                throw error;
+            });
+        if (legacyMarkerExists) {
+            throw new Error(
+                'Local Replica folder has an incomplete ownership marker or legacy marker. ' +
+                'Close every window using this folder, then run the ownership repair command.',
+            );
+        }
+        const token = crypto.randomUUID();
+        const projectKey = vfsProjectKey(this.vfs.origin);
+        const rootKey = await this.syncOwnerRootKey();
+        const ownerBase: Omit<SyncOwnerRecord, 'port'> = {
+            version: 4,
+            token,
+            pid: process.pid,
+            hostname: os.hostname(),
+            hostId,
+            projectKey,
+            rootKey,
+            createdAt: new Date().toISOString(),
+        };
+        const {owner, server} = await this.listenSyncOwnerServer(ownerBase);
+        const claimFilePath = `${this.syncOwnerFilePath}.claim-${token}`;
+        let adoptedServer = false;
+        let installedClaim = false;
+
+        try {
+            const claimHandle = await nodeFs.open(claimFilePath, 'wx', 0o600);
+            try {
+                await claimHandle.writeFile(JSON.stringify(owner), 'utf8');
+                await claimHandle.sync();
+            } finally {
+                await claimHandle.close();
+            }
+            for (let attempt = 0; attempt<5; attempt += 1) {
+                try {
+                    await this.installSyncOwnerClaim(claimFilePath);
+                    installedClaim = true;
+                    break;
+                } catch (error) {
+                    if (!this.isNodeErrorCode(error, 'EEXIST')) { throw error; }
+                }
+
+                const existingOwner = await this.readSyncOwnerRecord();
+                if (!existingOwner) {
+                    throw new Error(
+                        'Local Replica folder has an incomplete ownership marker or legacy marker. ' +
+                        'Close every window using this folder, then run the ownership repair command.',
+                    );
+                }
+                if (existingOwner.rootKey!==rootKey) {
+                    throw new Error(
+                        'Local Replica ownership marker does not match the selected folder.',
+                    );
+                }
+                if (existingOwner.hostId!==hostId) {
+                    throw new LocalReplicaOwnershipUnavailableError(
+                        `Local Replica folder is owned by process ${existingOwner.pid} ` +
+                        `on ${existingOwner.hostname}. Cross-host stale takeover is disabled.`,
+                    );
+                }
+                if (this.isOwnerProcessAlive(existingOwner, hostId)!==false) {
+                    throw new LocalReplicaOwnershipUnavailableError(
+                        `Local Replica folder is already active in process ` +
+                        `${existingOwner.pid} on ${existingOwner.hostname}. ` +
+                        'Keep only one VS Code window connected to this Local Replica.',
+                    );
+                }
+
+                const stalePath = `${this.syncOwnerFilePath}.stale-${token}-${attempt}`;
+                try {
+                    await nodeFs.rename(this.syncOwnerFilePath, stalePath);
+                } catch (renameError) {
+                    if (this.isNodeErrorCode(renameError, 'ENOENT')) { continue; }
+                    throw renameError;
+                }
+                await nodeFs.unlink(stalePath).catch(
+                    cleanupError => {
+                        if (this.isNodeErrorCode(cleanupError, 'ENOENT')) { return; }
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [stale ownership cleanup failed] ` +
+                            `${stalePath}: ${formatUnknownError(cleanupError)}`,
+                        );
+                    },
+                );
+            }
+            if (!installedClaim) {
+                throw new LocalReplicaOwnershipUnavailableError(
+                    'Could not acquire Local Replica folder ownership after concurrent retries.',
+                );
+            }
+            const repairStarted = await nodeFs.stat(this.syncOwnerRepairFilePath)
+                .then(() => true)
+                .catch(error => {
+                    if (this.isNodeErrorCode(error, 'ENOENT')) { return false; }
+                    throw error;
+                });
+            if (repairStarted) {
+                await this.removeOwnedSyncOwnerLock(token);
+                installedClaim = false;
+                throw new LocalReplicaOwnershipUnavailableError(
+                    'Local Replica ownership repair started during activation.',
+                );
+            }
+            this.syncOwnerServer = server;
+            this.syncOwnerToken = token;
+            LocalReplicaSCMProvider.processSyncOwners.set(
+                this.syncOwnerFilePath,
+                this,
+            );
+            this.startSyncOwnerHeartbeat(token);
+            adoptedServer = true;
+        } catch (error) {
+            if (installedClaim) {
+                await this.removeOwnedSyncOwnerLock(token).catch(cleanupError => {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [failed claim release failed] ` +
+                        `${this.syncOwnerFilePath}: ${formatUnknownError(cleanupError)}`,
+                    );
+                });
+            }
+            throw error;
+        } finally {
+            await this.cleanupSyncOwnerClaim(claimFilePath).catch(cleanupError => {
+                if (this.isNodeErrorCode(cleanupError, 'ENOENT')) { return; }
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [ownership claim cleanup failed] ` +
+                    `${claimFilePath}: ${formatUnknownError(cleanupError)}`,
+                );
+            });
+            if (!adoptedServer) {
+                await this.closeSyncOwnerServer(server).catch(closeError => {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [failed claim server close failed] ` +
+                        `${this.baseUri.toString()}: ${formatUnknownError(closeError)}`,
+                    );
+                });
+            }
+        }
+    }
+
+    private clearSyncOwnershipState() {
+        this.syncOwnerServer = undefined;
+        this.syncOwnerToken = undefined;
+        this.clearSyncOwnerHeartbeat();
+        if (
+            LocalReplicaSCMProvider.processSyncOwners.get(
+                this.syncOwnerFilePath,
+            )===this
+        ) {
+            LocalReplicaSCMProvider.processSyncOwners.delete(
+                this.syncOwnerFilePath,
+            );
+        }
+    }
+
+    private async releaseSyncOwnershipNow(): Promise<void> {
+        const token = this.syncOwnerToken;
+        const server = this.syncOwnerServer;
+        this.clearSyncOwnerHeartbeat();
+        if (server) {
+            await this.closeSyncOwnerServer(server);
+            if (this.syncOwnerServer===server) {
+                this.syncOwnerServer = undefined;
+            }
+        }
+        if (!token) {
+            this.clearSyncOwnershipState();
+            return;
+        }
+
+        const owner = await this.readSyncOwnerRecord();
+        if (owner?.token!==token) {
+            this.clearSyncOwnershipState();
+            return;
+        }
+        await this.removeOwnedSyncOwnerLock(token);
+        this.clearSyncOwnershipState();
+    }
+
+    private releaseSyncOwnership(): Promise<void> {
+        if (this.syncOwnerReleasePromise) {
+            return this.syncOwnerReleasePromise;
+        }
+        if (!this.syncOwnerToken && !this.syncOwnerServer) {
+            return Promise.resolve();
+        }
+        const activation = this.activationPromise;
+        const release = (async () => {
+            if (activation) {
+                await Promise.allSettled([activation]);
+            }
+            this.stopSyncInputs();
+            await this.drainPendingSyncWork();
+            await this.releaseSyncOwnershipNow();
+        })();
+        const trackedRelease = release.finally(() => {
+            if (this.syncOwnerReleasePromise===trackedRelease) {
+                this.syncOwnerReleasePromise = undefined;
+            }
+        });
+        this.syncOwnerReleasePromise = trackedRelease;
+        return trackedRelease;
+    }
+
     private async runSessionIO<T>(
         generation: number,
         task: () => Thenable<T> | Promise<T>,
@@ -365,10 +1391,34 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private async beginSyncSession() {
+        if (this.removalDrainPromise || this.removalOwnershipHeld) {
+            throw new Error('Local Replica removal is already in progress.');
+        }
         if (this.syncSessionActive) {
-            this.deactivateSyncSession();
+            this.deactivateSyncSession(undefined, false);
+        }
+        if (await hasReplicaRemovalTombstone(this.baseUri, this.vfs.origin)) {
+            throw new Error(
+                'This Local Replica mapping was removed. ' +
+                'Select the folder explicitly to connect it again.',
+            );
+        }
+        await this.syncOwnerReleasePromise;
+        await this.acquireSyncOwnership();
+        if (
+            this.removalDrainPromise
+            || this.removalOwnershipHeld
+            || await hasReplicaRemovalTombstone(this.baseUri, this.vfs.origin)
+        ) {
+            await this.releaseSyncOwnershipNow();
+            throw new Error(
+                this.removalDrainPromise || this.removalOwnershipHeld
+                    ? 'Local Replica removal is already in progress.'
+                    : 'This Local Replica mapping was removed while activation was waiting.',
+            );
         }
         const generation = ++this.syncGeneration;
+        this.removalPendingGeneration = undefined;
         this.syncSessionActive = false;
         this.partialPullToastGeneration = undefined;
         await this.drainInFlightSessionIO();
@@ -376,6 +1426,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.syncSessionActive = true;
         }
         return generation;
+    }
+
+    public async prepareExplicitSelectionAndHoldOwnership(): Promise<void> {
+        if (this.removalDrainPromise || this.removalOwnershipHeld) {
+            throw new Error('Local Replica removal is already in progress.');
+        }
+        await this.syncOwnerReleasePromise;
+        await this.acquireSyncOwnership();
+        if (this.removalDrainPromise || this.removalOwnershipHeld) {
+            await this.releaseSyncOwnershipNow();
+            throw new Error('Local Replica removal started while selection was waiting.');
+        }
     }
 
     private isSyncSessionActive(generation = this.syncGeneration) {
@@ -388,11 +1450,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
-    private deactivateSyncSession(generation?: number) {
+    private stopSyncInputs(generation?: number) {
         if (generation!==undefined && generation!==this.syncGeneration) { return; }
-        this.syncSessionActive = false;
-        this.syncGeneration += 1;
-        this.partialPullToastGeneration = undefined;
         this.vfsWatcher?.dispose();
         this.vfsWatcher = undefined;
         for (const disposable of this.dynamicLocalDisposables) {
@@ -432,8 +1491,195 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.pendingLocalEvents.clear();
     }
 
-    public deactivate() {
+    private deactivateSyncSession(
+        generation?: number,
+        releaseOwnership = true,
+    ) {
+        if (generation!==undefined && generation!==this.syncGeneration) { return; }
+        this.stopSyncInputs(generation);
+        this.syncSessionActive = false;
+        this.syncGeneration += 1;
+        this.removalPendingGeneration = undefined;
+        this.partialPullToastGeneration = undefined;
+        if (!releaseOwnership) { return; }
+        void this.releaseSyncOwnership().catch(error => {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [sync ownership release failed] ` +
+                `${this.baseUri.toString()}: ${formatUnknownError(error)}`,
+            );
+        });
+    }
+
+    private async drainPendingSyncWork(): Promise<void> {
+        while (true) {
+            const pending = new Set<Promise<unknown>>([
+                ...this.syncQueues.values(),
+                ...this.inFlightSessionIO,
+                ...this.localGuardCleanupPromises.values(),
+                ...this.deferredSyncWork,
+                ...this.preQueueSyncWork,
+            ]);
+            if (pending.size===0) { return; }
+            await Promise.allSettled([...pending]);
+        }
+    }
+
+    private async flushPendingLocalEventsForRemoval(
+        generation: number,
+    ): Promise<void> {
+        const pendingEvents = [...this.pendingLocalEvents.entries()];
+        const flushes: Promise<unknown>[] = [];
+        for (const [relPath, pending] of pendingEvents) {
+            if (this.pendingLocalEvents.get(relPath)!==pending) { continue; }
+            clearTimeout(pending.timer);
+            this.pendingLocalEvents.delete(relPath);
+            flushes.push(this.enqueueLocalPendingEvent(
+                relPath,
+                pending,
+                generation,
+                true,
+            ));
+        }
+        await Promise.allSettled(flushes);
+    }
+
+    /**
+     * Stops new watcher work while allowing an already-started remote
+     * transaction to finish its rollback/cleanup before its mapping is removed.
+     */
+    public prepareRemovalAndHoldOwnership(): Promise<void> {
+        if (this.removalOwnershipHeld) {
+            return Promise.resolve();
+        }
+        if (this.removalDrainPromise) {
+            return this.removalDrainPromise;
+        }
+        const generation = this.syncGeneration;
+        for (const [relPath, failure] of this.removalAcceptedSyncErrors) {
+            if (failure.generation!==generation) {
+                this.removalAcceptedSyncErrors.delete(relPath);
+            }
+        }
+        this.removalPendingGeneration = generation;
+        const drain = (async () => {
+            try {
+                const pendingLocalFlush = this.flushPendingLocalEventsForRemoval(
+                    generation,
+                );
+                this.stopSyncInputs(generation);
+                await pendingLocalFlush;
+                const activation = this.activationPromise;
+                if (activation) {
+                    await Promise.allSettled([activation]);
+                }
+                this.stopSyncInputs(generation);
+                await this.syncOwnerReleasePromise;
+                await this.acquireSyncOwnership();
+                await this.drainPendingSyncWork();
+                if (this.syncSessionActive) {
+                    await this.recoverChangedCommittedLocalOperations(
+                        this.syncGeneration,
+                    );
+                    await this.drainPendingSyncWork();
+                }
+                const classificationFailures = [
+                    ...this.removalAcceptedSyncErrors.entries(),
+                ].filter(([_relPath, failure]) =>
+                    failure.generation===generation
+                );
+                if (classificationFailures.length>0) {
+                    throw new Error(
+                        'Local Replica could not classify accepted local edits before removal: ' +
+                        classificationFailures
+                            .map(([relPath, failure]) => `${relPath}: ${failure.error}`)
+                            .join('; '),
+                    );
+                }
+                await this.cleanupUnchangedCommittedGuardsForRemoval();
+                if (
+                    generation!==this.syncGeneration
+                    && this.syncSessionActive
+                ) {
+                    throw new Error(
+                        'Local Replica changed sync sessions while removal was being prepared.',
+                    );
+                }
+
+                const [localOperations, remoteOperations] = await Promise.all([
+                    this.listLocalOperationRecords(),
+                    this.listRemoteDeleteOperationRecords(),
+                ]);
+                const stagedIds = new Set(
+                    this.stagedDetachedLocalGuards.map(item => item.record.id),
+                );
+                const blockingLocalOperations = localOperations.filter(
+                    item => !stagedIds.has(item.record.id),
+                );
+                if (blockingLocalOperations.length>0 || remoteOperations.length>0) {
+                    throw new Error(
+                        'Local Replica still has recoverable file operations. ' +
+                        'Its mapping was retained so recovery can complete safely.',
+                    );
+                }
+                this.deactivateSyncSession(undefined, false);
+                this.removalOwnershipHeld = true;
+            } catch (error) {
+                let removalError = error;
+                this.removalOwnershipHeld = false;
+                try {
+                    await this.rollbackStagedDetachedLocalGuards();
+                } catch (rollbackError) {
+                    removalError = new Error(
+                        `${formatUnknownError(error)}; retained inode guard rollback failed: ` +
+                        formatUnknownError(rollbackError),
+                    );
+                }
+                if (this.syncOwnerToken || this.syncOwnerServer) {
+                    this.deactivateSyncSession();
+                    await this.syncOwnerReleasePromise?.catch(releaseError => {
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [temporary sync ownership release failed] ` +
+                            `${this.baseUri.toString()}: ${formatUnknownError(releaseError)}`,
+                        );
+                    });
+                }
+                throw removalError;
+            }
+        })();
+        this.removalDrainPromise = drain;
+        return drain.finally(() => {
+            if (this.removalDrainPromise===drain) {
+                this.removalDrainPromise = undefined;
+            }
+        });
+    }
+
+    public async finishRemoval(): Promise<void> {
+        if (this.removalDrainPromise) {
+            await this.removalDrainPromise;
+        }
+        if (!this.removalOwnershipHeld) { return; }
+        await this.rollbackStagedDetachedLocalGuards();
+        this.removalOwnershipHeld = false;
         this.deactivateSyncSession();
+        await this.syncOwnerReleasePromise;
+    }
+
+    public async deactivateAndDrain(): Promise<void> {
+        await this.prepareRemovalAndHoldOwnership();
+        await this.finishRemoval();
+    }
+
+    public deactivate(): Promise<void> {
+        this.deactivateSyncSession();
+        return this.syncOwnerReleasePromise ?? Promise.resolve();
+    }
+
+    public markWaitingForOwnership(message: string) {
+        this.status = {
+            status: 'need-attention',
+            message: `sync paused: ${message}`,
+        };
     }
 
     public static sanitizeProjectFolderName(projectName: string): string {
@@ -474,6 +1720,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return code==='FileNotFound'
             || code==='ENOENT'
             || /EntryNotFound|FileNotFound|ENOENT|not found/i.test(message);
+    }
+
+    private static isSyncStatType(
+        stat: vscode.FileStat,
+        type: vscode.FileType.File | vscode.FileType.Directory,
+        allowSymbolicLink: boolean,
+    ): boolean {
+        return allowSymbolicLink
+            ? (stat.type & type)!==0
+            : stat.type===type;
     }
 
     private static comparableFsPath(fsPath: string): string {
@@ -761,7 +2017,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return false;
         }
         const record = value as Partial<RemoteDeleteOperationRecord>;
+        const kind = record.kind ?? 'delete';
+        const expectedStageName = kind==='replace'
+            ? `.sr-overleaf-replace-${record.id}`
+            : `.sr-overleaf-delete-${record.id}`;
         return record.version===1
+            && (kind==='delete' || kind==='replace')
             && typeof record.id==='string'
             && record.id.length<=128
             && /^[a-f0-9]{24}$/.test(record.id)
@@ -769,10 +2030,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && this.isCanonicalReplicaRelPath(record.relPath)
             && typeof record.stagingRelPath==='string'
             && this.isCanonicalReplicaRelPath(record.stagingRelPath)
-            && nodePath.posix.basename(record.stagingRelPath).startsWith('.sr-overleaf-delete-')
-            && nodePath.posix.basename(record.stagingRelPath)===`.sr-overleaf-delete-${record.id}`
+            && nodePath.posix.basename(record.stagingRelPath)===expectedStageName
             && nodePath.posix.dirname(record.stagingRelPath)===nodePath.posix.dirname(record.relPath)
             && this.isValidRecordedPathRevision(record.expectedRevision)
+            && (
+                kind==='delete'
+                    ? record.replacementRevision===undefined
+                        && record.supersededByRevision===undefined
+                    : this.isValidRecordedPathRevision(record.replacementRevision)
+                        && (
+                            record.supersededByRevision===undefined
+                            || this.isValidRecordedPathRevision(record.supersededByRevision)
+                        )
+            )
             && typeof record.createdAt==='string'
             && Number.isFinite(Date.parse(record.createdAt));
     }
@@ -788,6 +2058,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 && existing.relPath===record.relPath
                 && existing.stagingRelPath===record.stagingRelPath
                 && existing.expectedRevision===record.expectedRevision
+                && (existing.kind ?? 'delete')===(record.kind ?? 'delete')
+                && existing.replacementRevision===record.replacementRevision
+                && existing.supersededByRevision===record.supersededByRevision
             ) {
                 return;
             }
@@ -799,6 +2072,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         await this.writeDurableOperationFile(
             recordPath,
+            Buffer.from(JSON.stringify(record)),
+        );
+    }
+
+    private async updateRemoteDeleteOperationRecord(
+        record: RemoteDeleteOperationRecord,
+    ): Promise<void> {
+        const relPath = record.relPath;
+        if (!this.isValidRemoteDeleteOperationRecord(record)) {
+            throw new Error(`Invalid remote delete journal update for ${relPath}`);
+        }
+        await this.writeDurableOperationFile(
+            this.remoteDeleteOperationRecordPath(record.id),
             Buffer.from(JSON.stringify(record)),
         );
     }
@@ -1031,6 +2317,249 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.localGuardCleanupPromises.set(record.id, cleanup);
     }
 
+    private detachedLocalGuardPaths(record: LocalReplicaOperationRecord): {
+        detachedDirectory: string;
+        detachedGuardPath: string;
+        detachedRecordPath: string;
+    } {
+        const detachedDirectory = nodePath.join(
+            this.settingsDirectoryUri.fsPath,
+            'detached-inode-guards',
+        );
+        return {
+            detachedDirectory,
+            detachedGuardPath: nodePath.join(detachedDirectory, `${record.id}.guard`),
+            detachedRecordPath: nodePath.join(detachedDirectory, `${record.id}.json`),
+        };
+    }
+
+    private localOperationRecordsEqual(
+        left: LocalReplicaOperationRecord,
+        right: LocalReplicaOperationRecord,
+    ): boolean {
+        return left.version===right.version
+            && left.id===right.id
+            && left.kind===right.kind
+            && left.relPath===right.relPath
+            && left.entityKind===right.entityKind
+            && left.expectedRevision===right.expectedRevision
+            && left.installedRevision===right.installedRevision
+            && left.stageName===right.stageName
+            && left.backupName===right.backupName
+            && left.guardName===right.guardName
+            && left.createdAt===right.createdAt;
+    }
+
+    private async readDetachedLocalGuardRecord(
+        record: LocalReplicaOperationRecord,
+    ): Promise<DetachedLocalGuardRecord | undefined> {
+        const {detachedRecordPath} = this.detachedLocalGuardPaths(record);
+        let parsed: unknown;
+        try {
+            parsed = JSON.parse(await nodeFs.readFile(detachedRecordPath, 'utf8'));
+        } catch (error) {
+            if (this.isNodeErrorCode(error, 'ENOENT')) { return undefined; }
+            throw new Error(
+                `Cannot read detached inode metadata ${detachedRecordPath}: ` +
+                formatUnknownError(error),
+            );
+        }
+        if (
+            !this.isValidLocalOperationRecord(parsed)
+            || !this.localOperationRecordsEqual(parsed, record)
+            || typeof (parsed as Partial<DetachedLocalGuardRecord>).detachedAt!=='string'
+            || !Number.isFinite(Date.parse(
+                (parsed as Partial<DetachedLocalGuardRecord>).detachedAt!,
+            ))
+            || (
+                (parsed as Partial<DetachedLocalGuardRecord>)
+                    .mappingRemovalCommittedAt!==undefined
+                && (
+                    typeof (parsed as Partial<DetachedLocalGuardRecord>)
+                        .mappingRemovalCommittedAt!=='string'
+                    || !Number.isFinite(Date.parse(
+                        (parsed as Partial<DetachedLocalGuardRecord>)
+                            .mappingRemovalCommittedAt!,
+                    ))
+                )
+            )
+        ) {
+            throw new Error(
+                `Detached inode metadata does not match its active journal: ` +
+                detachedRecordPath,
+            );
+        }
+        return parsed as DetachedLocalGuardRecord;
+    }
+
+    private async removeDetachedLocalGuardRecord(
+        detachedRecordPath: string,
+    ): Promise<void> {
+        await nodeFs.unlink(detachedRecordPath).catch(error => {
+            if (!this.isNodeErrorCode(error, 'ENOENT')) { throw error; }
+        });
+        await this.syncDirectoryBestEffort(nodePath.dirname(detachedRecordPath));
+    }
+
+    private async recoverDetachedLocalGuardForActiveMapping(
+        record: LocalReplicaOperationRecord,
+    ): Promise<'none' | 'active' | 'mapping-removed'> {
+        const {
+            detachedGuardPath,
+            detachedRecordPath,
+        } = this.detachedLocalGuardPaths(record);
+        const [metadata, activeGuardExists, detachedGuardExists] = await Promise.all([
+            this.readDetachedLocalGuardRecord(record),
+            this.localPathExists(this.localOperationGuardPath(record)),
+            this.localPathExists(detachedGuardPath),
+        ]);
+        if (!metadata) {
+            if (detachedGuardExists) {
+                throw new Error(
+                    `Detached inode guard has no durable metadata: ${detachedGuardPath}`,
+                );
+            }
+            return 'none';
+        }
+        if (metadata.mappingRemovalCommittedAt!==undefined) {
+            if (activeGuardExists) {
+                throw new Error(
+                    `A mapping-removed inode journal also has an active guard: ` +
+                    this.localOperationGuardPath(record),
+                );
+            }
+            await this.removeLocalOperationRecord(record.id);
+            return 'mapping-removed';
+        }
+        if (activeGuardExists && detachedGuardExists) {
+            throw new Error(
+                `Detached inode recovery found both active and staged guards for ` +
+                `${record.relPath}`,
+            );
+        }
+        if (detachedGuardExists) {
+            await this.renameDurably(
+                detachedGuardPath,
+                this.localOperationGuardPath(record),
+            );
+        } else if (!activeGuardExists) {
+            throw new Error(
+                `Detached inode metadata has no recoverable guard: ${detachedRecordPath}`,
+            );
+        }
+        await this.removeDetachedLocalGuardRecord(detachedRecordPath);
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [local inode guard staging recovered] ` +
+            `${record.relPath}: restored active journal tracking`,
+        );
+        return 'active';
+    }
+
+    private async stageDetachedLocalGuard(
+        record: LocalReplicaOperationRecord,
+        guardPath: string,
+    ): Promise<void> {
+        const {
+            detachedDirectory,
+            detachedGuardPath,
+            detachedRecordPath,
+        } = this.detachedLocalGuardPaths(record);
+        await nodeFs.mkdir(detachedDirectory, {recursive: true});
+        await this.writeDurableOperationFile(
+            detachedRecordPath,
+            Buffer.from(JSON.stringify({
+                ...record,
+                detachedAt: new Date().toISOString(),
+            })),
+        );
+        try {
+            await this.renameDurably(guardPath, detachedGuardPath);
+        } catch (error) {
+            await nodeFs.unlink(detachedRecordPath).catch(() => undefined);
+            throw error;
+        }
+        this.stagedDetachedLocalGuards.push({
+            record,
+            guardPath,
+            detachedGuardPath,
+            detachedRecordPath,
+        });
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [local inode guard staged for detach] ${record.relPath}: ` +
+            `platform cannot prove descriptor closure; staged=${detachedGuardPath}`,
+        );
+    }
+
+    private async rollbackStagedDetachedLocalGuards(): Promise<void> {
+        for (
+            let index=this.stagedDetachedLocalGuards.length-1;
+            index>=0;
+            index--
+        ) {
+            const item = this.stagedDetachedLocalGuards[index];
+            const metadata = await this.readDetachedLocalGuardRecord(item.record);
+            if (metadata?.mappingRemovalCommittedAt!==undefined) {
+                this.stagedDetachedLocalGuards.splice(index, 1);
+                continue;
+            }
+            const [detachedGuardExists, activeGuardExists] = await Promise.all([
+                this.localPathExists(item.detachedGuardPath),
+                this.localPathExists(item.guardPath),
+            ]);
+            if (detachedGuardExists) {
+                if (activeGuardExists) {
+                    throw new Error(
+                        `Cannot restore retained inode guard because its active path was recreated: ` +
+                        `${item.guardPath}`,
+                    );
+                }
+                await this.renameDurably(item.detachedGuardPath, item.guardPath);
+            } else if (!activeGuardExists) {
+                throw new Error(
+                    `Cannot restore retained inode guard because both staged and active paths ` +
+                    `are missing for ${item.record.relPath}`,
+                );
+            }
+            await this.removeDetachedLocalGuardRecord(item.detachedRecordPath);
+            this.stagedDetachedLocalGuards.splice(index, 1);
+        }
+    }
+
+    public async confirmRemovalPersistenceDeleted(): Promise<void> {
+        for (const item of [...this.stagedDetachedLocalGuards]) {
+            const metadata = await this.readDetachedLocalGuardRecord(item.record);
+            if (!metadata) {
+                throw new Error(
+                    `Cannot commit mapping removal without detached inode metadata: ` +
+                    item.detachedRecordPath,
+                );
+            }
+            if (metadata.mappingRemovalCommittedAt===undefined) {
+                await this.writeDurableOperationFile(
+                    item.detachedRecordPath,
+                    Buffer.from(JSON.stringify({
+                        ...metadata,
+                        mappingRemovalCommittedAt: new Date().toISOString(),
+                    })),
+                );
+            }
+            const index = this.stagedDetachedLocalGuards.indexOf(item);
+            if (index>=0) {
+                this.stagedDetachedLocalGuards.splice(index, 1);
+            }
+            await this.removeLocalOperationRecord(item.record.id).catch(error => {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [detached inode journal cleanup deferred] ` +
+                    `${item.record.relPath}: ${formatUnknownError(error)}`,
+                );
+            });
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [local inode guard detached] ${item.record.relPath}: ` +
+                `mapping removal committed; preserved=${item.detachedGuardPath}`,
+            );
+        }
+    }
+
     private async listLocalOperationRecords(): Promise<Array<{
         record: LocalReplicaOperationRecord;
         committed: boolean;
@@ -1093,6 +2622,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const targetPath = this.localUri(record.relPath).fsPath;
         const targetExists = await this.localPathExists(targetPath);
         if (!targetExists) {
+            await this.ensureOperationRecoveryParent(record.relPath, generation);
             await this.restoreStagedPathWithoutOverwrite(
                 guardPath,
                 targetPath,
@@ -1123,6 +2653,52 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         await this.renameDurably(guardPath, targetPath);
     }
 
+    private async ensureOperationRecoveryParent(
+        relPath: string,
+        generation: number,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        const pathParts = this.requireConfinedRelPath(
+            relPath,
+            'recover local operation parent',
+        ).replace(/^\/+/, '').split('/').slice(0, -1);
+        const rootRealPath = LocalReplicaSCMProvider.comparableFsPath(
+            await nodeFs.realpath(this.baseUri.fsPath),
+        );
+        let parentPath = this.baseUri.fsPath;
+        for (const pathPart of pathParts) {
+            this.requireSyncSession(generation);
+            parentPath = nodePath.join(parentPath, pathPart);
+            try {
+                const stat = await nodeFs.lstat(parentPath);
+                if (stat.isSymbolicLink() || !stat.isDirectory()) {
+                    throw new Error(
+                        `Local Replica operation recovery refuses a non-directory ancestor: ${parentPath}`,
+                    );
+                }
+            } catch (error) {
+                if (!this.isNodeErrorCode(error, 'ENOENT')) {
+                    throw error;
+                }
+                await nodeFs.mkdir(parentPath);
+                await this.syncDirectoryBestEffort(nodePath.dirname(parentPath));
+            }
+            const parentRealPath = LocalReplicaSCMProvider.comparableFsPath(
+                await nodeFs.realpath(parentPath),
+            );
+            const relative = nodePath.relative(rootRealPath, parentRealPath);
+            if (
+                relative==='..'
+                || relative.startsWith(`..${nodePath.sep}`)
+                || nodePath.isAbsolute(relative)
+            ) {
+                throw new Error(
+                    `Local Replica operation recovery escaped the selected folder: ${parentPath}`,
+                );
+            }
+        }
+    }
+
     private async cleanupLocalOperationStage(
         record: LocalReplicaOperationRecord,
     ): Promise<void> {
@@ -1137,6 +2713,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.requireSyncSession(generation);
         for (const {record, committed} of await this.listLocalOperationRecords()) {
             this.requireSyncSession(generation);
+            const detachedRecovery =
+                await this.recoverDetachedLocalGuardForActiveMapping(record);
+            if (detachedRecovery==='mapping-removed') { continue; }
             const targetPath = this.localUri(record.relPath).fsPath;
             const backupPath = this.localOperationSiblingPath(record, record.backupName);
             const guardPath = this.localOperationGuardPath(record);
@@ -1151,31 +2730,28 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         record.relPath,
                         generation,
                     );
-                    const targetExists = await this.localPathExists(targetPath);
-                    if (
-                        sourceRevision.revision!==record.expectedRevision
-                        || (record.kind==='write' && !targetExists)
-                    ) {
+                    if (sourceRevision.revision!==record.expectedRevision) {
                         await this.restoreOperationGuardToVisiblePath(
                             record,
                             sourcePath,
                             generation,
                         );
-                        if (sourceRevision.revision!==record.expectedRevision) {
-                            const latestLocal = await this.captureLocalPathRevision(
-                                record.relPath,
-                                generation,
-                            );
-                            await this.markSyncConflict(
-                                record.relPath,
-                                'A process continued writing through an older local file handle while Local Replica was inactive',
-                                latestLocal.kind==='file' ? latestLocal.content : undefined,
-                                generation,
-                            );
-                        }
+                        const latestLocal = await this.captureLocalPathRevision(
+                            record.relPath,
+                            generation,
+                        );
+                        await this.markSyncConflict(
+                            record.relPath,
+                            'A process continued writing through an older local file handle while Local Replica was inactive',
+                            latestLocal.kind==='file' ? latestLocal.content : undefined,
+                            generation,
+                        );
                         await this.retainGuardOrRemoveLocalOperation(record);
-                    } else if (sourcePath!==guardPath) {
-                        await this.renameDurably(sourcePath, guardPath);
+                    } else {
+                        if (sourcePath!==guardPath) {
+                            await this.renameDurably(sourcePath, guardPath);
+                        }
+                        this.scheduleUnreferencedLocalGuardCleanup(record, generation);
                     }
                 } else {
                     await this.removeLocalOperationRecord(record.id);
@@ -1208,6 +2784,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             await this.renameDurably(sourcePath, guardPath);
                         }
                         await this.markLocalOperationCommitted(record.id);
+                        this.scheduleUnreferencedLocalGuardCleanup(record, generation);
                         await this.cleanupLocalOperationStage(record);
                         continue;
                     }
@@ -1221,6 +2798,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         await this.renameDurably(sourcePath, guardPath);
                     }
                     await this.markLocalOperationCommitted(record.id);
+                    this.scheduleUnreferencedLocalGuardCleanup(record, generation);
                     await this.cleanupLocalOperationStage(record);
                     continue;
                 }
@@ -1256,6 +2834,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.requireSyncSession(generation);
         for (const {record, committed} of await this.listLocalOperationRecords()) {
             if (!committed) { continue; }
+            const detachedRecovery =
+                await this.recoverDetachedLocalGuardForActiveMapping(record);
+            if (detachedRecovery==='mapping-removed') { continue; }
             const guardPath = this.localOperationGuardPath(record);
             if (!await this.localPathExists(guardPath)) {
                 await this.removeLocalOperationRecord(record.id);
@@ -1283,6 +2864,37 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 generation,
             );
             await this.retainGuardOrRemoveLocalOperation(record);
+        }
+    }
+
+    private async cleanupUnchangedCommittedGuardsForRemoval(): Promise<void> {
+        for (const {record, committed} of await this.listLocalOperationRecords()) {
+            if (!committed) { continue; }
+            const detachedRecovery =
+                await this.recoverDetachedLocalGuardForActiveMapping(record);
+            if (detachedRecovery==='mapping-removed') { continue; }
+            const guardPath = this.localOperationGuardPath(record);
+            if (!await this.localPathExists(guardPath)) {
+                await this.removeLocalOperationRecord(record.id);
+                continue;
+            }
+            const guardRevision = await this.captureLocalUriRevisionUnfenced(
+                vscode.Uri.file(guardPath),
+                record.relPath,
+            );
+            if (guardRevision.revision!==record.expectedRevision) {
+                continue;
+            }
+            if (process.platform!=='linux') {
+                await this.stageDetachedLocalGuard(record, guardPath);
+                continue;
+            }
+            const hasOpenDescriptor = await this.retainedPathHasOpenFileDescriptor(guardPath);
+            if (hasOpenDescriptor!==false) {
+                continue;
+            }
+            await nodeFs.rm(guardPath, {recursive: true, force: true});
+            await this.removeLocalOperationRecord(record.id);
         }
     }
 
@@ -1477,10 +3089,23 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return false;
         }
         const entry = value as Partial<SyncManifestConflictEntry>;
+        const validRemoteProof = (
+            entry.remoteKind===undefined
+            && entry.remoteRevision===undefined
+        ) || (
+            (
+                entry.remoteKind==='missing'
+                || entry.remoteKind==='file'
+                || entry.remoteKind==='directory'
+                || entry.remoteKind==='other'
+            )
+            && this.isValidRecordedPathRevision(entry.remoteRevision)
+        );
         return typeof entry.reason==='string'
             && entry.reason.length>0
             && entry.reason.length<=16_384
             && this.isValidRecordedPathRevision(entry.localDigest)
+            && validRemoteProof
             && typeof entry.updatedAt==='string'
             && Number.isFinite(Date.parse(entry.updatedAt));
     }
@@ -1696,20 +3321,30 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         generation = this.syncGeneration,
     ): Promise<PathRevision> {
         this.requireSyncSession(generation);
+        const revision = await this.captureLocalUriRevisionUnfenced(uri, relPath);
+        this.requireSyncSession(generation);
+        return revision;
+    }
+
+    private async captureLocalUriRevisionUnfenced(
+        uri: vscode.Uri,
+        relPath: string,
+    ): Promise<PathRevision> {
         let stat: vscode.FileStat;
         try {
-            stat = await vscode.workspace.fs.stat(uri);
+            stat = await this.statConfinedLocalUri(
+                uri,
+                `revision capture of ${relPath}`,
+            );
         } catch (error) {
             if (LocalReplicaSCMProvider.isFileNotFoundError(error)) {
                 return {kind: 'missing', revision: DELETE_DIGEST};
             }
             throw error;
         }
-        this.requireSyncSession(generation);
 
-        if (stat.type===vscode.FileType.File) {
-            const content = await vscode.workspace.fs.readFile(uri);
-            this.requireSyncSession(generation);
+        if (LocalReplicaSCMProvider.isSyncStatType(stat, vscode.FileType.File, false)) {
+            const content = await this.readConfinedLocalFile(relPath, uri);
             return {
                 kind: 'file',
                 revision: contentDigest(content),
@@ -1718,17 +3353,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         if (stat.type===vscode.FileType.Directory) {
             const entries = await vscode.workspace.fs.readDirectory(uri);
-            this.requireSyncSession(generation);
             const revisions: string[] = [];
             for (const [name] of entries.sort(([left], [right]) => left.localeCompare(right))) {
                 const childRelPath = this.requireConfinedRelPath(
                     `${relPath.replace(/\/+$/, '')}/${name}`,
                     'local path revision',
                 );
-                const child = await this.captureLocalUriRevision(
+                const child = await this.captureLocalUriRevisionUnfenced(
                     vscode.Uri.joinPath(uri, name),
                     childRelPath,
-                    generation,
                 );
                 revisions.push(`${name}\0${child.kind}\0${child.revision}`);
             }
@@ -1758,7 +3391,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         try {
             const content = await this.runSessionIO(
                 generation,
-                () => vscode.workspace.fs.readFile(this.localUri(relPath)),
+                () => this.readConfinedLocalFile(relPath),
             );
             this.requireSyncSession(generation);
             return content;
@@ -1788,7 +3421,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         this.requireSyncSession(generation);
 
-        if (stat.type===vscode.FileType.File) {
+        if (LocalReplicaSCMProvider.isSyncStatType(stat, vscode.FileType.File, true)) {
             const content = await this.pullRemoteFile(relPath, uri, generation);
             return {
                 kind: 'file',
@@ -1842,6 +3475,31 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const parentPath = nodePath.posix.dirname(relPath);
         const operationId = this.remoteDeleteOperationId(relPath, expectedRevision);
         const stageName = `.sr-overleaf-delete-${operationId}`;
+        return parentPath==='/' ? `/${stageName}` : `${parentPath}/${stageName}`;
+    }
+
+    private remoteReplacementOperationId(
+        relPath: string,
+        expectedRevision: string,
+        replacementRevision: string,
+    ): string {
+        return contentDigest(
+            Buffer.from(`${relPath}\0${expectedRevision}\0${replacementRevision}`),
+        ).slice(0, 24);
+    }
+
+    private remoteReplacementStagingPath(
+        relPath: string,
+        expectedRevision: string,
+        replacementRevision: string,
+    ): string {
+        const parentPath = nodePath.posix.dirname(relPath);
+        const operationId = this.remoteReplacementOperationId(
+            relPath,
+            expectedRevision,
+            replacementRevision,
+        );
+        const stageName = `.sr-overleaf-replace-${operationId}`;
         return parentPath==='/' ? `/${stageName}` : `${parentPath}/${stageName}`;
     }
 
@@ -2199,19 +3857,539 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+    private async removeRemoteReplacementStage(
+        stagingUri: vscode.Uri,
+        relPath: string,
+        generation: number,
+    ): Promise<boolean> {
+        try {
+            await this.runSessionIO(
+                generation,
+                () => vscode.workspace.fs.delete(stagingUri, {recursive: true}),
+            );
+            return true;
+        } catch (error) {
+            try {
+                await this.refreshRemoteStateForReconciliation(
+                    relPath,
+                    generation,
+                    'verify remote replacement stage cleanup',
+                );
+                if (!await this.remotePathExists(stagingUri, generation)) {
+                    return true;
+                }
+            } catch {
+                // Retain the durable journal when cleanup cannot be verified.
+            }
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [remote replacement stage retained] ${relPath}: ` +
+                `${formatUnknownError(error)}; recovery=${stagingUri.toString()}`,
+            );
+            return false;
+        }
+    }
+
+    private async guardedReplaceRemoteBinary(
+        relPath: string,
+        targetUri: vscode.Uri,
+        replacementContent: Uint8Array,
+        remoteBaseline: Uint8Array,
+        generation = this.syncGeneration,
+    ): Promise<Uint8Array> {
+        this.requireSyncSession(generation);
+        const expectedRevision = contentDigest(remoteBaseline);
+        const replacementRevision = contentDigest(replacementContent);
+        const operationId = this.remoteReplacementOperationId(
+            relPath,
+            expectedRevision,
+            replacementRevision,
+        );
+        const stagingRelPath = this.remoteReplacementStagingPath(
+            relPath,
+            expectedRevision,
+            replacementRevision,
+        );
+        const stagingUri = this.vfs.pathToUri(stagingRelPath);
+        await this.createRemoteDeleteOperationRecord({
+            version: 1,
+            id: operationId,
+            kind: 'replace',
+            relPath,
+            stagingRelPath,
+            expectedRevision,
+            replacementRevision,
+            createdAt: new Date().toISOString(),
+        });
+
+        const completedRecord: RemoteDeleteOperationRecord = {
+            version: 1,
+            id: operationId,
+            kind: 'replace',
+            relPath,
+            stagingRelPath,
+            expectedRevision,
+            replacementRevision,
+            createdAt: new Date().toISOString(),
+        };
+        const removeCompletedJournal = async () => {
+            const removed = await this.removeRemoteReplacementStage(
+                stagingUri,
+                relPath,
+                generation,
+            );
+            if (removed) {
+                const verifiedTarget = await this.captureRemoteUriRevision(
+                    targetUri,
+                    relPath,
+                    generation,
+                );
+                if (verifiedTarget.revision!==replacementRevision) {
+                    throw new RemoteDocumentMergeConflictError(
+                        `Overleaf changed ${relPath} while its completed binary replacement was finalized`,
+                    );
+                }
+                await this.retireSupersededRemoteReplacements(
+                    completedRecord,
+                    generation,
+                );
+                await this.removeRemoteDeleteOperationRecord(operationId);
+            }
+        };
+
+        try {
+            let staged = await this.captureRemoteUriRevision(
+                stagingUri,
+                relPath,
+                generation,
+            );
+            let target = await this.captureRemoteUriRevision(
+                targetUri,
+                relPath,
+                generation,
+            );
+
+            if (staged.kind==='missing') {
+                if (target.revision===replacementRevision) {
+                    await this.retireSupersededRemoteReplacements(
+                        completedRecord,
+                        generation,
+                    );
+                    await this.removeRemoteDeleteOperationRecord(operationId);
+                    return replacementContent;
+                }
+                if (target.revision!==expectedRevision) {
+                    if (target.kind==='missing') {
+                        throw new ConcurrentReplicaChangeError(
+                            `Overleaf removed ${relPath} before its binary replacement was staged`,
+                        );
+                    }
+                    throw new RemoteDocumentMergeConflictError(
+                        `Overleaf changed ${relPath} before its binary replacement was staged`,
+                    );
+                }
+                await this.renameRemotePathForDelete(targetUri, stagingUri, generation);
+                staged = await this.captureRemoteUriRevision(
+                    stagingUri,
+                    relPath,
+                    generation,
+                );
+                target = await this.captureRemoteUriRevision(
+                    targetUri,
+                    relPath,
+                    generation,
+                );
+            }
+
+            if (staged.revision!==expectedRevision) {
+                if (target.kind==='missing') {
+                    const restored = await this.restoreRemoteStagingPath(
+                        stagingUri,
+                        targetUri,
+                        relPath,
+                        generation,
+                    );
+                    if (restored) {
+                        await this.removeRemoteDeleteOperationRecord(operationId);
+                    }
+                }
+                throw new ConcurrentReplicaChangeError(
+                    `The retained Overleaf replacement stage for ${relPath} changed`,
+                );
+            }
+            if (target.kind!=='missing') {
+                if (target.revision===replacementRevision) {
+                    await removeCompletedJournal();
+                    return replacementContent;
+                }
+                throw new RemoteDocumentMergeConflictError(
+                    `Overleaf recreated ${relPath} while its binary replacement was staged`,
+                );
+            }
+
+            const pushedContent = await this.pushWithRetry(
+                relPath,
+                targetUri,
+                replacementContent,
+                generation,
+                undefined,
+                true,
+            );
+            target = await this.captureRemoteUriRevision(
+                targetUri,
+                relPath,
+                generation,
+            );
+            if (target.revision!==contentDigest(pushedContent)) {
+                throw new RemoteDocumentWriteAmbiguousError(
+                    `Overleaf could not verify the completed binary replacement for ${relPath}`,
+                );
+            }
+            await removeCompletedJournal();
+            return pushedContent;
+        } catch (error) {
+            try {
+                await this.refreshRemoteStateForReconciliation(
+                    relPath,
+                    generation,
+                    'recover failed remote binary replacement',
+                );
+                const staged = await this.captureRemoteUriRevision(
+                    stagingUri,
+                    relPath,
+                    generation,
+                );
+                const target = await this.captureRemoteUriRevision(
+                    targetUri,
+                    relPath,
+                    generation,
+                );
+
+                if (target.revision===replacementRevision) {
+                    if (staged.kind!=='missing') {
+                        await removeCompletedJournal();
+                    } else {
+                        await this.retireSupersededRemoteReplacements(
+                            completedRecord,
+                            generation,
+                        );
+                        await this.removeRemoteDeleteOperationRecord(operationId);
+                    }
+                    return replacementContent;
+                }
+                if (
+                    target.kind==='missing'
+                    && staged.revision===expectedRevision
+                ) {
+                    const restored = await this.restoreRemoteStagingPath(
+                        stagingUri,
+                        targetUri,
+                        relPath,
+                        generation,
+                    );
+                    if (restored) {
+                        await this.removeRemoteDeleteOperationRecord(operationId);
+                    }
+                    throw error;
+                }
+                if (
+                    target.kind==='missing'
+                    && staged.kind!=='missing'
+                    && staged.revision!==expectedRevision
+                ) {
+                    const restored = await this.restoreRemoteStagingPath(
+                        stagingUri,
+                        targetUri,
+                        relPath,
+                        generation,
+                    );
+                    if (restored) {
+                        await this.removeRemoteDeleteOperationRecord(operationId);
+                    }
+                    throw new ConcurrentReplicaChangeError(
+                        `Overleaf changed ${relPath} while its binary replacement was being recovered`,
+                    );
+                }
+                if (
+                    staged.kind==='missing'
+                    && target.revision===expectedRevision
+                ) {
+                    await this.removeRemoteDeleteOperationRecord(operationId);
+                    throw error;
+                }
+                if (
+                    staged.revision===expectedRevision
+                    && target.kind!=='missing'
+                ) {
+                    throw new RemoteDocumentMergeConflictError(
+                        `Overleaf changed ${relPath} while its binary replacement was in progress; ` +
+                        `the prior remote bytes remain staged at ${stagingRelPath}`,
+                    );
+                }
+                if (staged.kind==='missing' && target.kind!=='missing') {
+                    await this.removeRemoteDeleteOperationRecord(operationId);
+                    throw new RemoteDocumentMergeConflictError(
+                        `Overleaf changed ${relPath} while its binary replacement was being recovered`,
+                    );
+                }
+            } catch (recoveryError) {
+                if (recoveryError!==error) {
+                    throw recoveryError;
+                }
+            }
+            throw error;
+        }
+    }
+
+    private async retireSupersededRemoteReplacements(
+        completedRecord: RemoteDeleteOperationRecord,
+        generation: number,
+    ): Promise<void> {
+        const records = await this.listRemoteDeleteOperationRecords();
+        for (const record of records) {
+            if (
+                record.kind!=='replace'
+                || record.relPath!==completedRecord.relPath
+                || record.id===completedRecord.id
+            ) {
+                continue;
+            }
+            const supersededRecord = record.supersededByRevision===completedRecord.replacementRevision
+                ? record
+                : {
+                    ...record,
+                    supersededByRevision: completedRecord.replacementRevision,
+                };
+            if (supersededRecord!==record) {
+                await this.updateRemoteDeleteOperationRecord(supersededRecord);
+            }
+            const stagingUri = this.vfs.pathToUri(record.stagingRelPath);
+            const staged = await this.captureRemoteUriRevision(
+                stagingUri,
+                completedRecord.relPath,
+                generation,
+            );
+            if (
+                staged.kind==='missing'
+                || (
+                    staged.revision===record.expectedRevision
+                    && await this.removeRemoteReplacementStage(
+                        stagingUri,
+                        completedRecord.relPath,
+                        generation,
+                    )
+                )
+            ) {
+                await this.removeRemoteDeleteOperationRecord(record.id);
+            }
+        }
+    }
+
+    private async recoverInterruptedRemoteReplacement(
+        record: RemoteDeleteOperationRecord,
+        generation: number,
+    ): Promise<void> {
+        const stagingUri = this.vfs.pathToUri(record.stagingRelPath);
+        const targetUri = this.vfs.pathToUri(record.relPath);
+        const staged = await this.captureRemoteUriRevision(
+            stagingUri,
+            record.relPath,
+            generation,
+        );
+        const target = await this.captureRemoteUriRevision(
+            targetUri,
+            record.relPath,
+            generation,
+        );
+        if (record.supersededByRevision!==undefined) {
+            if (staged.kind==='missing') {
+                await this.removeRemoteDeleteOperationRecord(record.id);
+                return;
+            }
+            if (
+                staged.revision===record.expectedRevision
+                && await this.removeRemoteReplacementStage(
+                    stagingUri,
+                    record.relPath,
+                    generation,
+                )
+            ) {
+                await this.removeRemoteDeleteOperationRecord(record.id);
+            } else {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [superseded replacement stage retained] ` +
+                    `${record.relPath}: recovery=${stagingUri.toString()}`,
+                );
+            }
+            return;
+        }
+        if (staged.kind==='missing' && target.kind!=='missing') {
+            if (target.revision===record.replacementRevision) {
+                await this.retireSupersededRemoteReplacements(record, generation);
+            }
+            await this.removeRemoteDeleteOperationRecord(record.id);
+            return;
+        }
+        if (staged.kind==='missing' && target.kind==='missing') {
+            throw new ConcurrentReplicaChangeError(
+                `Both the target and recovery stage for ${record.relPath} are missing`,
+            );
+        }
+        if (staged.revision!==record.expectedRevision) {
+            if (target.kind==='missing') {
+                const restored = await this.restoreRemoteStagingPath(
+                    stagingUri,
+                    targetUri,
+                    record.relPath,
+                    generation,
+                );
+                if (restored) {
+                    await this.removeRemoteDeleteOperationRecord(record.id);
+                }
+            }
+            throw new ConcurrentReplicaChangeError(
+                `The interrupted replacement stage for ${record.relPath} changed`,
+            );
+        }
+        if (target.kind==='missing') {
+            const restored = await this.restoreRemoteStagingPath(
+                stagingUri,
+                targetUri,
+                record.relPath,
+                generation,
+            );
+            if (!restored) {
+                throw new ConcurrentReplicaChangeError(
+                    `Could not restore ${record.relPath} after an interrupted binary replacement`,
+                );
+            }
+            await this.removeRemoteDeleteOperationRecord(record.id);
+            return;
+        }
+
+        if (target.revision!==record.replacementRevision) {
+            const localState = await this.captureLocalPathRevision(
+                record.relPath,
+                generation,
+            );
+            await this.markSyncConflict(
+                record.relPath,
+                'Overleaf changed the file while an interrupted binary replacement was recovered',
+                localState.kind==='missing'
+                    ? null
+                    : (localState.kind==='file' ? localState.content : undefined),
+                generation,
+            );
+            return;
+        }
+
+        const removed = await this.removeRemoteReplacementStage(
+            stagingUri,
+            record.relPath,
+            generation,
+        );
+        if (!removed) {
+            throw new ConcurrentReplicaChangeError(
+                `Could not clean the interrupted replacement stage for ${record.relPath}`,
+            );
+        }
+        const verifiedTarget = await this.captureRemoteUriRevision(
+            targetUri,
+            record.relPath,
+            generation,
+        );
+        if (verifiedTarget.revision!==record.replacementRevision) {
+            throw new ConcurrentReplicaChangeError(
+                `Overleaf changed ${record.relPath} while replacement recovery was finalized`,
+            );
+        }
+        await this.retireSupersededRemoteReplacements(record, generation);
+        await this.removeRemoteDeleteOperationRecord(record.id);
+    }
+
+    private async markCompletedReplacementSupersessions(
+        records: RemoteDeleteOperationRecord[],
+        generation: number,
+    ): Promise<RemoteDeleteOperationRecord[]> {
+        const updatedRecords = [...records];
+        const replacementPaths = [...new Set(
+            records
+                .filter(record => record.kind==='replace')
+                .map(record => record.relPath),
+        )];
+        for (const relPath of replacementPaths) {
+            this.requireSyncSession(generation);
+            const target = await this.captureRemotePathRevision(relPath, generation);
+            const completed = records
+                .filter(record =>
+                    record.kind==='replace'
+                    && record.relPath===relPath
+                    && record.supersededByRevision===undefined
+                    && record.replacementRevision===target.revision
+                )
+                .sort((left, right) =>
+                    Date.parse(right.createdAt)-Date.parse(left.createdAt)
+                    || right.id.localeCompare(left.id)
+                )[0];
+            if (!completed) { continue; }
+
+            for (let index = 0; index<updatedRecords.length; index++) {
+                const record = updatedRecords[index];
+                if (
+                    record.kind!=='replace'
+                    || record.relPath!==relPath
+                    || record.id===completed.id
+                    || record.supersededByRevision!==undefined
+                ) {
+                    continue;
+                }
+                const superseded = {
+                    ...record,
+                    supersededByRevision: target.revision,
+                };
+                await this.updateRemoteDeleteOperationRecord(superseded);
+                updatedRecords[index] = superseded;
+            }
+        }
+        return updatedRecords;
+    }
+
     private async recoverInterruptedRemoteDeletes(
         generation = this.syncGeneration,
     ): Promise<void> {
         this.requireSyncSession(generation);
-        const records = await this.listRemoteDeleteOperationRecords();
+        let records = await this.listRemoteDeleteOperationRecords();
         if (records.length===0) { return; }
         await this.refreshRemoteStateForReconciliation(
             '/',
             generation,
             'recover interrupted remote deletes',
         );
+        records = await this.markCompletedReplacementSupersessions(records, generation);
         for (const record of records) {
             this.requireSyncSession(generation);
+            if (record.kind==='replace') {
+                try {
+                    await this.recoverInterruptedRemoteReplacement(record, generation);
+                } catch (error) {
+                    const localState = await this.captureLocalPathRevision(
+                        record.relPath,
+                        generation,
+                    );
+                    await this.markSyncConflict(
+                        record.relPath,
+                        `An interrupted remote replacement could not be resumed safely: ${formatUnknownError(error)}`,
+                        localState.kind==='missing'
+                            ? null
+                            : (localState.kind==='file' ? localState.content : undefined),
+                        generation,
+                    );
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [remote replacement recovery blocked] ` +
+                        `${record.relPath}: ${formatUnknownError(error)}`,
+                    );
+                }
+                continue;
+            }
             const staging = await this.captureRemotePathRevision(
                 record.stagingRelPath,
                 generation,
@@ -2671,6 +4849,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 await this.markLocalOperationCommitted(operationRecord.id);
                 operationCommitted = true;
                 rollbackPath = undefined;
+                this.scheduleUnreferencedLocalGuardCleanup(
+                    operationRecord,
+                    generation,
+                );
             } else {
                 await this.removeLocalOperationRecord(operationRecord.id);
                 operationRecordExists = false;
@@ -2850,6 +5032,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 rollbackPath = undefined;
                 await this.markLocalOperationCommitted(operationRecord.id);
                 operationCommitted = true;
+                this.scheduleUnreferencedLocalGuardCleanup(
+                    operationRecord,
+                    generation,
+                );
                 getOutputChannel().appendLine(
                     `${new Date().toISOString()} [local inode guard retained] ${relPath}: ` +
                     `${finalMoved.revision!==expectedRevision
@@ -2890,6 +5076,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             await this.markLocalOperationCommitted(operationRecord.id);
             operationCommitted = true;
             rollbackPath = undefined;
+            this.scheduleUnreferencedLocalGuardCleanup(
+                operationRecord,
+                generation,
+            );
             return true;
         } catch (error) {
             operationError = error;
@@ -3429,6 +5619,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         reason: string,
         localContent?: Uint8Array | null,
         generation = this.syncGeneration,
+        recordedRemoteState?: PathRevision,
     ) {
         this.requireSyncSession(generation);
         let conflictDigest: string;
@@ -3447,6 +5638,20 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 conflictDigest = `unreadable:${Date.now()}:${formatUnknownError(error)}`;
             }
         }
+        let remoteState = recordedRemoteState;
+        if (remoteState===undefined) {
+            try {
+                remoteState = await this.captureRemotePathRevision(relPath, generation);
+            } catch (error) {
+                if (!this.isSyncSessionActive(generation)) {
+                    throw error;
+                }
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [sync conflict proof unavailable] ${relPath}: ` +
+                    formatUnknownError(error),
+                );
+            }
+        }
         this.requireSyncSession(generation);
         this.syncConflicts.set(relPath, reason);
         this.conflictLocalDigests.set(relPath, conflictDigest);
@@ -3454,6 +5659,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.syncManifest.conflicts[relPath] = {
                 reason,
                 localDigest: conflictDigest,
+                remoteKind: remoteState?.kind,
+                remoteRevision: remoteState?.revision,
                 updatedAt: new Date().toISOString(),
             };
             this.markSyncManifestDirty();
@@ -3534,6 +5741,263 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+    private hasRelatedFailedInitialPull(relPath: string): boolean {
+        return [...this.failedInitialPulls].some(path =>
+            this.isPathAtOrBelow(path, relPath)
+            || this.isPathAtOrBelow(relPath, path)
+        );
+    }
+
+    private conflictPathForPushTarget(relPath: string): string | undefined {
+        return [...this.syncConflicts.keys()]
+            .filter(conflictPath => this.isPathAtOrBelow(relPath, conflictPath))
+            .sort((left, right) => right.split('/').length-left.split('/').length)[0];
+    }
+
+    private async prepareConflictResolutionProof(
+        conflictPath: string,
+        targetRelPath: string,
+        generation = this.syncGeneration,
+        acceptUnchangedLocalState = false,
+    ): Promise<ConflictResolutionProof | undefined> {
+        this.requireSyncSession(generation);
+        const entry = this.syncManifest?.conflicts[conflictPath];
+        if (!entry) {
+            return undefined;
+        }
+        if (
+            this.hasRelatedFailedInitialPull(conflictPath)
+            || this.hasRelatedFailedInitialPull(targetRelPath)
+        ) {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [conflict resolution blocked:initial-pull-failed] ${conflictPath}`,
+            );
+            return undefined;
+        }
+        if (
+            entry.remoteKind===undefined
+            || entry.remoteRevision===undefined
+        ) {
+            try {
+                const localState = await this.captureLocalPathRevision(conflictPath, generation);
+                await this.refreshRemoteStateForReconciliation(
+                    conflictPath,
+                    generation,
+                    'establish missing conflict proof',
+                );
+                const remoteState = await this.captureRemotePathRevision(
+                    conflictPath,
+                    generation,
+                );
+                await this.markSyncConflict(
+                    conflictPath,
+                    'An authoritative Overleaf revision was established for a legacy conflict; ' +
+                        'review it and edit the local copy again to resolve',
+                    localState.kind==='missing' ? null : localState.content,
+                    generation,
+                    remoteState,
+                );
+                await this.persistSyncManifest(false, generation);
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [conflict resolution blocked:remote-proof-established] ` +
+                    conflictPath,
+                );
+            } catch (error) {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [conflict resolution blocked:no-remote-proof] ` +
+                    `${conflictPath}: ${formatUnknownError(error)}`,
+                );
+            }
+            return undefined;
+        }
+        if (
+            !acceptUnchangedLocalState
+            && !await this.hasLocalConflictRevision(conflictPath, generation)
+        ) {
+            return undefined;
+        }
+
+        const localState = await this.captureLocalPathRevision(conflictPath, generation);
+        if (localState.kind==='other') {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [conflict resolution blocked:unsupported-local-type] ${conflictPath}`,
+            );
+            return undefined;
+        }
+
+        await this.refreshRemoteStateForReconciliation(
+            conflictPath,
+            generation,
+            'verify conflict resolution',
+        );
+        const remoteConflictState = await this.captureRemotePathRevision(
+            conflictPath,
+            generation,
+        );
+        this.requireSyncSession(generation);
+        if (
+            remoteConflictState.kind!==entry.remoteKind
+            || remoteConflictState.revision!==entry.remoteRevision
+        ) {
+            const reason = 'Overleaf changed again after the conflict was recorded; ' +
+                'the newer remote revision was preserved';
+            await this.markSyncConflict(
+                conflictPath,
+                reason,
+                localState.kind==='missing' ? null : localState.content,
+                generation,
+                remoteConflictState,
+            );
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [conflict resolution blocked:remote-advanced] ${conflictPath}`,
+            );
+            return undefined;
+        }
+        if (remoteConflictState.kind==='other') {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [conflict resolution blocked:unsupported-remote-type] ${conflictPath}`,
+            );
+            return undefined;
+        }
+        const remoteTargetState = targetRelPath===conflictPath
+            ? remoteConflictState
+            : await this.captureRemotePathRevision(targetRelPath, generation);
+        this.requireSyncSession(generation);
+        if (remoteTargetState.kind==='other') {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [conflict resolution blocked:unsupported-target-type] ${targetRelPath}`,
+            );
+            return undefined;
+        }
+        return {
+            conflictPath,
+            remoteState: remoteTargetState,
+        };
+    }
+
+    public getSyncConflictPaths(): string[] {
+        return [...this.syncConflicts.keys()].sort();
+    }
+
+    public async resolveConflictWithLocalState(relPath: string): Promise<boolean> {
+        const generation = this.syncGeneration;
+        this.requireSyncSession(generation);
+        const confinedRelPath = this.normalizeConfinedRelPath(
+            relPath,
+            'resolve conflict using local state',
+        );
+        if (
+            confinedRelPath===undefined
+            || !this.syncConflicts.has(confinedRelPath)
+        ) {
+            return false;
+        }
+        const localState = await this.captureLocalPathRevision(
+            confinedRelPath,
+            generation,
+        );
+        if (localState.kind==='other') {
+            return false;
+        }
+        const event = await this.enqueueSync(
+            confinedRelPath,
+            () => this.applySync(
+                'push',
+                localState.kind==='missing' ? 'delete' : 'update',
+                confinedRelPath,
+                this.localUri(confinedRelPath),
+                this.vfs.pathToUri(confinedRelPath),
+                {
+                    forcePush: true,
+                    resolveConflict: true,
+                    acceptUnchangedLocalConflictState: true,
+                    reason: 'explicit-conflict-resolution',
+                },
+                generation,
+            ),
+            generation,
+        ) as Events['scmSyncCompleteEvent'] | undefined;
+        return event?.outcome==='success' || event?.outcome==='suppressed';
+    }
+
+    private async refreshConflictRemoteProof(
+        conflictPath: string,
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        const entry = this.syncManifest?.conflicts[conflictPath];
+        if (!entry) { return; }
+        const remoteState = await this.captureRemotePathRevision(conflictPath, generation);
+        this.requireSyncSession(generation);
+        entry.remoteKind = remoteState.kind;
+        entry.remoteRevision = remoteState.revision;
+        entry.updatedAt = new Date().toISOString();
+        this.markSyncManifestDirty();
+    }
+
+    private async hydrateMissingConflictRemoteProofs(
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        const missingProofs = Object.entries(this.syncManifest?.conflicts ?? {})
+            .filter(([_relPath, entry]) =>
+                entry.remoteKind===undefined || entry.remoteRevision===undefined
+            )
+            .map(([relPath]) => relPath);
+        if (missingProofs.length===0) { return; }
+
+        try {
+            await this.refreshRemoteStateForReconciliation(
+                '/',
+                generation,
+                'hydrate legacy conflict proofs',
+            );
+        } catch (error) {
+            if (!this.isSyncSessionActive(generation)) {
+                throw error;
+            }
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [conflict remote proof hydration deferred] ` +
+                formatUnknownError(error),
+            );
+            return;
+        }
+        for (const relPath of missingProofs) {
+            this.requireSyncSession(generation);
+            const entry = this.syncManifest?.conflicts[relPath];
+            if (!entry) { continue; }
+            try {
+                const remoteState = await this.captureRemotePathRevision(
+                    relPath,
+                    generation,
+                );
+                const localState = await this.captureLocalPathRevision(
+                    relPath,
+                    generation,
+                );
+                this.requireSyncSession(generation);
+                entry.localDigest = localState.revision;
+                entry.remoteKind = remoteState.kind;
+                entry.remoteRevision = remoteState.revision;
+                entry.updatedAt = new Date().toISOString();
+                this.conflictLocalDigests.set(relPath, localState.revision);
+                this.markSyncManifestDirty();
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [conflict remote proof hydrated] ${relPath}`,
+                );
+            } catch (error) {
+                if (!this.isSyncSessionActive(generation)) {
+                    throw error;
+                }
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [conflict remote proof unavailable] ` +
+                    `${relPath}: ${formatUnknownError(error)}`,
+                );
+            }
+        }
+        await this.persistSyncManifest(false, generation);
+    }
+
     private async isConflictStateResolved(
         relPath: string,
         generation = this.syncGeneration,
@@ -3542,7 +6006,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         let localStat: vscode.FileStat | undefined;
         let remoteStat: vscode.FileStat | undefined;
         try {
-            localStat = await vscode.workspace.fs.stat(this.localUri(relPath));
+            localStat = await this.statConfinedLocalUri(
+                this.localUri(relPath),
+                `conflict inspection of ${relPath}`,
+            );
         } catch (error) {
             if (!LocalReplicaSCMProvider.isFileNotFoundError(error)) {
                 return false;
@@ -3582,7 +6049,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         try {
             const [localContent, remoteContent] = await Promise.all([
-                vscode.workspace.fs.readFile(this.localUri(relPath)),
+                this.readConfinedLocalFile(relPath),
                 this.pullRemoteFile(relPath, this.vfs.pathToUri(relPath), generation),
             ]);
             this.requireSyncSession(generation);
@@ -3650,13 +6117,42 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         result.attemptedCount += 1;
         result.paths.push(relPath);
         const vfsUri = this.vfs.pathToUri(relPath);
+        const queuedBehindExistingSync = this.syncQueues.has(relPath);
+        let alreadySynced = false;
         const event = await this.enqueueSync(
             relPath,
-            () => this.applySync('push', type, relPath, localUri, vfsUri, options, generation),
+            async () => {
+                let currentType = type;
+                if (type==='delete' || queuedBehindExistingSync) {
+                    const reclassifiedType = await this.localTargetNeedsPush(relPath, localUri);
+                    this.requireSyncSession(generation);
+                    if (reclassifiedType===undefined) {
+                        alreadySynced = true;
+                        return undefined;
+                    }
+                    currentType = reclassifiedType;
+                }
+                return this.applySync(
+                    'push',
+                    currentType,
+                    relPath,
+                    localUri,
+                    vfsUri,
+                    options,
+                    generation,
+                );
+            },
             generation,
         );
         this.requireSyncSession(generation);
 
+        if (alreadySynced) {
+            this.locallyDivergedPaths.delete(relPath);
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [compile barrier already synced] ${relPath}`,
+            );
+            return;
+        }
         if (!event) {
             result.failedCount += 1;
             result.failures.push(`${relPath}: no sync completion event`);
@@ -3701,13 +6197,267 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return this.syncManifest?.files[relPath]?.localDigest===contentDigest(content);
     }
 
+    private async getLocalRootRealPath(): Promise<string> {
+        if (this.localRootRealPath===undefined) {
+            this.localRootRealPath = LocalReplicaSCMProvider.comparableFsPath(
+                await nodeFs.realpath(this.baseUri.fsPath),
+            );
+        }
+        return this.localRootRealPath;
+    }
+
+    private async assertLocalRealPathConfined(
+        actualPath: string,
+        operation: string,
+    ): Promise<void> {
+        const rootRealPath = await this.getLocalRootRealPath();
+        const comparableActualPath = LocalReplicaSCMProvider.comparableFsPath(actualPath);
+        const relative = nodePath.relative(rootRealPath, comparableActualPath);
+        if (
+            relative==='..'
+            || relative.startsWith(`..${nodePath.sep}`)
+            || nodePath.isAbsolute(relative)
+        ) {
+            throw new Error(
+                `Local Replica ${operation} escaped the selected folder: ${actualPath}`,
+            );
+        }
+    }
+
+    private async captureLocalPathIdentitySnapshot(
+        uri: vscode.Uri,
+        operation: string,
+    ): Promise<LocalPathIdentitySnapshot> {
+        const basePath = nodePath.resolve(this.baseUri.fsPath);
+        const targetPath = nodePath.resolve(uri.fsPath);
+        const lexicalRelative = nodePath.relative(basePath, targetPath);
+        if (
+            lexicalRelative==='..'
+            || lexicalRelative.startsWith(`..${nodePath.sep}`)
+            || nodePath.isAbsolute(lexicalRelative)
+        ) {
+            throw new Error(
+                `Local Replica ${operation} escaped the selected folder: ${targetPath}`,
+            );
+        }
+
+        const paths = [basePath];
+        let currentPath = basePath;
+        for (const part of lexicalRelative.split(nodePath.sep).filter(Boolean)) {
+            currentPath = nodePath.join(currentPath, part);
+            paths.push(currentPath);
+        }
+
+        const entries: LocalPathIdentitySnapshot['entries'] = [];
+        let finalStat: LocalPathIdentitySnapshot['finalStat'] | undefined;
+        for (let index=0; index<paths.length; index++) {
+            const candidatePath = paths[index];
+            const stat = await nodeFs.lstat(candidatePath, {bigint: true});
+            if (stat.isSymbolicLink()) {
+                throw new Error(
+                    `Local Replica ${operation} refuses symbolic links: ${candidatePath}`,
+                );
+            }
+            if (index<paths.length-1 && !stat.isDirectory()) {
+                throw new Error(
+                    `Local Replica ${operation} encountered a non-directory ancestor: ${candidatePath}`,
+                );
+            }
+            const mtime = String(
+                (stat as unknown as {mtimeNs?: bigint}).mtimeNs ?? stat.mtimeMs,
+            );
+            const ctime = String(
+                (stat as unknown as {ctimeNs?: bigint}).ctimeNs ?? stat.ctimeMs,
+            );
+            entries.push({
+                path: LocalReplicaSCMProvider.comparableFsPath(candidatePath),
+                identity: [
+                    stat.dev,
+                    stat.ino,
+                    stat.mode,
+                    stat.nlink,
+                    stat.size,
+                    mtime,
+                    ctime,
+                ].join(':'),
+            });
+            if (index===paths.length-1) {
+                finalStat = {
+                    isFile: stat.isFile(),
+                    isDirectory: stat.isDirectory(),
+                    ctimeMs: Number(stat.ctimeMs),
+                    mtimeMs: Number(stat.mtimeMs),
+                    size: Number(stat.size),
+                    dev: String(stat.dev),
+                    ino: String(stat.ino),
+                };
+            }
+        }
+        await this.assertLocalRealPathConfined(
+            await nodeFs.realpath(targetPath),
+            operation,
+        );
+        return {entries, finalStat: finalStat!};
+    }
+
+    private localPathIdentitySnapshotsEqual(
+        left: LocalPathIdentitySnapshot,
+        right: LocalPathIdentitySnapshot,
+    ): boolean {
+        return left.entries.length===right.entries.length
+            && left.entries.every((entry, index) =>
+                entry.path===right.entries[index].path
+                && entry.identity===right.entries[index].identity
+            );
+    }
+
+    private readOpenedLocalFile(handle: nodeFs.FileHandle): Promise<Buffer> {
+        return handle.readFile();
+    }
+
+    private async statConfinedLocalUri(
+        uri: vscode.Uri,
+        operation: string,
+    ): Promise<vscode.FileStat> {
+        if (uri.scheme!=='file' || this.baseUri.scheme!=='file') {
+            const stat = await vscode.workspace.fs.stat(uri);
+            if ((stat.type & vscode.FileType.SymbolicLink)!==0) {
+                throw new Error(`Local Replica ${operation} refuses symbolic links: ${uri.toString()}`);
+            }
+            return stat;
+        }
+
+        const snapshot = await this.captureLocalPathIdentitySnapshot(uri, operation);
+        const type = snapshot.finalStat.isFile
+            ? vscode.FileType.File
+            : snapshot.finalStat.isDirectory
+                ? vscode.FileType.Directory
+                : vscode.FileType.Unknown;
+        return {
+            type,
+            ctime: snapshot.finalStat.ctimeMs,
+            mtime: snapshot.finalStat.mtimeMs,
+            size: snapshot.finalStat.size,
+        };
+    }
+
+    private async readConfinedLocalFile(
+        relPath: string,
+        uri: vscode.Uri = this.localUri(relPath),
+    ): Promise<Uint8Array> {
+        if (uri.scheme!=='file' || this.baseUri.scheme!=='file') {
+            await this.statConfinedLocalUri(uri, `read of ${relPath}`);
+            return vscode.workspace.fs.readFile(uri);
+        }
+
+        const before = await this.captureLocalPathIdentitySnapshot(
+            uri,
+            `read of ${relPath}`,
+        );
+        const flags = nodeFsConstants.O_RDONLY
+            | (nodeFsConstants.O_NOFOLLOW ?? 0);
+        const handle = await nodeFs.open(uri.fsPath, flags);
+        try {
+            const descriptorStat = await handle.stat({bigint: true});
+            if (!descriptorStat.isFile()) {
+                throw new Error(`Local Replica read expected a regular file: ${uri.fsPath}`);
+            }
+            if (
+                String(descriptorStat.dev)!==before.finalStat.dev
+                || String(descriptorStat.ino)!==before.finalStat.ino
+            ) {
+                throw new Error(
+                    `Local Replica read target changed while it was opened: ${uri.fsPath}`,
+                );
+            }
+            const descriptorPathPrefix = process.platform==='linux'
+                ? '/proc/self/fd'
+                : undefined;
+            let descriptorPathValidated = false;
+            if (descriptorPathPrefix!==undefined) {
+                const descriptorPath = await nodeFs.realpath(
+                    `${descriptorPathPrefix}/${handle.fd}`,
+                ).catch(() => undefined);
+                if (descriptorPath!==undefined) {
+                    descriptorPathValidated = true;
+                    await this.assertLocalRealPathConfined(
+                        descriptorPath,
+                        `read of ${relPath}`,
+                    );
+                }
+            }
+            const content = await this.readOpenedLocalFile(handle);
+            if (descriptorPathValidated) {
+                const descriptorPath = await nodeFs.realpath(
+                    `${descriptorPathPrefix}/${handle.fd}`,
+                );
+                await this.assertLocalRealPathConfined(
+                    descriptorPath,
+                    `read of ${relPath}`,
+                );
+                const pathStat = await nodeFs.lstat(uri.fsPath, {bigint: true});
+                if (
+                    pathStat.isSymbolicLink()
+                    || String(pathStat.dev)!==String(descriptorStat.dev)
+                    || String(pathStat.ino)!==String(descriptorStat.ino)
+                ) {
+                    throw new Error(
+                        `Local Replica read path changed during confinement validation: ${uri.fsPath}`,
+                    );
+                }
+                await this.assertLocalRealPathConfined(
+                    await nodeFs.realpath(uri.fsPath),
+                    `read of ${relPath}`,
+                );
+            } else {
+                const after = await this.captureLocalPathIdentitySnapshot(
+                    uri,
+                    `read of ${relPath}`,
+                );
+                if (
+                    !this.localPathIdentitySnapshotsEqual(before, after)
+                    || after.finalStat.dev!==String(descriptorStat.dev)
+                    || after.finalStat.ino!==String(descriptorStat.ino)
+                ) {
+                    throw new Error(
+                        `Local Replica read path changed during confinement validation: ${uri.fsPath}`,
+                    );
+                }
+            }
+            const descriptorStatAfter = await handle.stat({bigint: true});
+            if (
+                descriptorStatAfter.dev!==descriptorStat.dev
+                || descriptorStatAfter.ino!==descriptorStat.ino
+                || descriptorStatAfter.size!==descriptorStat.size
+                || descriptorStatAfter.mtimeNs!==descriptorStat.mtimeNs
+                || descriptorStatAfter.ctimeNs!==descriptorStat.ctimeNs
+            ) {
+                throw new Error(
+                    `Local Replica read target changed while bytes were read: ${uri.fsPath}`,
+                );
+            }
+            return content;
+        } finally {
+            await handle.close();
+        }
+    }
+
     private readLocalFile(uri: vscode.Uri): Thenable<Uint8Array> {
-        return vscode.workspace.fs.readFile(uri);
+        const relPath = this.relPathFromLocalFileUri(uri, 'read local file');
+        if (relPath===undefined) {
+            return Promise.reject(new Error(
+                `Local Replica read is outside the selected folder: ${uri.toString()}`,
+            ));
+        }
+        return this.readConfinedLocalFile(relPath, uri);
     }
 
     private async localTargetNeedsPush(relPath: string, localUri: vscode.Uri): Promise<'update' | 'delete' | undefined> {
         try {
-            const stat = await vscode.workspace.fs.stat(localUri);
+            const stat = await this.statConfinedLocalUri(
+                localUri,
+                `classification of ${relPath}`,
+            );
             if (stat.type===vscode.FileType.Directory) {
                 return this.syncManifest?.directories[relPath] ? undefined : 'update';
             }
@@ -3729,6 +6479,202 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 return 'delete';
             }
             return undefined;
+        }
+    }
+
+    private cancelPendingDescendantEvents(
+        action: 'push' | 'pull',
+        relPath: string,
+    ): void {
+        const pendingEvents = action==='push'
+            ? this.pendingLocalEvents
+            : this.pendingVfsEvents;
+        for (const [pendingPath, pending] of [...pendingEvents]) {
+            if (pendingPath===relPath || !this.isPathAtOrBelow(pendingPath, relPath)) {
+                continue;
+            }
+            clearTimeout(pending.timer);
+            pendingEvents.delete(pendingPath);
+        }
+    }
+
+    private async promoteDeleteToMissingTrackedDirectory(
+        action: 'push' | 'pull',
+        relPath: string,
+        generation = this.syncGeneration,
+    ): Promise<string> {
+        this.requireSyncSession(generation);
+        const parts = normalizeReplicaPath(relPath).split('/').filter(Boolean);
+        for (let depth=1; depth<=parts.length; depth++) {
+            const candidate = `/${parts.slice(0, depth).join('/')}`;
+            if (this.syncManifest?.directories[candidate]===undefined) {
+                continue;
+            }
+            const sourceUri = action==='push'
+                ? this.localUri(candidate)
+                : this.vfs.pathToUri(candidate);
+            try {
+                const stat = await vscode.workspace.fs.stat(sourceUri);
+                this.requireSyncSession(generation);
+                if (stat.type!==vscode.FileType.Directory) {
+                    return relPath;
+                }
+            } catch (error) {
+                if (!LocalReplicaSCMProvider.isFileNotFoundError(error)) {
+                    throw error;
+                }
+                this.cancelPendingDescendantEvents(action, candidate);
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [${action} delete coalesced] ` +
+                    `${relPath} -> ${candidate}`,
+                );
+                return candidate;
+            }
+        }
+        return relPath;
+    }
+
+    private async reconcileDirectoryDescendants(
+        action: 'push' | 'pull',
+        rootRelPath: string,
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        const directories: string[] = [];
+        const files: string[] = [];
+        const queue = [rootRelPath];
+        const visitedLocalDirectories = new Set<string>();
+        const localRootRealPath = action==='push' && this.baseUri.scheme==='file'
+            ? LocalReplicaSCMProvider.comparableFsPath(
+                await nodeFs.realpath(this.baseUri.fsPath),
+            )
+            : undefined;
+        const inspectLocalPath = async (
+            uri: vscode.Uri,
+        ): Promise<Awaited<ReturnType<typeof nodeFs.lstat>> | undefined> => {
+            if (action!=='push' || uri.scheme!=='file') {
+                return undefined;
+            }
+            let stat: Awaited<ReturnType<typeof nodeFs.lstat>>;
+            try {
+                stat = await nodeFs.lstat(uri.fsPath);
+            } catch (error) {
+                if (LocalReplicaSCMProvider.isFileNotFoundError(error)) {
+                    return undefined;
+                }
+                throw error;
+            }
+            if (stat.isSymbolicLink()) {
+                throw new Error(
+                    `Local Replica directory reconciliation refuses symbolic links: ${uri.fsPath}`,
+                );
+            }
+            const realPath = LocalReplicaSCMProvider.comparableFsPath(
+                await nodeFs.realpath(uri.fsPath),
+            );
+            if (localRootRealPath!==undefined) {
+                const relative = nodePath.relative(localRootRealPath, realPath);
+                if (
+                    relative==='..'
+                    || relative.startsWith(`..${nodePath.sep}`)
+                    || nodePath.isAbsolute(relative)
+                ) {
+                    throw new Error(
+                        `Local Replica directory reconciliation escaped the selected folder: ${uri.fsPath}`,
+                    );
+                }
+            }
+            return stat;
+        };
+        while (queue.length>0) {
+            const directoryPath = queue.shift()!;
+            const sourceUri = action==='push'
+                ? this.localUri(directoryPath)
+                : this.vfs.pathToUri(directoryPath);
+            if (action==='push') {
+                const directoryStat = await inspectLocalPath(sourceUri);
+                this.requireSyncSession(generation);
+                if (directoryStat===undefined) {
+                    continue;
+                }
+                if (!directoryStat.isDirectory()) {
+                    throw new Error(
+                        `Local Replica directory changed type during reconciliation: ${sourceUri.fsPath}`,
+                    );
+                }
+                const realPath = LocalReplicaSCMProvider.comparableFsPath(
+                    await nodeFs.realpath(sourceUri.fsPath),
+                );
+                if (visitedLocalDirectories.has(realPath)) {
+                    throw new Error(
+                        `Local Replica directory reconciliation encountered a directory cycle: ${sourceUri.fsPath}`,
+                    );
+                }
+                visitedLocalDirectories.add(realPath);
+            }
+            const entries = await vscode.workspace.fs.readDirectory(sourceUri);
+            this.requireSyncSession(generation);
+            for (const [name, type] of entries) {
+                const relPath = this.requireConfinedRelPath(
+                    `${directoryPath.replace(/\/+$/, '')}/${name}`,
+                    `${action} directory descendant reconciliation`,
+                );
+                if (
+                    this.matchIgnorePatterns(relPath)
+                    || this.matchIgnorePatterns(`${relPath}/`)
+                ) {
+                    continue;
+                }
+                const localStat = action==='push'
+                    ? await inspectLocalPath(this.localUri(relPath))
+                    : undefined;
+                this.requireSyncSession(generation);
+                if (action==='push' && localStat===undefined) {
+                    continue;
+                }
+                const isDirectory = localStat
+                    ? localStat.isDirectory()
+                    : (type & vscode.FileType.Directory)===vscode.FileType.Directory;
+                const isFile = localStat
+                    ? localStat.isFile()
+                    : (type & vscode.FileType.File)===vscode.FileType.File;
+                if (isDirectory) {
+                    directories.push(relPath);
+                    queue.push(relPath);
+                } else if (isFile) {
+                    files.push(relPath);
+                }
+            }
+        }
+
+        for (const relPath of [...directories, ...files]) {
+            this.requireSyncSession(generation);
+            const localUri = this.localUri(relPath);
+            const vfsUri = this.vfs.pathToUri(relPath);
+            const event = await this.enqueueSync(
+                relPath,
+                () => this.applySync(
+                    action,
+                    'update',
+                    relPath,
+                    action==='push' ? localUri : vfsUri,
+                    action==='push' ? vfsUri : localUri,
+                    {skipDirectoryDescendants: true},
+                    generation,
+                ),
+                generation,
+                true,
+            );
+            this.requireSyncSession(generation);
+            if (event===undefined) {
+                throw new Error(`Could not queue ${relPath} after ${rootRelPath}`);
+            }
+            if (event.outcome==='error' || event.outcome==='blocked') {
+                throw new Error(
+                    `Could not reconcile ${relPath} after ${rootRelPath}: ` +
+                    `${event.error ?? event.outcome}`,
+                );
+            }
         }
     }
 
@@ -4139,15 +7085,25 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return false;
     }
 
-    private setBypassCache(relPath: string, content?: Uint8Array, action?: 'push'|'pull') {
-        this.setBypassCacheDigest(relPath, contentDigest(content), action);
+    private setBypassCache(
+        relPath: string,
+        content?: Uint8Array,
+        action?: 'push'|'pull',
+        type: 'update'|'delete' = content===undefined ? 'delete' : 'update',
+    ) {
+        this.setBypassCacheDigest(relPath, contentDigest(content), action, type);
     }
 
-    private setBypassCacheDigest(relPath: string, hash: string, action?: 'push'|'pull') {
+    private setBypassCacheDigest(
+        relPath: string,
+        hash: string,
+        action?: 'push'|'pull',
+        type: 'update'|'delete' = hash===DELETE_DIGEST ? 'delete' : 'update',
+    ) {
         const key = normalizeReplicaPath(relPath);
         const date = Date.now();
         const cache = this.bypassCache.get(key) || [undefined,undefined];
-        const next = {date, hash};
+        const next = {date, hash, type};
         // A directional operation advances the synchronized digest for both
         // directions. Keeping the opposite direction's older digest would
         // let A(push) -> B(pull) -> A(push) look like a duplicate of the
@@ -4203,7 +7159,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private async manifestLocalStat(relPath: string): Promise<{size: number; mtime: number} | undefined> {
         try {
-            const stat = await vscode.workspace.fs.stat(this.localUri(relPath));
+            const stat = await this.statConfinedLocalUri(
+                this.localUri(relPath),
+                `manifest inspection of ${relPath}`,
+            );
             if (stat.type!==vscode.FileType.File) { return undefined; }
             return {size: stat.size, mtime: stat.mtime};
         } catch {
@@ -4260,9 +7219,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         let localContent: Uint8Array;
         let localStatAfter: vscode.FileStat;
         try {
-            localStatBefore = await vscode.workspace.fs.stat(this.localUri(relPath));
-            localContent = await vscode.workspace.fs.readFile(this.localUri(relPath));
-            localStatAfter = await vscode.workspace.fs.stat(this.localUri(relPath));
+            const localUri = this.localUri(relPath);
+            localStatBefore = await this.statConfinedLocalUri(
+                localUri,
+                `manifest snapshot of ${relPath}`,
+            );
+            localContent = await this.readConfinedLocalFile(relPath, localUri);
+            localStatAfter = await this.statConfinedLocalUri(
+                localUri,
+                `manifest snapshot of ${relPath}`,
+            );
             this.requireSyncSession(generation);
         } catch {
             if (!this.isSyncSessionActive(generation)) {
@@ -4427,6 +7393,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private shouldPropagate(
         action: 'push'|'pull',
+        type: 'update'|'delete',
         relPath: string,
         content?: Uint8Array,
         options?: ApplySyncOptions,
@@ -4443,7 +7410,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     `${new Date().toISOString()} [push forced:${options.reason ?? 'manual'}] ${relPath} ` +
                     `(bypassing echo suppression)`,
                 );
-                this.setBypassCache(key, content, action);
+                this.setBypassCache(key, content, action, type);
                 return true;
             }
             // Same-direction match: the last operation in THIS direction
@@ -4454,10 +7421,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const matchesCurrentBaseline = content===undefined
                 || this.isContentKnownSynced(key, content)
                 || this.syncManifest?.directories[key]!==undefined;
-            if (ownCache?.hash===thisHash && matchesCurrentBaseline) {
+            if (
+                ownCache?.hash===thisHash
+                && ownCache.type===type
+                && matchesCurrentBaseline
+            ) {
                 getOutputChannel().appendLine(
                     `${new Date().toISOString()} [${action} suppressed:own-echo] ${relPath} ` +
-                    `(age=${now-ownCache.date}ms, hash unchanged since prior ${action})`,
+                    `(age=${now-ownCache.date}ms, ${type} hash unchanged since prior ${action})`,
                 );
                 return false;
             }
@@ -4465,16 +7436,20 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             // bytes — this fire is the watcher reacting to that write. Only
             // honour while fresh so a stale divergent cache can't swallow a
             // later undo/redo save back to that state.
-            if (oppositeCache?.hash===thisHash && now-oppositeCache.date<ECHO_WINDOW_MS) {
+            if (
+                oppositeCache?.hash===thisHash
+                && oppositeCache.type===type
+                && now-oppositeCache.date<ECHO_WINDOW_MS
+            ) {
                 getOutputChannel().appendLine(
                     `${new Date().toISOString()} [${action} suppressed:cross-echo] ${relPath} ` +
-                    `(age=${now-oppositeCache.date}ms within ${ECHO_WINDOW_MS}ms window)`,
+                    `(age=${now-oppositeCache.date}ms, ${type} within ${ECHO_WINDOW_MS}ms window)`,
                 );
-                this.setBypassCache(key, content, action);
+                this.setBypassCache(key, content, action, type);
                 return false;
             }
         }
-        this.setBypassCache(key, content, action);
+        this.setBypassCache(key, content, action, type);
         return true;
     }
 
@@ -4482,7 +7457,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         relPath: string,
         task: () => Promise<T>,
         generation = this.syncGeneration,
+        acceptedBeforeRemoval = false,
     ): Promise<T | undefined> {
+        if (
+            this.removalPendingGeneration===generation
+            && !acceptedBeforeRemoval
+        ) {
+            return Promise.resolve(undefined);
+        }
         const previous = this.syncQueues.get(relPath) ?? Promise.resolve();
         const next = previous
             .catch(() => undefined)
@@ -4501,6 +7483,31 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             });
         this.syncQueues.set(relPath, next);
         return next;
+    }
+
+    private deferAcceptedSync<T>(
+        relPath: string,
+        task: () => Promise<T>,
+        generation: number,
+    ): void {
+        let deferred!: Promise<void>;
+        deferred = new Promise<void>(resolve => {
+            setTimeout(() => {
+                if (!this.isSyncSessionActive(generation)) {
+                    resolve();
+                    return;
+                }
+                void this.enqueueSync(
+                    relPath,
+                    task,
+                    generation,
+                    true,
+                ).then(() => resolve(), () => resolve());
+            }, 0);
+        }).finally(() => {
+            this.deferredSyncWork.delete(deferred);
+        });
+        this.deferredSyncWork.add(deferred);
     }
 
     private async overwrite(
@@ -5348,7 +8355,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return true;
         }
         // synchronization propagation check
-        if (!this.shouldPropagate(action, relPath, content, options)) {
+        if (!this.shouldPropagate(action, type, relPath, content, options)) {
             return true;
         }
         // otherwise, log the synchronization
@@ -5702,13 +8709,41 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         let outcome: 'success' | 'error' | 'blocked' | 'suppressed' = 'success';
         let errorMessage: string | undefined;
         let authoritativePullCompleted = false;
+        let resolveConflict = false;
+        let conflictResolutionProof: ConflictResolutionProof | undefined;
 
         try {
             await (async () => {
+            const conflictPath = action==='push'
+                ? this.conflictPathForPushTarget(relPath)
+                : undefined;
+            if (
+                action==='push'
+                && conflictPath!==undefined
+                && (
+                    options.resolveConflict===true
+                    || await this.hasLocalConflictRevision(conflictPath, generation)
+                )
+            ) {
+                conflictResolutionProof = await this.prepareConflictResolutionProof(
+                    conflictPath,
+                    relPath,
+                    generation,
+                    options.acceptUnchangedLocalConflictState===true,
+                );
+                resolveConflict = conflictResolutionProof!==undefined;
+                if (resolveConflict) {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [conflict resolution verified] ${relPath} ` +
+                        `(conflict=${conflictPath}): ` +
+                        'the local decision was reviewed and the recorded Overleaf revision is still current',
+                    );
+                }
+            }
             if (
                 action==='push'
                 && this.touchesSyncConflict(relPath)
-                && !options.resolveConflict
+                && !resolveConflict
             ) {
                 getOutputChannel().appendLine(
                     `${new Date().toISOString()} [push blocked:unresolved-conflict] ${relPath}`,
@@ -5823,7 +8858,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 // baseCache and no seenLocalEntities trace), the local-watcher
                 // event is an echo, not user intent.
                 if (action==='push') {
-                    if (this.failedInitialPulls.has(relPath) && !options.resolveConflict) {
+                    if (this.failedInitialPulls.has(relPath)) {
                         getOutputChannel().appendLine(
                             `${new Date().toISOString()} [push delete blocked] ${relPath}: initial pull failed; refusing to mutate remote`,
                         );
@@ -5846,7 +8881,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         outcome = 'suppressed';
                         return;
                     }
-                    remoteDeleteState = await this.captureRemotePathRevision(relPath, generation);
+                    remoteDeleteState = resolveConflict
+                        ? conflictResolutionProof?.remoteState
+                        : await this.captureRemotePathRevision(relPath, generation);
+                    if (!remoteDeleteState) {
+                        outcome = 'blocked';
+                        errorMessage = 'missing verified remote conflict revision';
+                        return;
+                    }
                     if (remoteDeleteState.kind==='missing') {
                         targetAlreadyMissing = true;
                     } else {
@@ -5867,7 +8909,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 errorMessage = 'local folder delete contains ignored remote content';
                                 return;
                             }
-                            if (await this.remoteDirectoryHasChanges(relPath, generation)) {
+                            if (
+                                !resolveConflict
+                                && await this.remoteDirectoryHasChanges(relPath, generation)
+                            ) {
                                 this.requireSyncSession(generation);
                                 await this.markSyncConflict(
                                     relPath,
@@ -5886,7 +8931,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 throw error;
                             }
                         }
-                    } else if (!targetAlreadyMissing && previousBaseContent!==undefined) {
+                    } else if (
+                        !resolveConflict
+                        && !targetAlreadyMissing
+                        && previousBaseContent!==undefined
+                    ) {
                         const remoteContent = remoteDeleteState.content;
                         if (remoteContent!==undefined && !bytesEqual(remoteContent, previousBaseContent)) {
                             await this.markSyncConflict(
@@ -6065,7 +9114,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (
                     action==='push'
                     && this.failedInitialPulls.has(relPath)
-                    && !options.resolveConflict
                 ) {
                     getOutputChannel().appendLine(
                         `${new Date().toISOString()} [push update blocked] ${relPath}: initial pull failed; refusing to mutate remote`,
@@ -6077,9 +9125,25 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     errorMessage = 'initial pull failed';
                     return;
                 }
-                const stat = await vscode.workspace.fs.stat(fromUri);
+                const stat = action==='push'
+                    ? await this.statConfinedLocalUri(
+                        fromUri,
+                        `push classification of ${relPath}`,
+                    )
+                    : await vscode.workspace.fs.stat(fromUri);
                 this.requireSyncSession(generation);
-                if (stat.type===vscode.FileType.Directory) {
+                const isRemotePull = action==='pull';
+                const isDirectory = LocalReplicaSCMProvider.isSyncStatType(
+                    stat,
+                    vscode.FileType.Directory,
+                    isRemotePull,
+                );
+                const isFile = LocalReplicaSCMProvider.isSyncStatType(
+                    stat,
+                    vscode.FileType.File,
+                    isRemotePull,
+                );
+                if (isDirectory) {
                     const newContent = new Uint8Array();
                     if (this.bypassSync(action, type, relPath, newContent, options)) {
                         outcome = 'suppressed';
@@ -6133,8 +9197,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     this.locallyDivergedPaths.delete(relPath);
                     this.recordSyncManifestDirectory(relPath);
                     await this.persistSyncManifest(false, generation);
+                    if (
+                        !options.skipDirectoryDescendants
+                        && !options.resolveConflict
+                    ) {
+                        await this.reconcileDirectoryDescendants(
+                            action,
+                            relPath,
+                            generation,
+                        );
+                    }
                 }
-                else if (stat.type===vscode.FileType.File) {
+                else if (isFile) {
                     try {
                         // Pull reads go through the retrying helper since
                         // transient binary failures are the trigger for the
@@ -6142,7 +9216,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         // are local-disk and need no retry.
                         let newContent = action==='pull'
                             ? await this.pullRemoteFile(relPath, fromUri, generation)
-                            : await vscode.workspace.fs.readFile(fromUri);
+                            : await this.readConfinedLocalFile(relPath, fromUri);
                         this.requireSyncSession(generation);
                         if (action==='pull') {
                             authoritativePullCompleted = true;
@@ -6177,7 +9251,25 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 return;
                             }
 
-                            const baseContent = options.resolveConflict
+                            if (resolveConflict) {
+                                const verifiedRemoteState = conflictResolutionProof?.remoteState;
+                                if (!verifiedRemoteState) {
+                                    outcome = 'blocked';
+                                    errorMessage = 'missing verified remote conflict revision';
+                                    return;
+                                }
+                                if (verifiedRemoteState.kind==='file') {
+                                    remoteBaselineForPush = verifiedRemoteState.content;
+                                } else if (verifiedRemoteState.kind==='missing') {
+                                    expectedRemoteMissingForPush = true;
+                                } else {
+                                    outcome = 'blocked';
+                                    errorMessage = 'conflicting Overleaf path is not a file';
+                                    return;
+                                }
+                            }
+
+                            const baseContent = resolveConflict
                                 ? undefined
                                 : this.baseCache[relPath]
                                     ?? this.manifestBaseContent(this.syncManifest?.files[relPath]);
@@ -6252,7 +9344,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     newContent = mergedContent;
                                     writeMergedContentBackToLocal = true;
                                 }
-                            } else if (!options.resolveConflict) {
+                            } else if (!resolveConflict) {
                                 const remoteState = await this.captureRemotePathRevision(
                                     relPath,
                                     generation,
@@ -6524,14 +9616,25 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             // Push with bounded retry so a transient socket blip doesn't
                             // silently lose the accepted edit.
                             try {
-                                const pushedContent = await this.pushWithRetry(
-                                    relPath,
-                                    toUri,
-                                    newContent,
-                                    generation,
-                                    remoteBaselineForPush,
-                                    expectedRemoteMissingForPush,
-                                );
+                                const pushedContent = (
+                                    this.isLikelyBinaryRelPath(relPath)
+                                    && remoteBaselineForPush!==undefined
+                                )
+                                    ? await this.guardedReplaceRemoteBinary(
+                                        relPath,
+                                        toUri,
+                                        newContent,
+                                        remoteBaselineForPush,
+                                        generation,
+                                    )
+                                    : await this.pushWithRetry(
+                                        relPath,
+                                        toUri,
+                                        newContent,
+                                        generation,
+                                        remoteBaselineForPush,
+                                        expectedRemoteMissingForPush,
+                                    );
                                 if (!bytesEqual(pushedContent, newContent)) {
                                     newContent = pushedContent;
                                     writeMergedContentBackToLocal = true;
@@ -6639,7 +9742,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 localUri: fromUri,
                                 relPath,
                                 type,
-                                content: await Promise.resolve(vscode.workspace.fs.readFile(fromUri)).catch(() => undefined),
+                                content: await this.readConfinedLocalFile(relPath, fromUri)
+                                    .catch(() => undefined),
                             });
                         }
                         console.error(error);
@@ -6667,7 +9771,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     relPath,
                     type,
                     content: type==='update'
-                        ? await Promise.resolve(vscode.workspace.fs.readFile(fromUri)).catch(() => undefined)
+                        ? await this.readConfinedLocalFile(relPath, fromUri)
+                            .catch(() => undefined)
                         : undefined,
                 });
             }
@@ -6694,10 +9799,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             try {
                 if (
                     action==='push'
-                    && options.resolveConflict
-                    && !options.deferConflictResolution
+                    && resolveConflict
+                    && conflictResolutionProof
+                    && (
+                        options.deferConflictResolution
+                        || conflictResolutionProof.conflictPath!==relPath
+                    )
                 ) {
-                    this.clearFailedInitialPullAfterAuthoritativeSync(relPath, generation);
+                    await this.refreshConflictRemoteProof(
+                        conflictResolutionProof.conflictPath,
+                        generation,
+                    );
                 }
                 if (!options.deferConflictResolution) {
                     await this.clearSyncConflictAfterSuccess(relPath, generation);
@@ -6795,6 +9907,48 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         );
                         return undefined;
                     }
+                    if (currentType==='delete') {
+                        const promotedRelPath = await this.promoteDeleteToMissingTrackedDirectory(
+                            'pull',
+                            relPath,
+                            generation,
+                        );
+                        if (promotedRelPath!==relPath) {
+                            const promotedVfsUri = this.vfs.pathToUri(promotedRelPath);
+                            const promotedLocalUri = this.localUri(promotedRelPath);
+                            this.deferAcceptedSync(
+                                promotedRelPath,
+                                async () => {
+                                    const promotedType = await this.remoteTargetEventType(
+                                        promotedVfsUri,
+                                    );
+                                    this.requireSyncSession(generation);
+                                    if (promotedType!=='delete') {
+                                        return this.applySync(
+                                            'pull',
+                                            promotedType,
+                                            promotedRelPath,
+                                            promotedVfsUri,
+                                            promotedLocalUri,
+                                            {},
+                                            generation,
+                                        );
+                                    }
+                                    return this.applySync(
+                                        'pull',
+                                        'delete',
+                                        promotedRelPath,
+                                        promotedVfsUri,
+                                        promotedLocalUri,
+                                        {},
+                                        generation,
+                                    );
+                                },
+                                generation,
+                            );
+                            return undefined;
+                        }
+                    }
                     return this.applySync(
                         'pull',
                         currentType,
@@ -6825,9 +9979,158 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
-    private async syncToVFS(localUri: vscode.Uri, type: 'update'|'delete') {
-        if (!this.isSyncSessionActive()) { return; }
+    private enqueueLocalPendingEvent(
+        relPath: string,
+        pending: Pick<PendingEvent, 'latestType' | 'latestUri'>,
+        generation: number,
+        acceptedBeforeRemoval = false,
+    ): Promise<unknown> {
+        const vfsUri = this.vfs.pathToUri(relPath);
+        const classify = async (
+            targetRelPath: string,
+            targetLocalUri: vscode.Uri,
+            observedType: 'update' | 'delete',
+        ): Promise<'update' | 'delete' | undefined> => {
+            try {
+                const removalSensitive = acceptedBeforeRemoval
+                    || this.removalPendingGeneration===generation;
+                const currentType = removalSensitive
+                    ? await this.withRetry(
+                        'push',
+                        targetRelPath,
+                        () => this.localTargetNeedsPush(
+                            targetRelPath,
+                            targetLocalUri,
+                        ),
+                        {
+                            delays:
+                                LocalReplicaSCMProvider.localClassificationRetryDelays,
+                            generation,
+                        },
+                    )
+                    : await this.localTargetNeedsPush(
+                        targetRelPath,
+                        targetLocalUri,
+                    );
+                this.removalAcceptedSyncErrors.delete(targetRelPath);
+                return currentType;
+            } catch (error) {
+                this.retainLocalPushIntentAfterClassificationFailure(
+                    targetRelPath,
+                    targetLocalUri,
+                    observedType,
+                    error,
+                    generation,
+                );
+                if (
+                    acceptedBeforeRemoval
+                    || this.removalPendingGeneration===generation
+                ) {
+                    this.removalAcceptedSyncErrors.set(targetRelPath, {
+                        generation,
+                        error: formatUnknownError(error),
+                    });
+                }
+                throw error;
+            }
+        };
+        return this.enqueueSync(
+            relPath,
+            async () => {
+                let currentType: 'update' | 'delete' | undefined;
+                try {
+                    currentType = await classify(
+                        relPath,
+                        pending.latestUri,
+                        pending.latestType,
+                    );
+                    this.requireSyncSession(generation);
+                } catch {
+                    return undefined;
+                }
+                if (currentType==='delete') {
+                    const promotedRelPath = await this.promoteDeleteToMissingTrackedDirectory(
+                        'push',
+                        relPath,
+                        generation,
+                    );
+                    if (promotedRelPath!==relPath) {
+                        const promotedLocalUri = this.localUri(promotedRelPath);
+                        const promotedVfsUri = this.vfs.pathToUri(promotedRelPath);
+                        this.deferAcceptedSync(
+                            promotedRelPath,
+                            async () => {
+                                let promotedType: 'update' | 'delete' | undefined;
+                                try {
+                                    promotedType = await classify(
+                                        promotedRelPath,
+                                        promotedLocalUri,
+                                        'delete',
+                                    );
+                                } catch {
+                                    return undefined;
+                                }
+                                this.requireSyncSession(generation);
+                                if (promotedType===undefined) {
+                                    return undefined;
+                                }
+                                return this.applySync(
+                                    'push',
+                                    promotedType,
+                                    promotedRelPath,
+                                    promotedLocalUri,
+                                    promotedVfsUri,
+                                    {},
+                                    generation,
+                                );
+                            },
+                            generation,
+                        );
+                        return undefined;
+                    }
+                }
+                if (currentType===undefined) {
+                    this.locallyDivergedPaths.delete(relPath);
+                    return undefined;
+                }
+                return this.applySync(
+                    'push',
+                    currentType,
+                    relPath,
+                    pending.latestUri,
+                    vfsUri,
+                    {},
+                    generation,
+                );
+            },
+            generation,
+            acceptedBeforeRemoval,
+        );
+    }
+
+    private syncToVFS(
+        localUri: vscode.Uri,
+        type: 'update'|'delete',
+    ): Promise<void> {
+        if (!this.isSyncSessionActive()) { return Promise.resolve(); }
         const generation = this.syncGeneration;
+        let tracked!: Promise<void>;
+        tracked = this.syncToVFSAccepted(localUri, type, generation)
+            .catch(error => {
+                console.error(error);
+            })
+            .finally(() => {
+                this.preQueueSyncWork.delete(tracked);
+            });
+        this.preQueueSyncWork.add(tracked);
+        return tracked;
+    }
+
+    private async syncToVFSAccepted(
+        localUri: vscode.Uri,
+        type: 'update'|'delete',
+        generation: number,
+    ): Promise<void> {
         if (isLocalReplicaMetadataUri(localUri, this.baseUri)) {
             return;
         }
@@ -6847,6 +10150,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // work that bypassSync would reject anyway.
         if (this.matchIgnorePatterns(relPath)) { return; }
 
+        if (this.removalPendingGeneration===generation) {
+            await this.enqueueLocalPendingEvent(
+                relPath,
+                {latestType: type, latestUri: localUri},
+                generation,
+                true,
+            );
+            return;
+        }
+
         // Debounce local watcher events too. Editors save by write-temp+
         // rename which can fire Change+Create+Change for the same file in
         // milliseconds; coalescing means one applySync per intent.
@@ -6859,43 +10172,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const pending = this.pendingLocalEvents.get(relPath);
             if (!pending) { return; }
             this.pendingLocalEvents.delete(relPath);
-            const vfsUri = this.vfs.pathToUri(relPath);
-            void this.enqueueSync(
-                relPath,
-                async () => {
-                    let currentType: 'update' | 'delete' | undefined;
-                    try {
-                        currentType = await this.localTargetNeedsPush(
-                            relPath,
-                            pending.latestUri,
-                        );
-                        this.requireSyncSession(generation);
-                    } catch (error) {
-                        this.retainLocalPushIntentAfterClassificationFailure(
-                            relPath,
-                            pending.latestUri,
-                            pending.latestType,
-                            error,
-                            generation,
-                        );
-                        return undefined;
-                    }
-                    if (currentType===undefined) {
-                        this.locallyDivergedPaths.delete(relPath);
-                        return undefined;
-                    }
-                    return this.applySync(
-                        'push',
-                        currentType,
-                        relPath,
-                        pending.latestUri,
-                        vfsUri,
-                        {},
-                        generation,
-                    );
-                },
-                generation,
-            );
+            void this.enqueueLocalPendingEvent(relPath, pending, generation);
         }, delay);
         this.pendingLocalEvents.set(relPath, { timer, firstEventAt, latestType: type, latestUri: localUri });
     }
@@ -6924,6 +10201,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             await this.recoverInterruptedLocalOperations(activeGeneration);
             if (!this.isSyncSessionActive(activeGeneration)) { return false; }
             await this.recoverInterruptedRemoteDeletes(activeGeneration);
+            await this.hydrateMissingConflictRemoteProofs(activeGeneration);
             const completed = await this.overwrite('/', initializationOptions, activeGeneration);
             if (completed!==true || !this.isSyncSessionActive(activeGeneration)) { return false; }
         } catch (error) {
@@ -7663,15 +10941,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     readFile(relPath: string): Thenable<Uint8Array|undefined> {
-        let uri: vscode.Uri;
         try {
-            uri = this.localUri(relPath);
+            this.localUri(relPath);
         } catch {
             return Promise.resolve(undefined);
         }
         return new Promise(async (resolve, reject) => {
             try {
-                const content = await vscode.workspace.fs.readFile(uri);
+                const content = await this.readConfinedLocalFile(relPath);
                 resolve(content);
             } catch (error) {
                 resolve(undefined);
@@ -7680,13 +10957,23 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     get triggers(): Promise<vscode.Disposable[]> {
-        return this.initWatch().then((watches) => {
+        if (this.activationPromise) {
+            return this.activationPromise;
+        }
+        const activation = this.initWatch().then((watches) => {
             if (this.vfsWatcher===undefined) {
                 // initWatch should always create the vfsWatcher; if not, bail.
                 return [];
             }
             return [this.vfsWatcher, ...watches];
         });
+        const trackedActivation = activation.finally(() => {
+            if (this.activationPromise===trackedActivation) {
+                this.activationPromise = undefined;
+            }
+        });
+        this.activationPromise = trackedActivation;
+        return trackedActivation;
     }
 
     public static get baseUriInputBox(): vscode.QuickPick<vscode.QuickPickItem> {
@@ -7790,6 +11077,43 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     get settingItems(): SettingItem[] {
         return [
+            {
+                label: vscode.l10n.t('Resolve a sync conflict using local state ...'),
+                callback: async () => {
+                    const conflicts = this.getSyncConflictPaths();
+                    if (conflicts.length===0) {
+                        vscode.window.showInformationMessage(
+                            vscode.l10n.t('There are no Local Replica sync conflicts.'),
+                        );
+                        return;
+                    }
+                    const relPath = await vscode.window.showQuickPick(conflicts, {
+                        ignoreFocusOut: true,
+                        title: vscode.l10n.t('Select a conflict to resolve using the current local state'),
+                    });
+                    if (!relPath) { return; }
+                    const confirmation = await vscode.window.showWarningMessage(
+                        vscode.l10n.t(
+                            'Apply the current local state for "{relPath}" to Overleaf? This may overwrite or delete the remote path.',
+                            {relPath},
+                        ),
+                        {modal: true},
+                        vscode.l10n.t('Apply Local State'),
+                    );
+                    if (confirmation!==vscode.l10n.t('Apply Local State')) {
+                        return;
+                    }
+                    const resolved = await this.resolveConflictWithLocalState(relPath);
+                    if (!resolved) {
+                        vscode.window.showWarningMessage(
+                            vscode.l10n.t(
+                                'The conflict for "{relPath}" could not be resolved because its state changed. Review it again.',
+                                {relPath},
+                            ),
+                        );
+                    }
+                },
+            },
             // configure ignore patterns
             {
                 label: vscode.l10n.t('Configure sync ignore patterns ...'),

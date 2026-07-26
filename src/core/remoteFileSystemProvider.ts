@@ -1,13 +1,16 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as vscode from 'vscode';
 import DiffMatchPatch = require('diff-match-patch');
-import { BaseAPI, MemberEntity, ProjectSettingsSchema } from '../api/base';
+import { BaseAPI, Identity, MemberEntity, ProjectSettingsSchema } from '../api/base';
 import { SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { OUTPUT_FOLDER_NAME, PREFETCH_COMMAND, ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { ClientManager } from '../collaboration/clientManager';
 import { EventBus } from '../utils/eventBus';
-import { SCMCollectionProvider } from '../scm/scmCollectionProvider';
+import {
+    SCMCollectionProvider,
+    removeDetachedLocalReplicaSCM,
+} from '../scm/scmCollectionProvider';
 import { ExtendedBaseAPI, ProjectLinkedFileProvider, UrlLinkedFileProvider } from '../api/extendedBase';
 import { canonicalizeOverleafUri, normalizeOverleafQuery } from '../utils/overleafUri';
 import {
@@ -126,6 +129,10 @@ export function vfsProjectKey(uri: vscode.Uri) {
 
 export type VFSConnectionState = 'initial' | 'connected' | 'reconnecting' | 'disconnected';
 
+interface ActivateProjectOptions {
+    restorePersistedSCMs?: boolean;
+}
+
 export class RemoteDocumentMergeConflictError extends Error {}
 export class RemoteDocumentWriteAmbiguousError extends Error {}
 export class RemoteMutationRejectedError extends Error {
@@ -175,7 +182,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     private readonly documentCollaboratorRevisions = new Map<string, number>();
     private readonly pendingDocumentWrites = new Map<string, PendingDocumentWrite>();
     private readonly documentInDoubtSenderVersions = new Map<string, number[]>();
+    private readonly sessionIdentity: Identity;
     private disposed = false;
+    private restorePersistedSCMsOnManagerCreation = true;
     private static readonly documentAppliedTimeoutMs = 5000;
 
     // Connection state is useful for SCM and UI layers: we don't want to trust
@@ -207,6 +216,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.clientManagerItem = undefined;
             // dispose all triggers of scmCollection
             this.scmCollectionItem?.triggers.forEach((trigger) => trigger.dispose());
+            this.scmCollectionItem?.collection.dispose();
             this.scmCollectionItem = undefined;
             this.remoteWatchDisposable?.dispose();
             this.remoteWatchDisposable = undefined;
@@ -235,10 +245,16 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.context = context;
         this.notify = notify;
 
-        const res = GlobalStateManager.initSocketIOAPI(this.context, this.serverName, projectId);
+        const res = GlobalStateManager.initSocketIOAPI(
+            this.context,
+            this.serverName,
+            projectId,
+            userId,
+        );
         if (res) {
             this.api = res.api;
             this.socket = res.socket;
+            this.sessionIdentity = res.identity;
         } else {
             throw new Error( vscode.l10n.t('Cannot init SocketIOAPI for {serverName}', {serverName}) );
         }
@@ -272,6 +288,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async ensureConnectedForWrite(): Promise<void> {
+        this.requireCurrentSession();
         if (this.connectionState==='connected') {
             return;
         }
@@ -282,6 +299,25 @@ export class VirtualFileSystem extends vscode.Disposable {
         await this.reconnect('before remote write');
     }
 
+    private requireCurrentSession(): Identity {
+        if (this.disposed) {
+            throw vscode.FileSystemError.Unavailable(
+                `Overleaf project is disposed: ${this.origin.toString()}`,
+            );
+        }
+        try {
+            return GlobalStateManager.requireAuthenticatedIdentity(
+                this.context,
+                this.serverName,
+                this.userId,
+                this.sessionIdentity,
+            );
+        } catch (error) {
+            this.dispose();
+            throw error;
+        }
+    }
+
     private setConnectionState(next: VFSConnectionState) {
         if (this.disposed) { return; }
         if (this._connectionState===next) { return; }
@@ -289,10 +325,25 @@ export class VirtualFileSystem extends vscode.Disposable {
         this._onDidChangeConnectionEmitter.fire(next);
     }
 
+    private acceptRemoteEvent(): boolean {
+        if (this.disposed) { return false; }
+        try {
+            this.requireCurrentSession();
+            return true;
+        } catch (error) {
+            console.warn(
+                `Discarding an event from a stale Overleaf session for ${this.origin.toString()}:`,
+                error,
+            );
+            return false;
+        }
+    }
+
     async init() : Promise<ProjectEntity> {
         if (this.disposed) {
             throw vscode.FileSystemError.Unavailable(`Overleaf project is disposed: ${this.origin.toString()}`);
         }
+        this.requireCurrentSession();
         if (this.root) {
             this.ensureActiveManagers();
             return Promise.resolve(this.root);
@@ -302,6 +353,13 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.initializing = this.initializingPromise;
         }
         return this.initializing;
+    }
+
+    configureInitialSCMRestore(restorePersistedSCMs: boolean) {
+        if (this.scmCollectionItem) {
+            return;
+        }
+        this.restorePersistedSCMsOnManagerCreation = restorePersistedSCMs;
     }
 
     private ensureActiveManagers(force = false) {
@@ -322,7 +380,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             };
         }
         if (!this.scmCollectionItem) {
-            const scmCollection = new SCMCollectionProvider(this, this.context);
+            const scmCollection = new SCMCollectionProvider(this, this.context, {
+                restorePersistedSCMs: this.restorePersistedSCMsOnManagerCreation,
+            });
             this.scmCollectionItem = {
                 collection: scmCollection,
                 triggers: scmCollection.triggers,
@@ -374,18 +434,13 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.remoteWatch();
         this.root = undefined;
         return this.socket.joinProject(this.projectId).then(async (project) => {
-            if (this.disposed) {
-                throw vscode.FileSystemError.Unavailable(`Overleaf project is disposed: ${this.origin.toString()}`);
-            }
+            this.requireCurrentSession();
             // fetch project settings
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
-            if (this.disposed) {
-                throw vscode.FileSystemError.Unavailable(`Overleaf project is disposed: ${this.origin.toString()}`);
-            }
-            project.settings = (await this.api.getProjectSettings(identity, this.projectId)).settings!;
-            if (this.disposed) {
-                throw vscode.FileSystemError.Unavailable(`Overleaf project is disposed: ${this.origin.toString()}`);
-            }
+            const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
+            this.requireCurrentSession();
+            const settingsResponse = await this.api.getProjectSettings(identity, this.projectId);
+            this.requireCurrentSession();
+            project.settings = settingsResponse.settings!;
             this.root = project;
             this.retryConnection = 0;
             this.lastConnectionError = undefined;
@@ -454,15 +509,21 @@ export class VirtualFileSystem extends vscode.Disposable {
         return {parentFolder, fileName, fileEntity, fileType, fileId};
     }
 
-    _resolveById(entityId: string, root?: FolderEntity, path?:string):{
+    _resolveById(
+        entityId: string,
+        root?: FolderEntity,
+        path?: string,
+        parentFolder?: FolderEntity,
+    ): {
         parentFolder: FolderEntity, fileEntity: FileEntity, fileType:FileType, path:string
     } | undefined {
         root = root || this.root?.rootFolder[0];
         if (!root) { return undefined; }
         path = path || '/';
+        parentFolder = parentFolder || root;
 
         if (root._id === entityId) {
-            return {parentFolder: root, fileType: 'folder', fileEntity: root, path};
+            return {parentFolder, fileType: 'folder', fileEntity: root, path};
         } else {
             // search files in root
             for (const _type of Object.keys(FolderKeys)) {
@@ -475,7 +536,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
             // recursive search
             for (const folder of root.folders) {
-                const res = this._resolveById(entityId, folder, path+folder.name+'/');
+                const res = this._resolveById(entityId, folder, path+folder.name+'/', root);
                 if (res) { return res; }
             }
         }
@@ -571,7 +632,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         this.remoteWatchDisposable?.dispose();
         this.remoteWatchDisposable = this.socket.updateEventHandlers({
             onDisconnected: () => {
-                if (this.disposed) { return; }
+                if (!this.acceptRemoteEvent()) { return; }
                 if (this.root===undefined) { return; } // bypass the first initialization
                 console.log("Disconnected");
                 this.setConnectionState('reconnecting');
@@ -579,11 +640,13 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.initializing = this.initializingPromise;
             },
             onConnectionAccepted: (publicId:string) => {
+                if (!this.acceptRemoteEvent()) { return; }
                 this.retryConnection = 0;
                 this.publicId = publicId;
                 this.setConnectionState('connected');
             },
             onFileCreated: (parentFolderId:string, type:FileType, entity:FileEntity) => {
+                if (!this.acceptRemoteEvent()) { return; }
                 const res = this._resolveById(parentFolderId);
                 if (res) {
                     const {fileEntity,path} = res;
@@ -595,6 +658,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             },
             onFileRenamed: (entityId:string, newName:string) => {
+                if (!this.acceptRemoteEvent()) { return; }
                 const res = this._resolveById(entityId);
                 if (res) {
                     const {fileEntity} = res;
@@ -612,6 +676,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             },
             onFileRemoved: (entityId:string) => {
+                if (!this.acceptRemoteEvent()) { return; }
                 const res = this._resolveById(entityId);
                 if (res) {
                     const {parentFolder, fileType, fileEntity} = res;
@@ -622,6 +687,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             },
             onFileMoved: (entityId:string, folderId:string) => {
+                if (!this.acceptRemoteEvent()) { return; }
                 const oldPath = this._resolveById(entityId);
                 const newPath = this._resolveById(folderId);
                 if (oldPath && newPath) {
@@ -639,21 +705,25 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             },
             onFileChanged: (update:UpdateSchema) => {
+                if (!this.acceptRemoteEvent()) { return; }
                 this.applyRemoteDocumentUpdate(update);
             },
             onSpellCheckLanguageUpdated: (language:string) => {
+                if (!this.acceptRemoteEvent()) { return; }
                 if (this.root) {
                     this.root.spellCheckLanguage = language;
                     EventBus.fire('spellCheckLanguageUpdateEvent', {language});
                 }
             },
             onCompilerUpdated: (compiler:string) => {
+                if (!this.acceptRemoteEvent()) { return; }
                 if (this.root) {
                     this.root.compiler = compiler;
                     EventBus.fire('compilerUpdateEvent', {compiler});
                 }
             },
             onRootDocUpdated: (rootDocId:string) => {
+                if (!this.acceptRemoteEvent()) { return; }
                 //NOTE: do not sync rootDocId
                 // if (this.root) {
                 //     this.root.rootDoc_id = rootDocId;
@@ -691,6 +761,27 @@ export class VirtualFileSystem extends vscode.Disposable {
             throw new Error('Active Local Replica manager is not available.');
         }
         await collection.flushLocalReplicaBeforeCompile(localUris, activeReplicaRoot);
+    }
+
+    public async removeLocalReplicaSCM(
+        scmKey: string,
+        baseUri: vscode.Uri,
+    ): Promise<void> {
+        const collection = this.scmCollectionItem?.collection;
+        if (collection) {
+            await collection.removeLocalReplicaSCM(scmKey, baseUri);
+        } else {
+            const detachedCollection = new SCMCollectionProvider(
+                this,
+                this.context,
+                {restorePersistedSCMs: false},
+            );
+            try {
+                await detachedCollection.removeLocalReplicaSCM(scmKey, baseUri);
+            } finally {
+                detachedCollection.dispose();
+            }
+        }
     }
 
     async resolve(uri: vscode.Uri): Promise<File> {
@@ -865,11 +956,14 @@ export class VirtualFileSystem extends vscode.Disposable {
         doc: DocumentEntity,
     ): Promise<Uint8Array> {
         for (let attempt = 0; attempt<3; attempt++) {
+            const collaboratorRevision = this.documentCollaboratorRevisions.get(doc._id) ?? 0;
             const response = await this.socket.joinDoc(doc._id);
-            if (this.disposed) {
-                throw vscode.FileSystemError.Unavailable(
-                    `Overleaf project is disposed: ${this.origin.toString()}`,
-                );
+            this.requireCurrentSession();
+            if (
+                (this.documentCollaboratorRevisions.get(doc._id) ?? 0)
+                !== collaboratorRevision
+            ) {
+                continue;
             }
             if (doc.version!==undefined && doc.version>response.version) {
                 continue;
@@ -899,7 +993,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async openFile(uri: vscode.Uri): Promise<Uint8Array> {
+        const identity = this.requireCurrentSession();
         const {fileType, fileEntity} = await this._resolveUri(uri);
+        this.requireCurrentSession();
         if (!fileEntity) {
             throw vscode.FileSystemError.FileNotFound();
         }
@@ -911,32 +1007,29 @@ export class VirtualFileSystem extends vscode.Disposable {
                 EventBus.fire('fileWillOpenEvent', {uri});
                 return new TextEncoder().encode(content);
             } else {
-                const res = await this.socket.joinDoc(fileEntity._id);
-                const content = res.docLines.join('\n');
-                doc.version = res.version;
-                doc.remoteCache = content;
-                doc.localCache  = content;
+                const content = await this.refreshDocumentFromServer(uri, doc);
                 EventBus.fire('fileWillOpenEvent', {uri});
-                return new TextEncoder().encode(content);
+                return content;
             }
         } else if (fileType==='outputs') {
             const {compileGroup, clsiServerId, pdfDownloadDomain} = this;
-            return GlobalStateManager.authenticate(this.context, this.serverName)
-            .then((identity) => {
-                return this.api.getFileFromClsi(identity, (fileEntity as OutputFileEntity).url, compileGroup || 'standard', clsiServerId, pdfDownloadDomain)
-                .then((res) => {
-                    if (res.type==='success') {
-                        EventBus.fire('fileWillOpenEvent', {uri});
-                        return res.content;
-                    } else {
-                        return new Uint8Array(0);
-                    }
-                });
-            });
+            const res = await this.api.getFileFromClsi(
+                identity,
+                (fileEntity as OutputFileEntity).url,
+                compileGroup || 'standard',
+                clsiServerId,
+                pdfDownloadDomain,
+            );
+            this.requireCurrentSession();
+            if (res.type==='success') {
+                EventBus.fire('fileWillOpenEvent', {uri});
+                return res.content;
+            }
+            return new Uint8Array(0);
         } else {
             const fileId = fileEntity._id;
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
             const res = await this.api.getFile(identity, this.projectId, fileId);
+            this.requireCurrentSession();
             if (res.type==='success' && res.content) {
                 EventBus.fire('fileWillOpenEvent', {uri});
                 return res.content;
@@ -955,10 +1048,11 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
 
         let res = undefined;
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
 
         if (content.length===0) {
             const _res = await this.api.addDoc(identity, this.projectId, parentFolder._id, fileName);
+            this.requireCurrentSession();
             if (_res.type==='success' && _res.entity!==undefined) {
                 res = _res.entity;
             } else {
@@ -969,6 +1063,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         } else {
             const parentFolderId = parentFolder._id;
             const _res = await this.api.uploadFile(identity, this.projectId, parentFolderId, fileName, content);
+            this.requireCurrentSession();
             if (_res.type==='success' && _res.entity!==undefined) {
                 res = _res.entity;
             } else {
@@ -1011,8 +1106,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             }, async (progress, token) => {
                 token.onCancellationRequested(() => {});
                 
-                const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+                const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
                 const res = await (this.api as ExtendedBaseAPI).refreshLinkedFile(identity, this.projectId, fileEntity._id);
+                this.requireCurrentSession();
 
                 if (res.type==='success' && res.message!==undefined) {
                     // refresh the entity id
@@ -1043,12 +1139,16 @@ export class VirtualFileSystem extends vscode.Disposable {
         });
 
         let provider = undefined, entityId = undefined, fileName = undefined, data = undefined;
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         if (selection === vscode.l10n.t('From Another Project')) {
             provider = 'project_file';
-            const allTags = (await this.api.getAllTags(identity)).tags || [];
+            const allTagsResponse = await this.api.getAllTags(identity);
+            this.requireCurrentSession();
+            const allTags = allTagsResponse.tags || [];
+            const projectsResponse = await this.api.userProjectsJson(identity);
+            this.requireCurrentSession();
             const projectId = await vscode.window.showQuickPick(
-                (await this.api.userProjectsJson(identity)).projects!
+                projectsResponse.projects!
                 .filter(project => project.id!==this.projectId)
                 .map(project => {
                     let detail = '';
@@ -1064,8 +1164,14 @@ export class VirtualFileSystem extends vscode.Disposable {
                     ignoreFocusOut: true,
                 }
             );
+            const entitiesResponse = projectId
+                ? await this.api.projectEntitiesJson(identity, projectId.id)
+                : undefined;
+            if (entitiesResponse) {
+                this.requireCurrentSession();
+            }
             const filePath = projectId && await vscode.window.showQuickPick(
-                (await this.api.projectEntitiesJson(identity, projectId!.id)).entities!.map(entity => entity.path),
+                entitiesResponse!.entities!.map(entity => entity.path),
                 {
                     title: vscode.l10n.t('Select a File'),
                     ignoreFocusOut: true,
@@ -1085,7 +1191,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             });
             //
             data = {source_entity_path: filePath!, source_project_id: projectId!.id};
+            this.requireCurrentSession();
             const res = await (this.api as ExtendedBaseAPI).createLinkedFile(identity, this.projectId, parentFolder._id, fileName!, provider, data);
+            this.requireCurrentSession();
             if (res.type==='success' && res.message!==undefined) {
                 entityId = res.message;
             }
@@ -1110,7 +1218,9 @@ export class VirtualFileSystem extends vscode.Disposable {
             });
             //
             data = {url:url!};
+            this.requireCurrentSession();
             const res = await (this.api as ExtendedBaseAPI).createLinkedFile(identity, this.projectId, parentFolder._id, fileName!, provider, data);
+            this.requireCurrentSession();
             if (res.type==='success' && res.message!==undefined) {
                 entityId = res.message;
             }
@@ -1118,6 +1228,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             return;
         }
 
+        this.requireCurrentSession();
         // insert entity
         const entity = {
             _id: entityId!, name: fileName!, _type: 'file', readonly: false,
@@ -1250,7 +1361,14 @@ export class VirtualFileSystem extends vscode.Disposable {
         let acknowledgementWasExplicitlyRejected = false;
         try {
             try {
+                GlobalStateManager.requireAuthenticatedIdentity(
+                    this.context,
+                    this.serverName,
+                    this.userId,
+                    this.sessionIdentity,
+                );
                 await this.socket.applyOtUpdate(doc._id, update);
+                this.requireCurrentSession();
             } catch (error) {
                 acknowledgementError = error;
             }
@@ -1421,8 +1539,9 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (fileType==='doc') {
             return this.refreshDocumentFromServer(uri, fileEntity as DocumentEntity);
         }
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const response = await this.api.getFile(identity, this.projectId, fileEntity._id);
+        this.requireCurrentSession();
         if (response.type==='success' && response.content!==undefined) {
             return response.content;
         }
@@ -1486,8 +1605,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     async mkdir(uri: vscode.Uri) {
         const {parentFolder, fileName} = await this._resolveUri(uri);
         const [folderName, parentFolderId] = [fileName, parentFolder._id];
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.addFolder(identity, this.projectId, folderName, parentFolderId);
+        this.requireCurrentSession();
 
         if (res.type==='success') {
             if (res.entity!==undefined) {
@@ -1510,8 +1630,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     async remove(uri: vscode.Uri, recursive: boolean) {
         const {parentFolder, fileType, fileEntity} = await this._resolveUri(uri);
         if (fileType && fileEntity) {
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+            const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
             const res = await this.api.deleteEntity(identity, this.projectId, fileType, fileEntity._id);
+            this.requireCurrentSession();
             if (res.type==='success') {
                 this.removeEntityById(parentFolder, fileType, fileEntity._id, recursive);
                 this.notify([
@@ -1541,7 +1662,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
             // rename or move
             let res = undefined;
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+            const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
             if (oldPath.parentFolder===newPath.parentFolder) {
                 const [entityType, entityId, newName] = [oldPath.fileType, oldPath.fileEntity._id, newPath.fileName];
                 res = await this.api.renameEntity(identity, this.projectId, entityType, entityId, newName);
@@ -1549,6 +1670,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const [entityType, entityId, newParentFolderId] = [oldPath.fileType, oldPath.fileEntity._id, newPath.parentFolder._id];
                 res = await this.api.moveEntity(identity, this.projectId, entityType, entityId, newParentFolderId);
             }
+            this.requireCurrentSession();
             // update local cache
             if (res?.type==='success') {
                 const newEntity = Object.assign(oldPath.fileEntity);
@@ -1580,10 +1702,11 @@ export class VirtualFileSystem extends vscode.Disposable {
             catch (e) {
                 needCacheClearFirst = true;
             }
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+            const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
             // clear cache if needed
             if (needCacheClearFirst) {
                 await this.api.deleteAuxFiles(identity, this.projectId);
+                this.requireCurrentSession();
             }
             // compile project
             const resolvedRootDocId = rootDocId ?? this.root?.rootDoc_id ?? null;
@@ -1597,6 +1720,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
             }
             const res = await this.api.compile(identity, this.projectId, rootResourcePath, draft, stopOnFirstError);
+            this.requireCurrentSession();
             if (res.type==='success' && res.compile?.status==='success') {
                 // Store CDN download info from the response for subsequent output file requests
                 this.compileGroup = res.compile.compileGroup;
@@ -1605,9 +1729,13 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.updateOutputs(res.compile.outputFiles);
                 return true;
             } else {
-                if (res.message!==undefined) {
-                    console.error('Compile failure.', res.message);
-                }
+                console.error('Compile response rejected.', {
+                    responseType: res.type,
+                    httpStatus: res.status,
+                    compileStatus: res.compile?.status,
+                    outputCount: res.compile?.outputFiles?.length,
+                    latexmkErrors: res.compile?.stats?.['latexmk-errors'],
+                });
                 return false;
             }
         }
@@ -1615,8 +1743,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async stopCompile() {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.stopCompile(identity, this.projectId);
+        this.requireCurrentSession();
         if (res.type==='success') {
             return true;
         } else {
@@ -1662,8 +1791,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async syncCode(filePath: string, line:number, column:number) {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.proxySyncCode(identity, this.projectId, filePath, line, column, this.outputBuildId ?? '');
+        this.requireCurrentSession();
         if (res.type==='success') {
             return res.syncCode;
         } else {
@@ -1675,8 +1805,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async syncPdf(page:number, h:number, v:number) {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.proxySyncPdf(identity, this.projectId, page, h, v, this.outputBuildId ?? '');
+        this.requireCurrentSession();
         if (res.type==='success') {
             return res.syncPdf;
         } else {
@@ -1692,8 +1823,9 @@ export class VirtualFileSystem extends vscode.Disposable {
 
         const {fileType} = await this._resolveUri(uri);
         if (fileType==='doc' || fileType==='file') {
-            const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+            const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
             const res = this.root && await this.api.proxyRequestToSpellingApi(identity, this.root.spellCheckLanguage, this.userId, words);
+            this.requireCurrentSession();
             if (res?.type==='success') {
                 return res.misspellings;
             }
@@ -1701,8 +1833,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async spellLearn(word: string) {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.spellingControllerLearn(identity, this.userId, word);
+        this.requireCurrentSession();
         if (res.type==='success') {
             this.root?.settings.learnedWords.push(word);
             return true;
@@ -1712,8 +1845,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async spellUnlearn(word: string) {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.spellingControllerUnlearn(identity, word);
+        this.requireCurrentSession();
         if (res.type==='success') {
             const index = this.root?.settings.learnedWords.findIndex((w) => w===word);
             if (index!==undefined && index>=0) {
@@ -1763,17 +1897,30 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     getProjectSCMPersist(scmKey: string) {
-        const scmPersists = GlobalStateManager.getServerProjectSCMPersists(this.context, this.serverName, this.projectId);
+        const scmPersists = GlobalStateManager.getServerProjectSCMPersists(
+            this.context,
+            this.serverName,
+            this.userId,
+            this.projectId,
+        );
         return scmPersists[scmKey];
     }
 
     setProjectSCMPersist(scmKey: string, persist: any) {
-        GlobalStateManager.updateServerProjectSCMPersist(this.context, this.serverName, this.projectId, scmKey, persist);
+        return GlobalStateManager.updateServerProjectSCMPersist(
+            this.context,
+            this.serverName,
+            this.userId,
+            this.projectId,
+            scmKey,
+            persist,
+        );
     }
 
     async updateSettings(setting: any) {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.updateProjectSettings(identity, this.projectId, setting);
+        this.requireCurrentSession();
         if (res.type==='success') {
             const keys = Object.keys(setting);
             if (keys.includes('spellCheckLanguage')) {
@@ -1790,8 +1937,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async metadata() {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.getMetadata(identity, this.projectId);
+        this.requireCurrentSession();
         if (res.type==='success') {
             return res.meta?.projectMeta;
         } else {
@@ -1800,8 +1948,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async getUpdates(before?: number) {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.proxyToHistoryApiAndGetUpdates(identity, this.projectId, before);
+        this.requireCurrentSession();
         if (res.type==='success') {
             return res.updates;
         } else {
@@ -1810,8 +1959,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async getFileDiff(pathname:string, from:number, to:number) {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.proxyToHistoryApiAndGetFileDiff(identity, this.projectId, pathname, from, to);
+        this.requireCurrentSession();
         if (res.type==='success') {
             return res.diff;
         } else {
@@ -1820,8 +1970,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async getFileTreeDiff(from:number, to:number) {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.proxyToHistoryApiAndGetFileTreeDiff(identity, this.projectId, from, to);
+        this.requireCurrentSession();
         if (res.type==='success') {
             return res.treeDiff;
         } else {
@@ -1869,8 +2020,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async createLabel(comment: string, version: number) {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.createLabel(identity, this.projectId, comment, version);
+        this.requireCurrentSession();
         if (res.type==='success') {
             return res.labels?.at(0);
         } else {
@@ -1879,8 +2031,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async deleteLabel(labelId: string) {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.deleteLabel(identity, this.projectId, labelId);
+        this.requireCurrentSession();
         if (res.type==='success') {
             return true;
         } else {
@@ -1889,14 +2042,16 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async downloadProjectArchive(version: number) {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.downloadZipOfVersion(identity, this.projectId, version);
+        this.requireCurrentSession();
         return res.content;
     }
 
     async getMessages() {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.getMessages(identity, this.projectId);
+        this.requireCurrentSession();
         if (res.type==='success') {
             return res.messages;
         } else {
@@ -1905,8 +2060,9 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async sendMessage(publicId:string, content: string) {
-        const identity = await GlobalStateManager.authenticate(this.context, this.serverName);
+        const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
         const res = await this.api.sendMessage(identity, this.projectId, publicId, content);
+        this.requireCurrentSession();
         if (res.type==='success') {
             return true;
         } else {
@@ -1994,7 +2150,10 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
         return this.getVFS(uri).then((vfs) => {return vfs;});
     }
 
-    async activateProject(uri: vscode.Uri): Promise<VirtualFileSystem> {
+    async activateProject(
+        uri: vscode.Uri,
+        options: ActivateProjectOptions = {},
+    ): Promise<VirtualFileSystem> {
         if (this.disposed) {
             throw vscode.FileSystemError.Unavailable('Overleaf file system provider is disposed.');
         }
@@ -2009,6 +2168,7 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
         });
 
         const vfs = await this.prefetch(uri);
+        vfs.configureInitialSCMRestore(options.restorePersistedSCMs!==false);
         if (this.disposed) {
             vfs.dispose();
             throw vscode.FileSystemError.Unavailable('Overleaf file system provider is disposed.');
@@ -2030,6 +2190,41 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
         }
         vfs.dispose();
         delete this.vfss[targetKey];
+    }
+
+    async removeLocalReplicaSCM(
+        projectUri: vscode.Uri,
+        scmKey: string,
+        baseUri: vscode.Uri,
+    ): Promise<void> {
+        const targetKey = vfsProjectKey(projectUri);
+        const vfs = this.vfss[targetKey];
+        if (vfs && !vfs.isDisposed) {
+            await vfs.removeLocalReplicaSCM(scmKey, baseUri);
+            return;
+        }
+        if (vfs?.isDisposed) {
+            delete this.vfss[targetKey];
+        }
+        await removeDetachedLocalReplicaSCM(
+            this.context,
+            projectUri,
+            scmKey,
+            baseUri,
+        );
+    }
+
+    async deactivateServer(serverName: string): Promise<void> {
+        if (this.disposed) { return; }
+        const entries = Object.entries(this.vfss)
+            .filter(([_key, vfs]) => vfs.serverName===serverName);
+        for (const [key, vfs] of entries) {
+            if (this._activeVFS===vfs) {
+                this.setActiveVFS(undefined);
+            }
+            vfs.dispose();
+            delete this.vfss[key];
+        }
     }
 
     notify(events :vscode.FileChangeEvent[]) {
@@ -2104,8 +2299,11 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
             vscode.commands.registerCommand(PREFETCH_COMMAND, (uri: vscode.Uri) => {
                 return this.prefetch(uri);
             }),
-            vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.activateProject`, (uri: vscode.Uri) => {
-                return this.activateProject(uri);
+            vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.activateProject`, (
+                uri: vscode.Uri,
+                options?: ActivateProjectOptions,
+            ) => {
+                return this.activateProject(uri, options);
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.remoteFileSystem.deactivateProject`, (uri?: vscode.Uri) => {
                 return this.deactivateProject(uri);

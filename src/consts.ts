@@ -18,6 +18,7 @@ export const PREFETCH_COMMAND = `${ROOT_NAME}.remoteFileSystem.prefetch`;
 
 export const REPLICA_SETTINGS_DIR = '.semantic-researcher-overleaf';
 export const REPLICA_SETTINGS_FILE = `${REPLICA_SETTINGS_DIR}/settings.json`;
+export const REPLICA_REMOVAL_TOMBSTONE_FILE = `${REPLICA_SETTINGS_DIR}/removed.json`;
 export const LEGACY_REPLICA_SETTINGS_DIR = '.overleaf';
 export const LEGACY_REPLICA_SETTINGS_FILE = `${LEGACY_REPLICA_SETTINGS_DIR}/settings.json`;
 export const LEGACY_REPLICA_SETTINGS_BACKUP_FILE = `${LEGACY_REPLICA_SETTINGS_DIR}/settings.overleaf-workshop.json`;
@@ -26,6 +27,7 @@ export const STATE_SERVERS_KEY = `${ROOT_NAME}.servers`;
 export const LEGACY_STATE_SERVERS_KEY = 'overleaf-servers';
 export const STATE_PDF_VIEWERS_KEY = `${ROOT_NAME}.pdf-viewers`;
 export const LEGACY_STATE_PDF_VIEWERS_KEY = 'overleaf-pdf-viewers';
+export const STATE_PROJECT_SCMS_PREFIX = `${ROOT_NAME}.project-scms`;
 
 export function getExplicitConfiguredValue<T>(config: vscode.WorkspaceConfiguration, key: string): T | undefined {
     const inspected = config.inspect<T>(key);

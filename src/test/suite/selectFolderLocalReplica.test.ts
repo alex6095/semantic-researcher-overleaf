@@ -1,12 +1,14 @@
 import * as assert from 'assert';
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
+import * as net from 'net';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
     LEGACY_REPLICA_SETTINGS_BACKUP_FILE,
     LEGACY_REPLICA_SETTINGS_FILE,
+    REPLICA_REMOVAL_TOMBSTONE_FILE,
     REPLICA_SETTINGS_DIR,
     REPLICA_SETTINGS_FILE,
     ROOT_NAME,
@@ -35,6 +37,7 @@ class FakeVirtualFileSystem {
     public readonly origin: vscode.Uri;
     public readonly projectName = 'Select Folder Test';
     public readonly serverName = 'test-server';
+    public readonly _userId = 'test-user';
     public readonly projectId = 'test-project';
     public readonly connectionState = 'connected';
     private readonly connectionEmitter = new vscode.EventEmitter<string>();
@@ -249,8 +252,12 @@ function setWorkspaceFoldersForTest(...roots: vscode.Uri[]) {
 }
 
 function createSCM(remoteRoot: vscode.Uri, localRoot: vscode.Uri, fakeVfs = new FakeVirtualFileSystem(remoteRoot)) {
-    return new LocalReplicaSCMProvider(fakeVfs as unknown as VirtualFileSystem, localRoot);
+    const scm = new LocalReplicaSCMProvider(fakeVfs as unknown as VirtualFileSystem, localRoot);
+    createdSCMsForTest.push(scm);
+    return scm;
 }
+
+const createdSCMsForTest: LocalReplicaSCMProvider[] = [];
 
 function createExtensionContextStub(initialSCMs: Record<string, PersistRecord> = {}): vscode.ExtensionContext {
     const state = new Map<string, unknown>();
@@ -356,6 +363,9 @@ suite('Select Project Folder Local Replica', function () {
         (LocalReplicaSCMProvider as any).watcherProbeTimeoutMs = originalWatcherProbeTimeoutMs;
         (LocalReplicaSCMProvider as any).watcherHealthIntervalMs = originalWatcherHealthIntervalMs;
         (LocalReplicaSCMProvider as any).fallbackScanIntervalMs = originalFallbackScanIntervalMs;
+        await Promise.allSettled(
+            createdSCMsForTest.splice(0).map(scm => scm.deactivate()),
+        );
         await setActiveReplicaRoot(undefined);
         if (originalWorkspaceFoldersDescriptor) {
             Object.defineProperty(vscode.workspace, 'workspaceFolders', originalWorkspaceFoldersDescriptor);
@@ -448,7 +458,11 @@ suite('Select Project Folder Local Replica', function () {
     });
 
     test('rejects git repository roots before prompting to empty them', async () => {
-        const repoRoot = vscode.Uri.file(path.resolve(__dirname, '..', '..', '..'));
+        const repoRoot = vscode.Uri.file(
+            process.env.VSCODE_TEST_REPOSITORY_ROOT
+                ? path.resolve(process.env.VSCODE_TEST_REPOSITORY_ROOT)
+                : path.resolve(__dirname, '..', '..', '..'),
+        );
         let prompted = false;
         const errorMessages: string[] = [];
         (vscode.window as any).showWarningMessage = async () => {
@@ -873,6 +887,87 @@ suite('Select Project Folder Local Replica', function () {
         }
     });
 
+    test('restores binary bytes when the replacement rename response is lost', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-media-rename-loss-remote-');
+        const localRoot = await tempDir('sr-overleaf-media-rename-loss-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        const baseline = Buffer.from([1, 2, 3]);
+        await writeBytes(remoteImage, baseline);
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, Buffer.from([9, 8, 7]));
+
+        const originalRename = (scm as any).renameRemotePathForDelete.bind(scm);
+        let loseResponse = true;
+        (scm as any).renameRemotePathForDelete = async (...args: unknown[]) => {
+            await originalRename(...args);
+            if (loseResponse) {
+                loseResponse = false;
+                throw new Error('simulated lost binary staging response');
+            }
+        };
+
+        const result = await (scm as any).applySync(
+            'push',
+            'update',
+            '/figure.png',
+            localImage,
+            remoteImage,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(result.outcome, 'error');
+        assert.deepStrictEqual(await readBytes(remoteImage), baseline);
+        const remoteEntries = await vscode.workspace.fs.readDirectory(remoteRoot);
+        assert.deepStrictEqual(
+            remoteEntries.filter(([name]) => name.startsWith('.sr-overleaf-replace-')),
+            [],
+        );
+    });
+
+    test('accepts a binary upload whose success response is lost', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-media-upload-loss-remote-');
+        const localRoot = await tempDir('sr-overleaf-media-upload-loss-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        const replacement = Buffer.from([9, 8, 7, 6]);
+        await writeBytes(remoteImage, Buffer.from([1, 2, 3]));
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, replacement);
+
+        const originalPushWithRetry = (scm as any).pushWithRetry.bind(scm);
+        let loseResponse = true;
+        (scm as any).pushWithRetry = async (...args: unknown[]) => {
+            const result = await originalPushWithRetry(...args);
+            if (loseResponse) {
+                loseResponse = false;
+                throw new Error('simulated lost binary upload response');
+            }
+            return result;
+        };
+
+        const result = await (scm as any).applySync(
+            'push',
+            'update',
+            '/figure.png',
+            localImage,
+            remoteImage,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(result.outcome, 'success');
+        assert.deepStrictEqual(await readBytes(remoteImage), replacement);
+        const remoteEntries = await vscode.workspace.fs.readDirectory(remoteRoot);
+        assert.deepStrictEqual(
+            remoteEntries.filter(([name]) => name.startsWith('.sr-overleaf-replace-')),
+            [],
+        );
+    });
+
     test('does not retry an explicitly rejected remote create', async () => {
         const remoteRoot = await tempDir('sr-overleaf-create-rejected-remote-');
         const localRoot = await tempDir('sr-overleaf-create-rejected-local-');
@@ -1150,7 +1245,7 @@ suite('Select Project Folder Local Replica', function () {
 
         const originalPullRemoteFile = (scm as any).pullRemoteFile.bind(scm);
         (scm as any).pullRemoteFile = async () => {
-            scm.deactivate();
+            (scm as any).deactivateSyncSession(undefined, false);
             await (scm as any).beginSyncSession();
             return Buffer.from('new remote content');
         };
@@ -1598,6 +1693,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(
             (scm as any).shouldPropagate(
                 'push',
+                'update',
                 '/main.tex',
                 Buffer.from('newest agent disk text'),
             ),
@@ -1919,6 +2015,38 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(result.blockedCount, 0);
         assert.strictEqual(result.sourceScanDeleteCount, 1);
         assert.strictEqual(await pathExists(remoteAppendix), false);
+    });
+
+    test('accepts a compile scan when an earlier queued delete already synchronized it', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-queued-delete-remote-');
+        const localRoot = await tempDir('sr-overleaf-queued-delete-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'remote baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.delete(localMain);
+
+        const internals = scm as any;
+        let releasePriorSync!: () => void;
+        const priorSync = new Promise<void>(resolve => {
+            releasePriorSync = resolve;
+        });
+        internals.syncQueues.set('/main.tex', priorSync);
+
+        const flushPromise = scm.flushBeforeCompile([]);
+        await waitUntil(() => internals.syncQueues.get('/main.tex')!==priorSync);
+        internals.clearReplicaState('/main.tex');
+        await vscode.workspace.fs.delete(remoteMain);
+        releasePriorSync();
+
+        const result = await flushPromise;
+        assert.strictEqual(result.failedCount, 0);
+        assert.strictEqual(result.blockedCount, 0);
+        assert.strictEqual(result.attemptedCount, 1);
+        assert.strictEqual(await pathExists(remoteMain), false);
     });
 
     test('cancels compile instead of treating a transient local read failure as deletion', async () => {
@@ -2256,6 +2384,27 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, 'figures', 'plot.png')), false);
     });
 
+    test('accepts linked Overleaf entities only for remote pull stat classification', () => {
+        const linkedFileStat: vscode.FileStat = {
+            type: vscode.FileType.File | vscode.FileType.SymbolicLink,
+            ctime: 0,
+            mtime: 0,
+            size: 8,
+        };
+        const linkedDirectoryStat: vscode.FileStat = {
+            ...linkedFileStat,
+            type: vscode.FileType.Directory | vscode.FileType.SymbolicLink,
+        };
+        const isSyncStatType = (LocalReplicaSCMProvider as any).isSyncStatType.bind(
+            LocalReplicaSCMProvider,
+        );
+
+        assert.strictEqual(isSyncStatType(linkedFileStat, vscode.FileType.File, true), true);
+        assert.strictEqual(isSyncStatType(linkedDirectoryStat, vscode.FileType.Directory, true), true);
+        assert.strictEqual(isSyncStatType(linkedFileStat, vscode.FileType.File, false), false);
+        assert.strictEqual(isSyncStatType(linkedDirectoryStat, vscode.FileType.Directory, false), false);
+    });
+
     test('keeps replica state consistent when a remote delete arrives after the local file is already missing', async () => {
         const remoteRoot = await tempDir('sr-overleaf-remote-');
         const localRoot = await tempDir('sr-overleaf-local-');
@@ -2340,6 +2489,43 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((scm as any).remoteDeleteTombstones.has(childPath), false);
         assert.strictEqual((scm as any).pendingLocalEvents.has(childPath), false);
         assert.strictEqual((scm as any).pendingVfsEvents.has(childPath), false);
+    });
+
+    test('does not suppress a remote folder delete with an older folder update echo', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-folder-echo-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-echo-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteFolder = vscode.Uri.joinPath(remoteRoot, 'remote-folder');
+        const localFolder = vscode.Uri.joinPath(localRoot, 'remote-folder');
+        await vscode.workspace.fs.createDirectory(remoteFolder);
+
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        assert.strictEqual(await pathExists(localFolder), true);
+
+        assert.strictEqual(
+            (scm as any).shouldPropagate(
+                'pull',
+                'update',
+                '/remote-folder',
+                undefined,
+            ),
+            true,
+        );
+        await vscode.workspace.fs.delete(remoteFolder, {recursive: true});
+
+        const applySync = (scm as any).applySync.bind(scm);
+        const event = await applySync(
+            'pull',
+            'delete',
+            '/remote-folder',
+            remoteFolder,
+            localFolder,
+        );
+
+        assert.strictEqual(event.outcome, 'success');
+        assert.strictEqual(await pathExists(localFolder), false);
     });
 
     test('does not recreate a remote file from a stale local event after a remote delete', async () => {
@@ -3226,6 +3412,429 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((restartedScm as any).syncConflicts.size, 0);
     });
 
+    test('lets an explicit local-state decision preserve a deleted file', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-delete-resolve-remote-');
+        const localRoot = await tempDir('sr-overleaf-delete-resolve-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.delete(localMain);
+        await writeText(remoteMain, 'remote collaborator edit');
+        const conflict = await (scm as any).applySync(
+            'push',
+            'delete',
+            '/main.tex',
+            localMain,
+            remoteMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflict.outcome, 'blocked');
+        assert.strictEqual((scm as any).syncConflicts.has('/main.tex'), true);
+
+        assert.strictEqual(
+            await scm.resolveConflictWithLocalState('/main.tex'),
+            true,
+        );
+        assert.strictEqual(await pathExists(remoteMain), false);
+        assert.strictEqual((scm as any).syncConflicts.has('/main.tex'), false);
+    });
+
+    test('lets an explicit local-state decision preserve a deleted folder', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-folder-delete-resolve-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-delete-resolve-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteFolder = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const localFolder = vscode.Uri.joinPath(localRoot, 'chapter');
+        const remoteMain = vscode.Uri.joinPath(remoteFolder, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.delete(localFolder, {recursive: true});
+        await writeText(remoteMain, 'remote collaborator edit');
+        const conflict = await (scm as any).applySync(
+            'push',
+            'delete',
+            '/chapter',
+            localFolder,
+            remoteFolder,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflict.outcome, 'blocked');
+        assert.strictEqual((scm as any).syncConflicts.has('/chapter'), true);
+
+        assert.strictEqual(
+            await scm.resolveConflictWithLocalState('/chapter'),
+            true,
+        );
+        assert.strictEqual(await pathExists(remoteFolder), false);
+        assert.strictEqual((scm as any).syncConflicts.has('/chapter'), false);
+    });
+
+    test('requires proof hydration before an explicit local deletion resolves a legacy conflict', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-delete-proof-remote-');
+        const localRoot = await tempDir('sr-overleaf-delete-proof-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.delete(localMain);
+        await writeText(remoteMain, 'remote collaborator edit');
+        const conflict = await (scm as any).applySync(
+            'push',
+            'delete',
+            '/main.tex',
+            localMain,
+            remoteMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflict.outcome, 'blocked');
+        const entry = (scm as any).syncManifest.conflicts['/main.tex'];
+        delete entry.remoteKind;
+        delete entry.remoteRevision;
+
+        assert.strictEqual(
+            await scm.resolveConflictWithLocalState('/main.tex'),
+            false,
+        );
+        assert.strictEqual(await pathExists(remoteMain), true);
+        const hydrated = (scm as any).syncManifest.conflicts['/main.tex'];
+        assert.strictEqual(hydrated.remoteKind, 'file');
+        assert.strictEqual(hydrated.remoteRevision, sha1('remote collaborator edit'));
+
+        assert.strictEqual(
+            await scm.resolveConflictWithLocalState('/main.tex'),
+            true,
+        );
+        assert.strictEqual(await pathExists(remoteMain), false);
+        assert.strictEqual((scm as any).syncConflicts.has('/main.tex'), false);
+    });
+
+    test('lets a new watcher revision resolve an exact file conflict immediately', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-live-conflict-remote-');
+        const localRoot = await tempDir('sr-overleaf-live-conflict-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await writeText(localMain, 'local conflicting edit');
+        await writeText(remoteMain, 'remote collaborator edit');
+        const conflictEvent = await (scm as any).applySync(
+            'pull',
+            'update',
+            '/main.tex',
+            remoteMain,
+            localMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflictEvent.outcome, 'blocked');
+
+        await writeText(localMain, 'agent-authored final resolution');
+        const pushEvent = await (scm as any).applySync(
+            'push',
+            'update',
+            '/main.tex',
+            localMain,
+            remoteMain,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(pushEvent.outcome, 'success');
+        assert.strictEqual(await readText(remoteMain), 'agent-authored final resolution');
+        assert.strictEqual((scm as any).syncConflicts.size, 0);
+        const manifestUri = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-manifest.json',
+        );
+        assert.strictEqual(
+            JSON.parse(await readText(manifestUri)).conflicts['/main.tex'],
+            undefined,
+        );
+    });
+
+    test('preserves a second remote edit before accepting a later local conflict resolution', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-advanced-conflict-remote-');
+        const localRoot = await tempDir('sr-overleaf-advanced-conflict-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await writeText(localMain, 'local conflicting edit');
+        await writeText(remoteMain, 'first remote collaborator edit');
+        const conflictEvent = await (scm as any).applySync(
+            'pull',
+            'update',
+            '/main.tex',
+            remoteMain,
+            localMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflictEvent.outcome, 'blocked');
+
+        await writeText(remoteMain, 'second remote collaborator edit');
+        await writeText(localMain, 'first local resolution attempt');
+        const blockedPush = await (scm as any).applySync(
+            'push',
+            'update',
+            '/main.tex',
+            localMain,
+            remoteMain,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(blockedPush.outcome, 'blocked');
+        assert.strictEqual(await readText(remoteMain), 'second remote collaborator edit');
+        assert.strictEqual(await readText(localMain), 'first local resolution attempt');
+        assert.ok((scm as any).syncConflicts.has('/main.tex'));
+        const conflict = (scm as any).syncManifest.conflicts['/main.tex'];
+        assert.strictEqual(conflict.remoteKind, 'file');
+        assert.strictEqual(conflict.remoteRevision, sha1('second remote collaborator edit'));
+        assert.strictEqual(conflict.localDigest, sha1('first local resolution attempt'));
+
+        await writeText(localMain, 'final local resolution after reviewing remote');
+        const resolvedPush = await (scm as any).applySync(
+            'push',
+            'update',
+            '/main.tex',
+            localMain,
+            remoteMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(resolvedPush.outcome, 'success');
+        assert.strictEqual(
+            await readText(remoteMain),
+            'final local resolution after reviewing remote',
+        );
+        assert.strictEqual((scm as any).syncConflicts.size, 0);
+    });
+
+    test('does not overwrite a second remote binary revision during conflict resolution', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-binary-conflict-remote-');
+        const localRoot = await tempDir('sr-overleaf-binary-conflict-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        await writeBytes(remoteImage, Buffer.from([1, 2, 3]));
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await writeBytes(localImage, Buffer.from([4, 5, 6]));
+        await writeBytes(remoteImage, Buffer.from([7, 8, 9]));
+        const conflictEvent = await (scm as any).applySync(
+            'pull',
+            'update',
+            '/figure.png',
+            remoteImage,
+            localImage,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflictEvent.outcome, 'blocked');
+
+        const secondRemote = Buffer.from([10, 11, 12]);
+        await writeBytes(remoteImage, secondRemote);
+        await writeBytes(localImage, Buffer.from([13, 14, 15]));
+        const blockedPush = await (scm as any).applySync(
+            'push',
+            'update',
+            '/figure.png',
+            localImage,
+            remoteImage,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(blockedPush.outcome, 'blocked');
+        assert.deepStrictEqual(await readBytes(remoteImage), secondRemote);
+        assert.ok((scm as any).syncConflicts.has('/figure.png'));
+        assert.strictEqual(
+            (scm as any).syncManifest.conflicts['/figure.png'].remoteRevision,
+            sha1(secondRemote),
+        );
+    });
+
+    test('preserves a binary revision created after conflict proof but before upload', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-binary-proof-race-remote-');
+        const localRoot = await tempDir('sr-overleaf-binary-proof-race-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        await writeBytes(remoteImage, Buffer.from([1, 2, 3]));
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await writeBytes(localImage, Buffer.from([4, 5, 6]));
+        await writeBytes(remoteImage, Buffer.from([7, 8, 9]));
+        const conflictEvent = await (scm as any).applySync(
+            'pull',
+            'update',
+            '/figure.png',
+            remoteImage,
+            localImage,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflictEvent.outcome, 'blocked');
+
+        await writeBytes(localImage, Buffer.from([10, 11, 12]));
+        const collaboratorRace = Buffer.from([13, 14, 15]);
+        const originalPushWithRetry = (scm as any).pushWithRetry.bind(scm);
+        let injected = false;
+        (scm as any).pushWithRetry = async (...args: unknown[]) => {
+            if (!injected) {
+                injected = true;
+                await writeBytes(remoteImage, collaboratorRace);
+            }
+            return originalPushWithRetry(...args);
+        };
+
+        const blockedPush = await (scm as any).applySync(
+            'push',
+            'update',
+            '/figure.png',
+            localImage,
+            remoteImage,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(blockedPush.outcome, 'blocked');
+        assert.strictEqual(injected, true);
+        assert.deepStrictEqual(await readBytes(remoteImage), collaboratorRace);
+        const remoteEntries = await vscode.workspace.fs.readDirectory(remoteRoot);
+        const replacementStages = remoteEntries.filter(
+            ([name]) => name.startsWith('.sr-overleaf-replace-'),
+        );
+        assert.strictEqual(replacementStages.length, 1);
+        assert.deepStrictEqual(
+            await readBytes(vscode.Uri.joinPath(remoteRoot, replacementStages[0][0])),
+            Buffer.from([7, 8, 9]),
+        );
+        assert.ok((scm as any).syncConflicts.has('/figure.png'));
+        assert.strictEqual(
+            (scm as any).syncManifest.conflicts['/figure.png'].remoteRevision,
+            sha1(collaboratorRace),
+        );
+    });
+
+    test('hydrates a proof-less conflict without treating an offline edit as reviewed resolution', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-legacy-conflict-proof-remote-');
+        const localRoot = await tempDir('sr-overleaf-legacy-conflict-proof-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await writeText(localMain, 'legacy local conflict');
+        await writeText(remoteMain, 'legacy remote conflict');
+        const conflictEvent = await (scm as any).applySync(
+            'pull',
+            'update',
+            '/main.tex',
+            remoteMain,
+            localMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflictEvent.outcome, 'blocked');
+
+        const manifestUri = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-manifest.json',
+        );
+        const legacyManifest = JSON.parse(await readText(manifestUri));
+        const originalLocalDigest = legacyManifest.conflicts['/main.tex'].localDigest;
+        delete legacyManifest.conflicts['/main.tex'].remoteKind;
+        delete legacyManifest.conflicts['/main.tex'].remoteRevision;
+        await writeText(manifestUri, JSON.stringify(legacyManifest, null, 2));
+
+        scm.deactivate();
+        await writeText(localMain, 'offline edit before remote proof hydration');
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        const hydrated = (restartedScm as any).syncManifest.conflicts['/main.tex'];
+        assert.notStrictEqual(hydrated.localDigest, originalLocalDigest);
+        assert.strictEqual(
+            hydrated.localDigest,
+            sha1('offline edit before remote proof hydration'),
+        );
+        assert.strictEqual(hydrated.remoteKind, 'file');
+        assert.strictEqual(hydrated.remoteRevision, sha1('legacy remote conflict'));
+
+        const blockedOfflineEdit = await (restartedScm as any).applySync(
+            'push',
+            'update',
+            '/main.tex',
+            localMain,
+            remoteMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(blockedOfflineEdit.outcome, 'blocked');
+        assert.strictEqual(await readText(remoteMain), 'legacy remote conflict');
+
+        await writeText(localMain, 'reviewed final local resolution');
+        const resolved = await (restartedScm as any).applySync(
+            'push',
+            'update',
+            '/main.tex',
+            localMain,
+            remoteMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(resolved.outcome, 'success');
+        assert.strictEqual(await readText(remoteMain), 'reviewed final local resolution');
+        assert.strictEqual((restartedScm as any).syncConflicts.size, 0);
+    });
+
+    test('never lets conflict resolution bypass a failed initial pull', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-failed-pull-conflict-remote-');
+        const localRoot = await tempDir('sr-overleaf-failed-pull-conflict-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'remote authoritative content');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        (scm as any).failedInitialPulls.add('/main.tex');
+        await (scm as any).markSyncConflict(
+            '/main.tex',
+            'The initial pull could not be verified',
+            Buffer.from('remote authoritative content'),
+        );
+
+        await writeText(localMain, 'unverified local update');
+        const updateEvent = await (scm as any).applySync(
+            'push',
+            'update',
+            '/main.tex',
+            localMain,
+            remoteMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(updateEvent.outcome, 'blocked');
+        assert.strictEqual(await readText(remoteMain), 'remote authoritative content');
+        assert.strictEqual((scm as any).failedInitialPulls.has('/main.tex'), true);
+        assert.ok((scm as any).syncConflicts.has('/main.tex'));
+
+        await vscode.workspace.fs.delete(localMain);
+        const deleteEvent = await (scm as any).applySync(
+            'push',
+            'delete',
+            '/main.tex',
+            localMain,
+            remoteMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(deleteEvent.outcome, 'blocked');
+        assert.strictEqual(await readText(remoteMain), 'remote authoritative content');
+        assert.strictEqual((scm as any).failedInitialPulls.has('/main.tex'), true);
+        assert.ok((scm as any).syncConflicts.has('/main.tex'));
+    });
+
     test('forces Local Replica manager initialization before completing a compile barrier', async () => {
         const localRoot = await tempDir('sr-overleaf-required-manager-local-');
         tempRoots.push(localRoot);
@@ -3314,6 +3923,71 @@ suite('Select Project Folder Local Replica', function () {
         } finally {
             collection.dispose();
         }
+    });
+
+    test('can prepare exact-folder commands without restoring a persisted Local Replica', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-deferred-restore-remote-');
+        const localRoot = await tempDir('sr-overleaf-deferred-restore-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const firstScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        firstScm.deactivate();
+        await writeText(vscode.Uri.joinPath(localRoot, 'main.tex'), 'offline local edit');
+
+        const scmKey = localRoot.toString();
+        const persist: PersistRecord = {
+            enabled: true,
+            label: LocalReplicaSCMProvider.label,
+            baseUri: scmKey,
+            settings: {} as JSON,
+        };
+        fakeVfs.setProjectSCMPersist(scmKey, persist);
+        const context = createExtensionContextStub({[scmKey]: persist});
+        const collection = new SCMCollectionProvider(
+            fakeVfs as unknown as VirtualFileSystem,
+            context,
+            {restorePersistedSCMs: false},
+        );
+
+        try {
+            await (collection as any).initSCMsPromise;
+            assert.deepStrictEqual((collection as any).scms, []);
+            assert.strictEqual(
+                await readText(vscode.Uri.joinPath(localRoot, 'main.tex')),
+                'offline local edit',
+            );
+            assert.strictEqual(
+                await readText(vscode.Uri.joinPath(remoteRoot, 'main.tex')),
+                'remote baseline',
+            );
+        } finally {
+            collection.dispose();
+        }
+    });
+
+    test('disposes collection-owned global listeners without activating SCM commands', () => {
+        const remoteRoot = vscode.Uri.file('/tmp/sr-overleaf-collection-dispose-remote');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const emitter = (EventBus as any)._eventEmitter;
+        const listenersBefore = emitter.listenerCount('scmStatusChangeEvent');
+        const collection = new SCMCollectionProvider(
+            fakeVfs as unknown as VirtualFileSystem,
+            createExtensionContextStub(),
+            {restorePersistedSCMs: false},
+        );
+
+        assert.strictEqual(
+            emitter.listenerCount('scmStatusChangeEvent'),
+            listenersBefore + 1,
+        );
+        collection.dispose();
+        assert.strictEqual(
+            emitter.listenerCount('scmStatusChangeEvent'),
+            listenersBefore,
+        );
     });
 
     test('restores a persisted Local Replica after its Overleaf project is renamed', async () => {
@@ -3606,11 +4280,17 @@ suite('Select Project Folder Local Replica', function () {
             getActiveVFS: () => undefined,
         } as unknown as any;
         const provider = new ProjectManagerProvider({} as any, remoteFileSystem);
+        let activationOptions: unknown;
 
-        (vscode.commands as any).executeCommand = async (command: string, arg?: unknown) => {
+        (vscode.commands as any).executeCommand = async (
+            command: string,
+            arg?: unknown,
+            options?: unknown,
+        ) => {
             calls.push(command);
             if (command===`${ROOT_NAME}.remoteFileSystem.activateProject`) {
                 assert.strictEqual((arg as vscode.Uri).toString(), projectUri.toString());
+                activationOptions = options;
                 return activatedVfs;
             }
             if (command===`${ROOT_NAME}.projectSCM.newExactLocalReplicaSCM`) {
@@ -3633,6 +4313,7 @@ suite('Select Project Folder Local Replica', function () {
             `${ROOT_NAME}.projectSCM.newExactLocalReplicaSCM`,
             `${ROOT_NAME}.remoteFileSystem.deactivateProject`,
         ]);
+        assert.deepStrictEqual(activationOptions, {restorePersistedSCMs: false});
     });
 
     test('disconnects the current live local replica without deleting local files', async () => {
@@ -3670,6 +4351,1766 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, 'main.tex')), 'local content');
     });
 
+    test('stops an active Local Replica SCM before removing its persisted mapping', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-remove-scm-remote-');
+        const localRoot = await tempDir('sr-overleaf-remove-scm-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const scm = createSCM(remoteRoot, localRoot);
+        const collection = Object.create(
+            SCMCollectionProvider.prototype,
+        ) as SCMCollectionProvider;
+        const internals = collection as any;
+        let prepareRemovalCount = 0;
+        let finishRemovalCount = 0;
+        let triggerDisposeCount = 0;
+        const removedKeys: string[] = [];
+        (scm as any).prepareRemovalAndHoldOwnership = async () => {
+            prepareRemovalCount += 1;
+        };
+        (scm as any).finishRemoval = async () => {
+            finishRemovalCount += 1;
+        };
+        internals.pendingSCMInstances = new Set();
+        internals.pendingSCMs = new Map();
+        internals.initSCMsPromise = Promise.resolve();
+        internals.disposed = false;
+        internals.scms = [{
+            scm,
+            enabled: true,
+            triggers: [{
+                dispose: () => {
+                    triggerDisposeCount += 1;
+                },
+            }],
+        }];
+        internals.vfs = {
+            origin: remoteRoot,
+            setProjectSCMPersist: async (key: string, persist: unknown) => {
+                assert.strictEqual(persist, undefined);
+                removedKeys.push(key);
+            },
+        };
+        internals.updateStatus = () => undefined;
+
+        await collection.removeLocalReplicaSCM(scm.scmKey, localRoot);
+
+        assert.strictEqual(prepareRemovalCount, 1);
+        assert.strictEqual(finishRemovalCount, 1);
+        assert.strictEqual(triggerDisposeCount, 1);
+        assert.deepStrictEqual(removedKeys, [scm.scmKey]);
+        assert.strictEqual(internals.scms.length, 0);
+        assert.strictEqual(
+            await pathExists(vscode.Uri.joinPath(localRoot, REPLICA_REMOVAL_TOMBSTONE_FILE)),
+            true,
+        );
+    });
+
+    test('rejects a Local Replica folder owned by another extension host', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const contender = createSCM(remoteRoot, localRoot);
+        const rootKey = await (contender as any).syncOwnerRootKey();
+        const hostId = await (contender as any).syncOwnerHostId();
+        const port = (contender as any).syncOwnerPorts(rootKey)[0];
+        const ownerRecord = {
+            version: 4,
+            token: '0123456789abcdef0123456789abcdef',
+            pid: process.pid,
+            hostname: os.hostname(),
+            hostId,
+            projectKey: remoteRoot.toString(),
+            rootKey,
+            port,
+            createdAt: new Date().toISOString(),
+        };
+        const ownerFile = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-owner.json',
+        );
+        await vscode.workspace.fs.createDirectory(
+            vscode.Uri.joinPath(localRoot, REPLICA_SETTINGS_DIR),
+        );
+        await writeText(ownerFile, JSON.stringify(ownerRecord));
+        const ownerServer = net.createServer(socket => {
+            socket.end(JSON.stringify(ownerRecord));
+        });
+        ownerServer.unref();
+        await new Promise<void>((resolve, reject) => {
+            ownerServer.once('error', reject);
+            ownerServer.listen({host: '127.0.0.1', port, exclusive: true}, resolve);
+        });
+        try {
+            await assert.rejects(
+                () => contender.triggers,
+                /already active.*process|already active.*VS Code window/i,
+            );
+            assert.strictEqual(await pathExists(ownerFile), true);
+        } finally {
+            await new Promise<void>((resolve, reject) => {
+                ownerServer.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+
+    test('does not reclaim a foreign-host owner after an old heartbeat', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-foreign-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-foreign-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const contender = createSCM(remoteRoot, localRoot);
+        const rootKey = await (contender as any).syncOwnerRootKey();
+        const ownerFile = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-owner.json',
+        );
+        await vscode.workspace.fs.createDirectory(
+            vscode.Uri.joinPath(localRoot, REPLICA_SETTINGS_DIR),
+        );
+        await writeText(ownerFile, JSON.stringify({
+            version: 4,
+            token: '1123456789abcdef0123456789abcdef',
+            pid: 1,
+            hostname: os.hostname(),
+            hostId: crypto.createHash('sha256').update('foreign-host').digest('hex'),
+            projectKey: remoteRoot.toString(),
+            rootKey,
+            port: (contender as any).syncOwnerPorts(rootKey)[0],
+            createdAt: '2000-01-01T00:00:00.000Z',
+        }));
+        await fs.utimes(ownerFile.fsPath, new Date(0), new Date(0));
+
+        await assert.rejects(
+            () => contender.triggers,
+            /Cross-host stale takeover is disabled/i,
+        );
+        assert.strictEqual(await pathExists(ownerFile), true);
+    });
+
+    test('does not delete an incomplete ownership marker while activation is uncertain', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-incomplete-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-incomplete-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const ownerFile = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-owner.json',
+        );
+        await vscode.workspace.fs.createDirectory(
+            vscode.Uri.joinPath(localRoot, REPLICA_SETTINGS_DIR),
+        );
+        await writeText(ownerFile, '{"version":');
+        const contender = createSCM(remoteRoot, localRoot);
+
+        await assert.rejects(
+            () => contender.triggers,
+            /incomplete ownership marker/i,
+        );
+        assert.strictEqual(await pathExists(ownerFile), true);
+    });
+
+    test('does not replace a marker created immediately before atomic ownership publish', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-publish-race-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-publish-race-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const contender = createSCM(remoteRoot, localRoot);
+        const internals = contender as any;
+        const ownerFile = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-owner.json',
+        );
+        const originalInstall = internals.installSyncOwnerClaim.bind(contender);
+        let injected = false;
+        internals.installSyncOwnerClaim = async (claimPath: string) => {
+            if (!injected) {
+                injected = true;
+                await writeText(ownerFile, '{"incomplete":true}');
+            }
+            await originalInstall(claimPath);
+        };
+
+        await assert.rejects(
+            () => contender.triggers,
+            /incomplete ownership marker/i,
+        );
+        assert.strictEqual(await readText(ownerFile), '{"incomplete":true}');
+        assert.strictEqual(internals.syncOwnerToken, undefined);
+        assert.strictEqual(internals.syncOwnerServer, undefined);
+    });
+
+    test('repairs an incomplete ownership marker only after explicit confirmation', async () => {
+        const localRoot = await tempDir('sr-overleaf-owner-repair-local-');
+        tempRoots.push(localRoot);
+        const ownerFile = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-owner.json',
+        );
+        await vscode.workspace.fs.createDirectory(
+            vscode.Uri.joinPath(localRoot, REPLICA_SETTINGS_DIR),
+        );
+        await writeText(ownerFile, '{"token":');
+        (vscode.window as any).showWarningMessage = async (
+            _message: string,
+            _options: unknown,
+            ...items: string[]
+        ) => items[0];
+        (vscode.window as any).showInformationMessage = async () => undefined;
+
+        assert.strictEqual(
+            await LocalReplicaSCMProvider.repairOwnershipMarker(localRoot),
+            true,
+        );
+        assert.strictEqual(await pathExists(ownerFile), false);
+    });
+
+    test('runs concurrent Local Replica trigger requests as one activation', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-single-flight-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-single-flight-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        const internals = scm as any;
+        const originalInitWatch = internals.initWatch.bind(scm);
+        let releaseActivation!: () => void;
+        const activationGate = new Promise<void>(resolve => {
+            releaseActivation = resolve;
+        });
+        let activationCount = 0;
+        internals.initWatch = async () => {
+            activationCount += 1;
+            await activationGate;
+            return originalInitWatch();
+        };
+
+        const first = scm.triggers;
+        const second = scm.triggers;
+        await new Promise(resolve => setTimeout(resolve, 25));
+        assert.strictEqual(activationCount, 1);
+        releaseActivation();
+        const [firstTriggers, secondTriggers] = await Promise.all([first, second]);
+
+        assert.strictEqual(firstTriggers, secondTriggers);
+        assert.strictEqual(activationCount, 1);
+        await scm.deactivate();
+    });
+
+    test('recovers a same-host repair lock left by a crashed process', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-repair-crash-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-repair-crash-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        const repairFile = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-owner.repair.json',
+        );
+        await writeText(repairFile, JSON.stringify({
+            version: 2,
+            token: '5123456789abcdef0123456789abcdef',
+            pid: 2_147_483_647,
+            hostname: os.hostname(),
+            hostId: await (scm as any).syncOwnerHostId(),
+            createdAt: new Date().toISOString(),
+        }));
+
+        await scm.triggers;
+
+        assert.strictEqual(await pathExists(repairFile), false);
+        assert.ok((scm as any).syncOwnerToken);
+        await scm.deactivate();
+    });
+
+    test('resumes repair after a crash quarantined an invalid owner marker', async () => {
+        const localRoot = await tempDir('sr-overleaf-owner-repair-quarantine-');
+        tempRoots.push(localRoot);
+        const settingsDirectory = vscode.Uri.joinPath(localRoot, REPLICA_SETTINGS_DIR);
+        const quarantinedOwner = vscode.Uri.joinPath(
+            settingsDirectory,
+            'sync-owner.json.repair-crashed',
+        );
+        const repairFile = vscode.Uri.joinPath(
+            settingsDirectory,
+            'sync-owner.repair.json',
+        );
+        const hostId = await (createSCM(localRoot, localRoot) as any).syncOwnerHostId();
+        await writeText(quarantinedOwner, '{"invalid":true}');
+        await writeText(repairFile, JSON.stringify({
+            version: 2,
+            token: '6123456789abcdef0123456789abcdef',
+            pid: 2_147_483_647,
+            hostname: os.hostname(),
+            hostId,
+            createdAt: new Date().toISOString(),
+        }));
+        (vscode.window as any).showWarningMessage = async (
+            _message: string,
+            _options: unknown,
+            ...items: string[]
+        ) => items[0];
+        (vscode.window as any).showInformationMessage = async () => undefined;
+
+        assert.strictEqual(
+            await LocalReplicaSCMProvider.repairOwnershipMarker(localRoot),
+            true,
+        );
+        assert.strictEqual(await pathExists(repairFile), false);
+        assert.strictEqual(await pathExists(quarantinedOwner), false);
+    });
+
+    test('repairs a valid v3 owner only when its same-host process is dead', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-v3-repair-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-v3-repair-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const scm = createSCM(remoteRoot, localRoot);
+        const legacyOwnerDirectory = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-owner',
+        );
+        const legacyOwnerFile = vscode.Uri.joinPath(legacyOwnerDirectory, 'owner.json');
+        const rootKey = await (scm as any).syncOwnerRootKey();
+        await writeText(legacyOwnerFile, JSON.stringify({
+            version: 3,
+            token: '7123456789abcdef0123456789abcdef',
+            pid: 2_147_483_647,
+            hostname: os.hostname(),
+            hostId: await (scm as any).syncOwnerHostId(),
+            projectKey: remoteRoot.toString(),
+            rootKey,
+            port: (scm as any).syncOwnerPorts(rootKey)[0],
+            createdAt: new Date().toISOString(),
+        }));
+        (vscode.window as any).showWarningMessage = async (
+            _message: string,
+            _options: unknown,
+            ...items: string[]
+        ) => items[0];
+        (vscode.window as any).showInformationMessage = async () => undefined;
+
+        assert.strictEqual(
+            await LocalReplicaSCMProvider.repairOwnershipMarker(localRoot),
+            true,
+        );
+        assert.strictEqual(await pathExists(legacyOwnerDirectory), false);
+    });
+
+    test('holds ownership through durable mapping removal and blocks revival', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-remove-hold-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-remove-hold-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const owner = createSCM(remoteRoot, localRoot);
+        await owner.triggers;
+        await owner.prepareRemovalAndHoldOwnership();
+
+        const waiting = createSCM(remoteRoot, localRoot);
+        await assert.rejects(
+            () => waiting.triggers,
+            /removal is holding folder ownership/i,
+        );
+        await localReplicaWorkspace.writeReplicaRemovalTombstone(localRoot, remoteRoot);
+        await owner.finishRemoval();
+
+        const late = createSCM(remoteRoot, localRoot);
+        await assert.rejects(
+            () => late.triggers,
+            /mapping was removed/i,
+        );
+        assert.strictEqual(
+            await localReplicaWorkspace.hasReplicaRemovalTombstone(localRoot, remoteRoot),
+            true,
+        );
+        await localReplicaWorkspace.clearReplicaRemovalTombstone(localRoot);
+    });
+
+    test('clears a removal tombstone only after explicit Select owns the folder', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-select-remove-race-remote-');
+        const localRoot = await tempDir('sr-overleaf-select-remove-race-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        await writeReplicaSettings(localRoot, remoteRoot);
+        const remover = createSCM(remoteRoot, localRoot);
+        await remover.triggers;
+        await remover.prepareRemovalAndHoldOwnership();
+        await localReplicaWorkspace.writeReplicaRemovalTombstone(localRoot, remoteRoot);
+
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const collection = new SCMCollectionProvider(
+            fakeVfs as unknown as VirtualFileSystem,
+            createExtensionContextStub(),
+            {restorePersistedSCMs: false},
+        );
+        (collection as any).promptBaseUri = async () => localRoot.fsPath;
+        try {
+            assert.strictEqual(
+                await (collection as any).createNewExactLocalReplicaSCM(),
+                undefined,
+            );
+            assert.strictEqual(
+                await localReplicaWorkspace.hasReplicaRemovalTombstone(
+                    localRoot,
+                    remoteRoot,
+                ),
+                true,
+            );
+            assert.strictEqual(
+                fakeVfs.hasProjectSCMPersist(localRoot.toString()),
+                false,
+            );
+
+            await remover.finishRemoval();
+            const selected = await (collection as any).createNewExactLocalReplicaSCM() as
+                LocalReplicaSCMProvider;
+            assert.ok(selected);
+            assert.strictEqual(
+                await localReplicaWorkspace.hasReplicaRemovalTombstone(
+                    localRoot,
+                    remoteRoot,
+                ),
+                false,
+            );
+            assert.strictEqual(
+                fakeVfs.hasProjectSCMPersist(localRoot.toString()),
+                true,
+            );
+            assert.ok((selected as any).syncOwnerToken);
+        } finally {
+            await remover.finishRemoval();
+            collection.dispose();
+        }
+    });
+
+    test('keeps explicit Select disconnected when durable mapping persistence fails', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-select-persist-fail-remote-');
+        const localRoot = await tempDir('sr-overleaf-select-persist-fail-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        await writeReplicaSettings(localRoot, remoteRoot);
+        await localReplicaWorkspace.writeReplicaRemovalTombstone(localRoot, remoteRoot);
+
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const originalSetPersist = fakeVfs.setProjectSCMPersist.bind(fakeVfs);
+        let failedCreationPersist = false;
+        (fakeVfs as any).setProjectSCMPersist = async (
+            key: string,
+            persist?: PersistRecord,
+        ) => {
+            if (persist!==undefined && !failedCreationPersist) {
+                failedCreationPersist = true;
+                await Promise.resolve();
+                throw new Error('simulated durable mapping write failure');
+            }
+            originalSetPersist(key, persist);
+        };
+        const collection = new SCMCollectionProvider(
+            fakeVfs as unknown as VirtualFileSystem,
+            createExtensionContextStub(),
+            {restorePersistedSCMs: false},
+        );
+        (collection as any).promptBaseUri = async () => localRoot.fsPath;
+
+        try {
+            assert.strictEqual(
+                await (collection as any).createNewExactLocalReplicaSCM(),
+                undefined,
+            );
+            assert.strictEqual(failedCreationPersist, true);
+            assert.strictEqual(
+                fakeVfs.hasProjectSCMPersist(localRoot.toString()),
+                false,
+            );
+            assert.strictEqual(
+                await localReplicaWorkspace.hasReplicaRemovalTombstone(
+                    localRoot,
+                    remoteRoot,
+                ),
+                true,
+            );
+            assert.strictEqual(
+                await pathExists(vscode.Uri.joinPath(
+                    localRoot,
+                    REPLICA_SETTINGS_DIR,
+                    'sync-owner.json',
+                )),
+                false,
+            );
+        } finally {
+            collection.dispose();
+        }
+    });
+
+    test('keeps a removal tombstone effective after the replica folder moves', async () => {
+        const localRoot = await tempDir('sr-overleaf-remove-move-');
+        const movedRoot = vscode.Uri.file(`${localRoot.fsPath}-moved`);
+        tempRoots.push(localRoot, movedRoot);
+        const projectUri = vscode.Uri.parse(
+            `${ROOT_NAME}://test-server/Move%20Tombstone` +
+            '?user=test-user&project=move-tombstone',
+        );
+        await writeReplicaSettings(localRoot, projectUri);
+        await localReplicaWorkspace.writeReplicaRemovalTombstone(localRoot, projectUri);
+        await vscode.workspace.fs.rename(localRoot, movedRoot, {overwrite: false});
+
+        assert.strictEqual(
+            await localReplicaWorkspace.hasReplicaRemovalTombstone(movedRoot, projectUri),
+            true,
+        );
+        assert.strictEqual(await setActiveReplicaRoot(movedRoot), undefined);
+        assert.strictEqual(getActiveReplicaRoot(), undefined);
+        setWorkspaceFoldersForTest(movedRoot);
+        await localReplicaWorkspace.initializeLocalReplicaWorkspace();
+        assert.strictEqual(getActiveReplicaRoot(), undefined);
+
+        await localReplicaWorkspace.clearReplicaRemovalTombstone(movedRoot);
+        assert.strictEqual(
+            await localReplicaWorkspace.hasReplicaRemovalTombstone(movedRoot, projectUri),
+            false,
+        );
+    });
+
+    test('fails closed for malformed and schema-invalid removal tombstones', async () => {
+        for (const [label, content] of [
+            ['malformed', '{"version":'],
+            ['wrong-schema', '{"version":2,"removed":true}'],
+        ]) {
+            const remoteRoot = await tempDir(`sr-overleaf-remove-${label}-remote-`);
+            const localRoot = await tempDir(`sr-overleaf-remove-${label}-local-`);
+            tempRoots.push(remoteRoot, localRoot);
+            await writeReplicaSettings(localRoot, remoteRoot);
+            await writeText(
+                vscode.Uri.joinPath(localRoot, REPLICA_REMOVAL_TOMBSTONE_FILE),
+                content,
+            );
+
+            assert.strictEqual(
+                await localReplicaWorkspace.hasReplicaRemovalTombstone(
+                    localRoot,
+                    remoteRoot,
+                ),
+                true,
+            );
+            const scm = createSCM(remoteRoot, localRoot);
+            await assert.rejects(
+                () => scm.triggers,
+                /mapping was removed/i,
+            );
+            assert.strictEqual(await setActiveReplicaRoot(localRoot), undefined);
+            assert.strictEqual(getActiveReplicaRoot(), undefined);
+            await localReplicaWorkspace.clearReplicaRemovalTombstone(localRoot);
+        }
+    });
+
+    test('writes a private atomic removal tombstone without leftover claims', async () => {
+        const localRoot = await tempDir('sr-overleaf-remove-durable-');
+        tempRoots.push(localRoot);
+        const projectUri = vscode.Uri.parse(
+            `${ROOT_NAME}://test-server/Durable%20Tombstone` +
+            '?user=test-user&project=durable-tombstone',
+        );
+
+        await localReplicaWorkspace.writeReplicaRemovalTombstone(localRoot, projectUri);
+
+        const tombstoneUri = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_REMOVAL_TOMBSTONE_FILE,
+        );
+        const tombstone = JSON.parse(await readText(tombstoneUri));
+        const stat = await fs.stat(tombstoneUri.fsPath);
+        const metadataEntries = await vscode.workspace.fs.readDirectory(
+            vscode.Uri.joinPath(localRoot, REPLICA_SETTINGS_DIR),
+        );
+        assert.strictEqual(tombstone.version, 1);
+        assert.strictEqual(tombstone.rootUri, localRoot.toString());
+        assert.strictEqual(stat.mode & 0o077, 0);
+        assert.deepStrictEqual(
+            metadataEntries
+                .map(([name]) => name)
+                .filter(name => name.startsWith('removed.json.claim-')),
+            [],
+        );
+    });
+
+    test('does not repair a valid owner that appears during confirmation', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-repair-race-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-repair-race-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const contender = createSCM(remoteRoot, localRoot);
+        const rootKey = await (contender as any).syncOwnerRootKey();
+        const ownerFile = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-owner.json',
+        );
+        await writeText(ownerFile, '{"invalid":true}');
+        const ownerRecord = {
+            version: 4,
+            token: '3123456789abcdef0123456789abcdef',
+            pid: process.pid,
+            hostname: os.hostname(),
+            hostId: await (contender as any).syncOwnerHostId(),
+            projectKey: remoteRoot.toString(),
+            rootKey,
+            port: (contender as any).syncOwnerPorts(rootKey)[0],
+            createdAt: new Date().toISOString(),
+        };
+        (vscode.window as any).showWarningMessage = async (
+            _message: string,
+            _options: unknown,
+            ...items: string[]
+        ) => {
+            await writeText(ownerFile, JSON.stringify(ownerRecord));
+            return items[0];
+        };
+
+        await assert.rejects(
+            () => LocalReplicaSCMProvider.repairOwnershipMarker(localRoot),
+            /changed during confirmation/i,
+        );
+        assert.deepStrictEqual(JSON.parse(await readText(ownerFile)), ownerRecord);
+    });
+
+    test('closes the ownership server even when failed claim cleanup also fails', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-cleanup-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-cleanup-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const contender = createSCM(remoteRoot, localRoot);
+        const internals = contender as any;
+        const originalClose = internals.closeSyncOwnerServer.bind(contender);
+        let closeCount = 0;
+        internals.installSyncOwnerClaim = async () => {
+            throw new Error('simulated ownership install failure');
+        };
+        internals.cleanupSyncOwnerClaim = async () => {
+            throw new Error('simulated claim cleanup failure');
+        };
+        internals.closeSyncOwnerServer = async (server: net.Server) => {
+            closeCount += 1;
+            await originalClose(server);
+        };
+
+        await assert.rejects(
+            () => contender.triggers,
+            /simulated ownership install failure/i,
+        );
+        assert.strictEqual(closeCount, 1);
+        assert.strictEqual(internals.syncOwnerToken, undefined);
+        assert.strictEqual(internals.syncOwnerServer, undefined);
+    });
+
+    test('falls back when an unrelated local service occupies the first ownership port', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-port-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-port-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        const rootKey = await (scm as any).syncOwnerRootKey();
+        const firstPort = (scm as any).syncOwnerPorts(rootKey)[0];
+        const unrelatedServer = net.createServer(socket => {
+            socket.end('unrelated service');
+        });
+        unrelatedServer.unref();
+        await new Promise<void>((resolve, reject) => {
+            unrelatedServer.once('error', reject);
+            unrelatedServer.listen({
+                host: '127.0.0.1',
+                port: firstPort,
+                exclusive: true,
+            }, resolve);
+        });
+        try {
+            await scm.triggers;
+            const owner = JSON.parse(await readText(vscode.Uri.joinPath(
+                localRoot,
+                REPLICA_SETTINGS_DIR,
+                'sync-owner.json',
+            )));
+            assert.notStrictEqual(owner.port, firstPort);
+        } finally {
+            await scm.deactivate();
+            await new Promise<void>((resolve, reject) => {
+                unrelatedServer.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+
+    test('drains old in-flight sync work before a same-process ownership handoff', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-handoff-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-handoff-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const first = createSCM(remoteRoot, localRoot);
+        await first.triggers;
+
+        let releaseOldOperation!: () => void;
+        const oldOperation = new Promise<void>(resolve => {
+            releaseOldOperation = resolve;
+        });
+        const firstInternals = first as any;
+        firstInternals.inFlightSessionIO.add(oldOperation);
+        void oldOperation.finally(() => {
+            firstInternals.inFlightSessionIO.delete(oldOperation);
+        });
+
+        const successor = createSCM(remoteRoot, localRoot);
+        let successorActivated = false;
+        const successorActivation = successor.triggers.then(value => {
+            successorActivated = true;
+            return value;
+        });
+        await new Promise(resolve => setTimeout(resolve, 75));
+        assert.strictEqual(successorActivated, false);
+
+        releaseOldOperation();
+        await successorActivation;
+        assert.strictEqual(firstInternals.syncOwnerToken, undefined);
+        assert.ok((successor as any).syncOwnerToken);
+    });
+
+    test('can retry ownership release after a transient release failure', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-release-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-release-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.triggers;
+        const internals = scm as any;
+        const originalRelease = internals.releaseSyncOwnershipNow.bind(scm);
+        let failRelease = true;
+        internals.releaseSyncOwnershipNow = async () => {
+            if (failRelease) {
+                const server = internals.syncOwnerServer;
+                await internals.closeSyncOwnerServer(server);
+                internals.syncOwnerServer = undefined;
+                throw new Error('simulated ownership release failure');
+            }
+            await originalRelease();
+        };
+
+        await assert.rejects(
+            () => scm.deactivate(),
+            /simulated ownership release failure/i,
+        );
+        assert.ok(internals.syncOwnerToken);
+        assert.strictEqual(internals.syncOwnerServer, undefined);
+        assert.strictEqual(await pathExists(vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-owner.json',
+        )), true);
+        await assert.rejects(
+            () => internals.beginSyncSession(),
+            /ownership release is incomplete/i,
+        );
+
+        failRelease = false;
+        await scm.deactivate();
+        assert.strictEqual(internals.syncOwnerToken, undefined);
+        assert.strictEqual(internals.syncOwnerServer, undefined);
+    });
+
+    test('reacquires ownership before removal preflights journals after a release', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-remove-release-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-remove-release-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.triggers;
+        const internals = scm as any;
+        const originalRemoveLock = internals.removeOwnedSyncOwnerLock.bind(scm);
+        const originalAcquire = internals.acquireSyncOwnership.bind(scm);
+        let releaseStarted!: () => void;
+        const releaseAtFence = new Promise<void>(resolve => {
+            releaseStarted = resolve;
+        });
+        let continueRelease!: () => void;
+        const releaseGate = new Promise<void>(resolve => {
+            continueRelease = resolve;
+        });
+        let gateFirstRelease = true;
+        internals.removeOwnedSyncOwnerLock = async (token: string) => {
+            if (gateFirstRelease) {
+                gateFirstRelease = false;
+                releaseStarted();
+                await releaseGate;
+            }
+            return originalRemoveLock(token);
+        };
+        let acquireCount = 0;
+        internals.acquireSyncOwnership = async () => {
+            acquireCount += 1;
+            await originalAcquire();
+        };
+        let preflightOwned = false;
+        internals.listLocalOperationRecords = async () => {
+            preflightOwned = Boolean(
+                internals.syncOwnerToken
+                && internals.syncOwnerServer?.listening
+            );
+            return [];
+        };
+        internals.listRemoteDeleteOperationRecords = async () => [];
+
+        const release = scm.deactivate();
+        await releaseAtFence;
+        const removal = scm.deactivateAndDrain();
+        continueRelease();
+        await release;
+        await removal;
+
+        assert.strictEqual(acquireCount, 1);
+        assert.strictEqual(preflightOwned, true);
+        assert.strictEqual(internals.syncOwnerToken, undefined);
+    });
+
+    test('does not deadlock removal that starts during ownership activation', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-activation-remove-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-activation-remove-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        const internals = scm as any;
+        const originalAcquire = internals.acquireSyncOwnership.bind(scm);
+        let signalOwnershipAcquired!: () => void;
+        const ownershipAcquired = new Promise<void>(resolve => {
+            signalOwnershipAcquired = resolve;
+        });
+        let continueActivation!: () => void;
+        const activationGate = new Promise<void>(resolve => {
+            continueActivation = resolve;
+        });
+        internals.acquireSyncOwnership = async () => {
+            await originalAcquire();
+            signalOwnershipAcquired();
+            await activationGate;
+        };
+
+        const activation = scm.triggers;
+        await ownershipAcquired;
+        const removal = scm.deactivateAndDrain();
+        continueActivation();
+
+        await assert.rejects(() => activation, /removal is already in progress/i);
+        await Promise.race([
+            removal,
+            new Promise((_, reject) => setTimeout(
+                () => reject(new Error('activation/removal ownership deadlock')),
+                2_000,
+            )),
+        ]);
+        assert.strictEqual(internals.syncOwnerToken, undefined);
+        assert.strictEqual(internals.syncOwnerServer, undefined);
+    });
+
+    test('drains a local watcher event accepted before its settings check completes', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-prequeue-remove-remote-');
+        const localRoot = await tempDir('sr-overleaf-prequeue-remove-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeText(localMain, 'closed agent edit before removal');
+
+        const internals = scm as any;
+        let signalSettingsCheck!: () => void;
+        const settingsCheckStarted = new Promise<void>(resolve => {
+            signalSettingsCheck = resolve;
+        });
+        let releaseSettingsCheck!: () => void;
+        const settingsCheckGate = new Promise<void>(resolve => {
+            releaseSettingsCheck = resolve;
+        });
+        internals.hasLocalReplicaSettings = async () => {
+            signalSettingsCheck();
+            await settingsCheckGate;
+            return true;
+        };
+
+        const watcherWork = internals.syncToVFS(localMain, 'update');
+        await settingsCheckStarted;
+        const removal = scm.prepareRemovalAndHoldOwnership();
+        releaseSettingsCheck();
+        await watcherWork;
+        await removal;
+        try {
+            assert.strictEqual(
+                await readText(remoteMain),
+                'closed agent edit before removal',
+            );
+            assert.strictEqual(internals.preQueueSyncWork.size, 0);
+        } finally {
+            await scm.finishRemoval();
+        }
+    });
+
+    test('flushes an accepted local watcher debounce before removal', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-debounce-remove-remote-');
+        const localRoot = await tempDir('sr-overleaf-debounce-remove-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeText(localMain, 'closed agent edit in debounce');
+
+        const internals = scm as any;
+        await internals.syncToVFS(localMain, 'update');
+        assert.strictEqual(internals.pendingLocalEvents.has('/main.tex'), true);
+
+        await scm.prepareRemovalAndHoldOwnership();
+        try {
+            assert.strictEqual(
+                await readText(remoteMain),
+                'closed agent edit in debounce',
+            );
+            assert.strictEqual(internals.pendingLocalEvents.size, 0);
+        } finally {
+            await scm.finishRemoval();
+        }
+    });
+
+    test('retries transient local classification while flushing removal debounce', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-classify-retry-remove-remote-');
+        const localRoot = await tempDir('sr-overleaf-classify-retry-remove-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeText(localMain, 'edit surviving transient classification failure');
+
+        const internals = scm as any;
+        const originalClassification = internals.localTargetNeedsPush.bind(scm);
+        let classificationAttempts = 0;
+        internals.localTargetNeedsPush = async (...args: unknown[]) => {
+            classificationAttempts += 1;
+            if (classificationAttempts===1) {
+                throw new Error('injected transient classification failure');
+            }
+            return originalClassification(...args);
+        };
+        await internals.syncToVFS(localMain, 'update');
+        assert.strictEqual(internals.pendingLocalEvents.has('/main.tex'), true);
+
+        await scm.prepareRemovalAndHoldOwnership();
+        try {
+            assert.strictEqual(classificationAttempts>=2, true);
+            assert.strictEqual(
+                await readText(remoteMain),
+                'edit surviving transient classification failure',
+            );
+            assert.strictEqual(internals.pendingLocalEvents.size, 0);
+            assert.strictEqual(internals.removalAcceptedSyncErrors.size, 0);
+        } finally {
+            await scm.finishRemoval();
+        }
+    });
+
+    test('blocks removal when accepted local classification keeps failing', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-classify-block-remove-remote-');
+        const localRoot = await tempDir('sr-overleaf-classify-block-remove-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeText(localMain, 'edit requiring classification');
+
+        const internals = scm as any;
+        internals.localTargetNeedsPush = async () => {
+            throw new Error('injected persistent classification failure');
+        };
+        await internals.syncToVFS(localMain, 'update');
+        assert.strictEqual(internals.pendingLocalEvents.has('/main.tex'), true);
+
+        await assert.rejects(
+            () => scm.prepareRemovalAndHoldOwnership(),
+            /could not classify accepted local edits before removal/i,
+        );
+        assert.strictEqual(await readText(remoteMain), 'baseline');
+        assert.strictEqual(
+            internals.removalAcceptedSyncErrors.get('/main.tex')?.error,
+            'injected persistent classification failure',
+        );
+        assert.strictEqual(internals.removalOwnershipHeld, false);
+    });
+
+    test('blocks detached removal while another extension host owns the folder', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-detached-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-detached-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const detached = createSCM(remoteRoot, localRoot);
+        const rootKey = await (detached as any).syncOwnerRootKey();
+        const hostId = await (detached as any).syncOwnerHostId();
+        const port = (detached as any).syncOwnerPorts(rootKey)[0];
+        const ownerRecord = {
+            version: 4,
+            token: '2123456789abcdef0123456789abcdef',
+            pid: process.pid,
+            hostname: os.hostname(),
+            hostId,
+            projectKey: remoteRoot.toString(),
+            rootKey,
+            port,
+            createdAt: new Date().toISOString(),
+        };
+        const ownerFile = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-owner.json',
+        );
+        await vscode.workspace.fs.createDirectory(
+            vscode.Uri.joinPath(localRoot, REPLICA_SETTINGS_DIR),
+        );
+        await writeText(ownerFile, JSON.stringify(ownerRecord));
+        const ownerServer = net.createServer(socket => {
+            socket.end(JSON.stringify(ownerRecord));
+        });
+        ownerServer.unref();
+        await new Promise<void>((resolve, reject) => {
+            ownerServer.once('error', reject);
+            ownerServer.listen({host: '127.0.0.1', port, exclusive: true}, resolve);
+        });
+        try {
+            await assert.rejects(
+                () => detached.deactivateAndDrain(),
+                /already active.*process|already active.*VS Code window/i,
+            );
+            assert.strictEqual(await pathExists(ownerFile), true);
+        } finally {
+            await new Promise<void>((resolve, reject) => {
+                ownerServer.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+
+    test('automatically activates a waiting SCM after the other owner releases', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-auto-retry-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-auto-retry-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const contender = createSCM(remoteRoot, localRoot);
+        const rootKey = await (contender as any).syncOwnerRootKey();
+        const hostId = await (contender as any).syncOwnerHostId();
+        const port = (contender as any).syncOwnerPorts(rootKey)[0];
+        const ownerRecord = {
+            version: 4,
+            token: '4123456789abcdef0123456789abcdef',
+            pid: process.pid,
+            hostname: os.hostname(),
+            hostId,
+            projectKey: remoteRoot.toString(),
+            rootKey,
+            port,
+            createdAt: new Date().toISOString(),
+        };
+        const ownerFile = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-owner.json',
+        );
+        await vscode.workspace.fs.createDirectory(
+            vscode.Uri.joinPath(localRoot, REPLICA_SETTINGS_DIR),
+        );
+        await writeText(ownerFile, JSON.stringify(ownerRecord));
+        const ownerServer = net.createServer(socket => {
+            socket.end(JSON.stringify(ownerRecord));
+        });
+        ownerServer.unref();
+        await new Promise<void>((resolve, reject) => {
+            ownerServer.once('error', reject);
+            ownerServer.listen({host: '127.0.0.1', port, exclusive: true}, resolve);
+        });
+
+        const persist: PersistRecord = {
+            enabled: true,
+            label: LocalReplicaSCMProvider.label,
+            baseUri: localRoot.toString(),
+            settings: {} as JSON,
+        };
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setProjectSCMPersist(localRoot.toString(), persist);
+        const collection = new SCMCollectionProvider(
+            fakeVfs as unknown as VirtualFileSystem,
+            createExtensionContextStub({[localRoot.toString()]: persist}),
+            {restorePersistedSCMs: false},
+        );
+        try {
+            const created = await (collection as any).createSCM(
+                LocalReplicaSCMProvider,
+                localRoot,
+                false,
+                true,
+                {preserveExistingLocalFiles: true},
+            ) as LocalReplicaSCMProvider;
+            const item = (collection as any).scms.find(
+                (candidate: {scm: unknown}) => candidate.scm===created,
+            );
+            assert.ok(item);
+            assert.strictEqual(item.triggers.length, 0);
+            assert.strictEqual(created.status.status, 'need-attention');
+
+            await new Promise<void>((resolve, reject) => {
+                ownerServer.close(error => error ? reject(error) : resolve());
+            });
+            await vscode.workspace.fs.delete(ownerFile);
+
+            const deadline = Date.now()+4_000;
+            while (item.triggers.length===0 && Date.now()<deadline) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            assert.ok(item.triggers.length>0);
+            assert.ok((created as any).syncOwnerToken);
+        } finally {
+            collection.dispose();
+            if (ownerServer.listening) {
+                await new Promise<void>((resolve, reject) => {
+                    ownerServer.close(error => error ? reject(error) : resolve());
+                });
+            }
+        }
+    });
+
+    test('drops a waiting SCM when removal finishes before ownership retry', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-owner-retry-remove-remote-');
+        const localRoot = await tempDir('sr-overleaf-owner-retry-remove-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        const contender = createSCM(remoteRoot, localRoot);
+        const rootKey = await (contender as any).syncOwnerRootKey();
+        const hostId = await (contender as any).syncOwnerHostId();
+        const port = (contender as any).syncOwnerPorts(rootKey)[0];
+        const ownerRecord = {
+            version: 4,
+            token: '8123456789abcdef0123456789abcdef',
+            pid: process.pid,
+            hostname: os.hostname(),
+            hostId,
+            projectKey: remoteRoot.toString(),
+            rootKey,
+            port,
+            createdAt: new Date().toISOString(),
+        };
+        const ownerFile = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-owner.json',
+        );
+        await writeText(ownerFile, JSON.stringify(ownerRecord));
+        const ownerServer = net.createServer(socket => {
+            socket.end(JSON.stringify(ownerRecord));
+        });
+        ownerServer.unref();
+        await new Promise<void>((resolve, reject) => {
+            ownerServer.once('error', reject);
+            ownerServer.listen({host: '127.0.0.1', port, exclusive: true}, resolve);
+        });
+
+        const persist: PersistRecord = {
+            enabled: true,
+            label: LocalReplicaSCMProvider.label,
+            baseUri: localRoot.toString(),
+            settings: {} as JSON,
+        };
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setProjectSCMPersist(localRoot.toString(), persist);
+        const collection = new SCMCollectionProvider(
+            fakeVfs as unknown as VirtualFileSystem,
+            createExtensionContextStub({[localRoot.toString()]: persist}),
+            {restorePersistedSCMs: false},
+        );
+        try {
+            const created = await (collection as any).createSCM(
+                LocalReplicaSCMProvider,
+                localRoot,
+                false,
+                true,
+                {preserveExistingLocalFiles: true},
+            ) as LocalReplicaSCMProvider;
+            const item = (collection as any).scms.find(
+                (candidate: {scm: unknown}) => candidate.scm===created,
+            );
+            assert.ok(item);
+            assert.strictEqual(item.triggers.length, 0);
+
+            await localReplicaWorkspace.writeReplicaRemovalTombstone(
+                localRoot,
+                remoteRoot,
+            );
+            fakeVfs.setProjectSCMPersist(localRoot.toString(), undefined);
+            await new Promise<void>((resolve, reject) => {
+                ownerServer.close(error => error ? reject(error) : resolve());
+            });
+            await vscode.workspace.fs.delete(ownerFile);
+
+            await waitUntil(
+                () => !(collection as any).scms.includes(item),
+                4_000,
+            );
+            assert.strictEqual((created as any).syncOwnerToken, undefined);
+            assert.strictEqual(
+                await localReplicaWorkspace.hasReplicaRemovalTombstone(
+                    localRoot,
+                    remoteRoot,
+                ),
+                true,
+            );
+        } finally {
+            collection.dispose();
+            if (ownerServer.listening) {
+                await new Promise<void>((resolve, reject) => {
+                    ownerServer.close(error => error ? reject(error) : resolve());
+                });
+            }
+            await localReplicaWorkspace.clearReplicaRemovalTombstone(localRoot);
+        }
+    });
+
+    test('drains every queued binary replacement before deleting its Local Replica mapping', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-remove-drain-remote-');
+        const localRoot = await tempDir('sr-overleaf-remove-drain-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        const baseline = Buffer.from([1, 2, 3]);
+        const replacement = Buffer.from([9, 8, 7, 6]);
+        const queuedReplacement = Buffer.from([5, 4, 3, 2, 1]);
+        await writeBytes(remoteImage, baseline);
+
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, replacement);
+        const persist: PersistRecord = {
+            enabled: true,
+            label: LocalReplicaSCMProvider.label,
+            baseUri: localRoot.toString(),
+            settings: {} as JSON,
+        };
+        fakeVfs.setProjectSCMPersist(scm.scmKey, persist);
+
+        const originalPushWithRetry = (scm as any).pushWithRetry.bind(scm);
+        let releaseUpload!: () => void;
+        const uploadGate = new Promise<void>(resolve => {
+            releaseUpload = resolve;
+        });
+        let signalUploadStarted!: () => void;
+        const uploadStarted = new Promise<void>(resolve => {
+            signalUploadStarted = resolve;
+        });
+        (scm as any).pushWithRetry = async (...args: unknown[]) => {
+            signalUploadStarted();
+            await uploadGate;
+            return originalPushWithRetry(...args);
+        };
+
+        const collection = Object.create(
+            SCMCollectionProvider.prototype,
+        ) as SCMCollectionProvider;
+        const internals = collection as any;
+        let triggerDisposeCount = 0;
+        internals.pendingSCMInstances = new Set();
+        internals.pendingSCMs = new Map();
+        internals.initSCMsPromise = Promise.resolve();
+        internals.disposed = false;
+        internals.scms = [{
+            scm,
+            enabled: true,
+            triggers: [{
+                dispose: () => {
+                    triggerDisposeCount += 1;
+                },
+            }],
+        }];
+        internals.vfs = fakeVfs;
+        internals.updateStatus = () => undefined;
+
+        const push = (scm as any).enqueueSync(
+            '/figure.png',
+            () => (scm as any).applySync(
+                'push',
+                'update',
+                '/figure.png',
+                localImage,
+                remoteImage,
+            ),
+        );
+        await uploadStarted;
+        assert.strictEqual(await pathExists(remoteImage), false);
+        assert.strictEqual(
+            (await vscode.workspace.fs.readDirectory(remoteRoot))
+                .filter(([name]) => name.startsWith('.sr-overleaf-replace-')).length,
+            1,
+        );
+        await writeBytes(localImage, queuedReplacement);
+        const queuedPush = (scm as any).enqueueSync(
+            '/figure.png',
+            () => (scm as any).applySync(
+                'push',
+                'update',
+                '/figure.png',
+                localImage,
+                remoteImage,
+            ),
+        );
+
+        let removalSettled = false;
+        const removal = collection.removeLocalReplicaSCM(
+            scm.scmKey,
+            localRoot,
+        ).finally(() => {
+            removalSettled = true;
+        });
+        await new Promise(resolve => setTimeout(resolve, 25));
+        assert.strictEqual(removalSettled, false);
+        assert.strictEqual(fakeVfs.hasProjectSCMPersist(scm.scmKey), true);
+
+        releaseUpload();
+        const pushed = await push as Events['scmSyncCompleteEvent'];
+        const queued = await queuedPush as Events['scmSyncCompleteEvent'];
+        await removal;
+
+        assert.strictEqual(pushed.outcome, 'success');
+        assert.strictEqual(queued.outcome, 'success');
+        assert.deepStrictEqual(await readBytes(remoteImage), queuedReplacement);
+        assert.strictEqual(fakeVfs.hasProjectSCMPersist(scm.scmKey), false);
+        assert.strictEqual(triggerDisposeCount, 1);
+        assert.deepStrictEqual(
+            (await vscode.workspace.fs.readDirectory(remoteRoot))
+                .filter(([name]) => name.startsWith('.sr-overleaf-replace-')),
+            [],
+        );
+        const journalEntries = await vscode.workspace.fs.readDirectory(
+            vscode.Uri.joinPath(
+                localRoot,
+                REPLICA_SETTINGS_DIR,
+                'remote-delete-operations',
+            ),
+        );
+        assert.deepStrictEqual(
+            journalEntries.filter(([name]) => name.endsWith('.json')),
+            [],
+        );
+    });
+
+    test('retains an inactive mapping when its detached journal still needs recovery', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-detached-journal-remote-');
+        const localRoot = await tempDir('sr-overleaf-detached-journal-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const persist: PersistRecord = {
+            enabled: true,
+            label: LocalReplicaSCMProvider.label,
+            baseUri: localRoot.toString(),
+            settings: {} as JSON,
+        };
+        fakeVfs.setProjectSCMPersist(localRoot.toString(), persist);
+        (fakeVfs as any).context = createExtensionContextStub({
+            [localRoot.toString()]: persist,
+        });
+        (fakeVfs as any).scmCollectionItem = undefined;
+        const operationId = '0123456789abcdef01234567';
+        await writeText(
+            vscode.Uri.joinPath(
+                localRoot,
+                REPLICA_SETTINGS_DIR,
+                'remote-delete-operations',
+                `${operationId}.json`,
+            ),
+            JSON.stringify({
+                version: 1,
+                id: operationId,
+                kind: 'replace',
+                relPath: '/figure.png',
+                stagingRelPath: `/.sr-overleaf-replace-${operationId}`,
+                expectedRevision: sha1('baseline'),
+                replacementRevision: sha1('replacement'),
+                createdAt: new Date().toISOString(),
+            }),
+        );
+
+        await assert.rejects(
+            () => VirtualFileSystem.prototype.removeLocalReplicaSCM.call(
+                fakeVfs,
+                localRoot.toString(),
+                localRoot,
+            ),
+            /recoverable file operations/,
+        );
+
+        assert.strictEqual(
+            fakeVfs.hasProjectSCMPersist(localRoot.toString()),
+            true,
+        );
+    });
+
+    test('removes a pending Local Replica after its failed activation has stopped', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-pending-remove-remote-');
+        const localRoot = await tempDir('sr-overleaf-pending-remove-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        const persist: PersistRecord = {
+            enabled: true,
+            label: LocalReplicaSCMProvider.label,
+            baseUri: localRoot.toString(),
+            settings: {} as JSON,
+        };
+        fakeVfs.setProjectSCMPersist(localRoot.toString(), persist);
+
+        const watchers: TestFileSystemWatcher[] = [];
+        (vscode.workspace as any).createFileSystemWatcher = () => {
+            const watcher = new TestFileSystemWatcher();
+            watchers.push(watcher);
+            return watcher;
+        };
+        let releaseInitialization!: () => void;
+        const initializationGate = new Promise<void>(resolve => {
+            releaseInitialization = resolve;
+        });
+        let signalInitializationStarted!: () => void;
+        const initializationStarted = new Promise<void>(resolve => {
+            signalInitializationStarted = resolve;
+        });
+        (scm as any).initializeLocalReplica = async () => {
+            signalInitializationStarted();
+            await initializationGate;
+            return false;
+        };
+        const activation = scm.triggers;
+        const pendingCreation = activation
+            .then(() => scm)
+            .catch(() => undefined);
+        await initializationStarted;
+
+        const collection = Object.create(
+            SCMCollectionProvider.prototype,
+        ) as SCMCollectionProvider;
+        const internals = collection as any;
+        internals.pendingSCMInstances = new Set([scm]);
+        internals.pendingSCMs = new Map([[
+            `${LocalReplicaSCMProvider.label}:${localRoot.toString()}`,
+            pendingCreation,
+        ]]);
+        internals.initSCMsPromise = Promise.resolve();
+        internals.disposed = false;
+        internals.scms = [];
+        internals.vfs = fakeVfs;
+        internals.updateStatus = () => undefined;
+
+        const removal = collection.removeLocalReplicaSCM(
+            localRoot.toString(),
+            localRoot,
+        );
+        releaseInitialization();
+        await removal;
+
+        assert.strictEqual(
+            fakeVfs.hasProjectSCMPersist(localRoot.toString()),
+            false,
+        );
+        assert.strictEqual((scm as any).syncSessionActive, false);
+        watchers.forEach(watcher => watcher.dispose());
+    });
+
+    test('does not revive the old folder after an A-to-B Local Replica switch and removal', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-switch-remove-remote-');
+        const localRootA = await tempDir('sr-overleaf-switch-remove-a-');
+        const localRootB = await tempDir('sr-overleaf-switch-remove-b-');
+        tempRoots.push(remoteRoot, localRootA, localRootB);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        await writeReplicaSettings(localRootA, remoteRoot);
+        await writeReplicaSettings(localRootB, remoteRoot);
+
+        const persistA: PersistRecord = {
+            enabled: true,
+            label: LocalReplicaSCMProvider.label,
+            baseUri: localRootA.toString(),
+            settings: {} as JSON,
+        };
+        const persistB: PersistRecord = {
+            enabled: true,
+            label: LocalReplicaSCMProvider.label,
+            baseUri: localRootB.toString(),
+            settings: {} as JSON,
+        };
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setProjectSCMPersist(localRootA.toString(), persistA);
+        fakeVfs.setProjectSCMPersist(localRootB.toString(), persistB);
+        const collection = new SCMCollectionProvider(
+            fakeVfs as unknown as VirtualFileSystem,
+            createExtensionContextStub({
+                [localRootA.toString()]: persistA,
+                [localRootB.toString()]: persistB,
+            }),
+            {restorePersistedSCMs: false},
+        );
+
+        try {
+            await (collection as any).createSCM(
+                LocalReplicaSCMProvider,
+                localRootA,
+                false,
+                true,
+                {preserveExistingLocalFiles: true},
+            );
+            const suspended = await (collection as any).suspendSCMsByLabel(
+                LocalReplicaSCMProvider.label,
+                localRootB,
+            );
+            assert.strictEqual(suspended.length, 1);
+            await (collection as any).createSCM(
+                LocalReplicaSCMProvider,
+                localRootB,
+                false,
+                true,
+                {preserveExistingLocalFiles: true},
+            );
+            await (collection as any).removeSCMsByLabel(
+                LocalReplicaSCMProvider.label,
+                localRootB,
+            );
+            assert.strictEqual(fakeVfs.hasProjectSCMPersist(localRootA.toString()), false);
+            assert.strictEqual(fakeVfs.hasProjectSCMPersist(localRootB.toString()), true);
+
+            await setActiveReplicaRoot(localRootB);
+            await collection.removeLocalReplicaSCM(
+                localRootB.toString(),
+                localRootB,
+            );
+            assert.strictEqual(fakeVfs.hasProjectSCMPersist(localRootB.toString()), false);
+
+            await setActiveReplicaRoot(undefined);
+            setWorkspaceFoldersForTest(localRootA, localRootB);
+            await localReplicaWorkspace.initializeLocalReplicaWorkspace();
+            assert.strictEqual(getActiveReplicaRoot(), undefined);
+        } finally {
+            collection.dispose();
+        }
+    });
+
+    test('rolls back B and restores only A when an exact-folder persist removal fails', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-switch-rollback-remote-');
+        const localRootA = await tempDir('sr-overleaf-switch-rollback-a-');
+        const localRootB = await tempDir('sr-overleaf-switch-rollback-b-');
+        tempRoots.push(remoteRoot, localRootA, localRootB);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote baseline');
+        await writeReplicaSettings(localRootA, remoteRoot);
+        await writeReplicaSettings(localRootB, remoteRoot);
+        const persistA: PersistRecord = {
+            enabled: true,
+            label: LocalReplicaSCMProvider.label,
+            baseUri: localRootA.toString(),
+            settings: {} as JSON,
+        };
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setProjectSCMPersist(localRootA.toString(), persistA);
+        const originalSetPersist = fakeVfs.setProjectSCMPersist.bind(fakeVfs);
+        let failRemovingA = true;
+        fakeVfs.setProjectSCMPersist = (key: string, persist?: PersistRecord) => {
+            if (
+                failRemovingA
+                && key===localRootA.toString()
+                && persist===undefined
+            ) {
+                failRemovingA = false;
+                throw new Error('simulated A persist removal failure');
+            }
+            originalSetPersist(key, persist);
+        };
+        const collection = new SCMCollectionProvider(
+            fakeVfs as unknown as VirtualFileSystem,
+            createExtensionContextStub({[localRootA.toString()]: persistA}),
+            {restorePersistedSCMs: false},
+        );
+        await (collection as any).createSCM(
+            LocalReplicaSCMProvider,
+            localRootA,
+            false,
+            true,
+            {preserveExistingLocalFiles: true},
+        );
+        await setActiveReplicaRoot(localRootA);
+        (collection as any).promptBaseUri = async () => localRootB.fsPath;
+
+        try {
+            const created = await (collection as any).createNewExactLocalReplicaSCM();
+            assert.strictEqual(created, undefined);
+            const records = (collection as any).scms as Array<{
+                scm: LocalReplicaSCMProvider;
+                triggers: vscode.Disposable[];
+            }>;
+            const aRecord = records.find(record =>
+                record.scm.baseUri.toString()===localRootA.toString()
+            );
+            const bRecord = records.find(record =>
+                record.scm.baseUri.toString()===localRootB.toString()
+            );
+            assert.ok(aRecord);
+            assert.ok(aRecord.triggers.length>0);
+            assert.strictEqual(bRecord, undefined);
+            assert.strictEqual(
+                fakeVfs.hasProjectSCMPersist(localRootA.toString()),
+                true,
+            );
+            assert.strictEqual(
+                fakeVfs.hasProjectSCMPersist(localRootB.toString()),
+                false,
+            );
+
+            await setActiveReplicaRoot(undefined);
+            setWorkspaceFoldersForTest(localRootA);
+            await localReplicaWorkspace.initializeLocalReplicaWorkspace();
+            assert.strictEqual(
+                getActiveReplicaRoot()?.toString(),
+                localRootA.toString(),
+            );
+        } finally {
+            collection.dispose();
+        }
+    });
+
+    test('removing the open Local Replica stops sync and suppresses marker restoration', async () => {
+        const localRoot = await tempDir('sr-overleaf-remove-open-');
+        tempRoots.push(localRoot);
+        const projectUri = vscode.Uri.parse(
+            `${ROOT_NAME}://test-server/Remove%20Project` +
+            '?user=test-user&project=remove-project',
+        );
+        await writeText(settingsUri(localRoot), JSON.stringify({
+            uri: vscode.Uri.file('/tmp/remove-project').toString(),
+            serverName: 'test-server',
+            enableCompileNPreview: true,
+            projectName: 'Remove Project',
+        }));
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(localMain, 'local content remains');
+        setWorkspaceFoldersForTest(localRoot);
+        await setActiveReplicaRoot(localRoot);
+
+        const calls: string[] = [];
+        let watcherActive = true;
+        const provider = new ProjectManagerProvider({} as any, {
+            removeLocalReplicaSCM: async (
+                receivedProject: vscode.Uri,
+                receivedKey: string,
+                receivedRoot: vscode.Uri,
+            ) => {
+                assert.strictEqual(receivedProject.toString(), projectUri.toString());
+                assert.strictEqual(receivedKey, localRoot.toString());
+                assert.strictEqual(receivedRoot.toString(), localRoot.toString());
+                watcherActive = false;
+                calls.push('remove-scm');
+            },
+            deactivateProject: async (receivedProject: vscode.Uri) => {
+                assert.strictEqual(watcherActive, false);
+                assert.strictEqual(receivedProject.toString(), projectUri.toString());
+                calls.push('deactivate-vfs');
+            },
+        } as any);
+
+        await (provider as any).removeLocalReplicaMapping(
+            projectUri,
+            localRoot.toString(),
+            localRoot,
+        );
+
+        assert.deepStrictEqual(calls, ['remove-scm', 'deactivate-vfs']);
+        assert.strictEqual(getActiveReplicaRoot(), undefined);
+        assert.strictEqual(await pathExists(settingsUri(localRoot)), true);
+        assert.strictEqual(await readText(localMain), 'local content remains');
+
+        await localReplicaWorkspace.initializeLocalReplicaWorkspace();
+        assert.strictEqual(getActiveReplicaRoot(), undefined);
+    });
+
+    test('does not revive a suppressed active root after a crash before active-root cleanup', async () => {
+        const localRoot = await tempDir('sr-overleaf-remove-crash-window-');
+        tempRoots.push(localRoot);
+        await writeText(settingsUri(localRoot), JSON.stringify({
+            uri: vscode.Uri.file('/tmp/remove-crash-window').toString(),
+            serverName: 'test-server',
+            enableCompileNPreview: true,
+            projectName: 'Remove Crash Window',
+        }));
+        setWorkspaceFoldersForTest(localRoot);
+        await setActiveReplicaRoot(localRoot);
+
+        await localReplicaWorkspace.suppressReplicaAutoRestoreRoot(localRoot);
+        await localReplicaWorkspace.initializeLocalReplicaWorkspace();
+
+        assert.strictEqual(getActiveReplicaRoot(), undefined);
+        await localReplicaWorkspace.initializeLocalReplicaWorkspace();
+        assert.strictEqual(getActiveReplicaRoot(), undefined);
+    });
+
+    test('removing an inactive Local Replica preserves the active root and blocks later restoration', async () => {
+        const activeRoot = await tempDir('sr-overleaf-remove-inactive-active-');
+        const removedRoot = await tempDir('sr-overleaf-remove-inactive-removed-');
+        tempRoots.push(activeRoot, removedRoot);
+        const projectUri = vscode.Uri.parse(
+            `${ROOT_NAME}://test-server/Inactive%20Project` +
+            '?user=test-user&project=inactive-project',
+        );
+        for (const [root, name] of [
+            [activeRoot, 'Active Project'],
+            [removedRoot, 'Inactive Project'],
+        ] as const) {
+            await writeText(settingsUri(root), JSON.stringify({
+                uri: vscode.Uri.file(`/tmp/${name.replace(' ', '-').toLowerCase()}`).toString(),
+                serverName: 'test-server',
+                enableCompileNPreview: true,
+                projectName: name,
+            }));
+        }
+        setWorkspaceFoldersForTest(activeRoot, removedRoot);
+        await setActiveReplicaRoot(activeRoot);
+
+        const calls: string[] = [];
+        const provider = new ProjectManagerProvider({} as any, {
+            removeLocalReplicaSCM: async (
+                receivedProject: vscode.Uri,
+                receivedKey: string,
+                receivedRoot: vscode.Uri,
+            ) => {
+                assert.strictEqual(receivedProject.toString(), projectUri.toString());
+                assert.strictEqual(receivedKey, removedRoot.toString());
+                assert.strictEqual(receivedRoot.toString(), removedRoot.toString());
+                calls.push('remove-scm');
+            },
+            deactivateProject: async () => {
+                calls.push('deactivate-vfs');
+            },
+        } as any);
+
+        await (provider as any).removeLocalReplicaMapping(
+            projectUri,
+            removedRoot.toString(),
+            removedRoot,
+        );
+
+        assert.deepStrictEqual(calls, ['remove-scm']);
+        assert.strictEqual(getActiveReplicaRoot()?.toString(), activeRoot.toString());
+
+        await setActiveReplicaRoot(undefined);
+        setWorkspaceFoldersForTest(removedRoot);
+        await localReplicaWorkspace.initializeLocalReplicaWorkspace();
+        assert.strictEqual(getActiveReplicaRoot(), undefined);
+    });
+
     test('switches away from an active live local replica before selecting another project folder', async () => {
         const oldRoot = await tempDir('sr-overleaf-old-live-');
         tempRoots.push(oldRoot);
@@ -3694,13 +6135,19 @@ suite('Select Project Folder Local Replica', function () {
             setWorkspaceFoldersForTest(vscode.Uri.file(os.tmpdir()));
             return true;
         };
-        (vscode.commands as any).executeCommand = async (command: string, arg?: unknown) => {
+        let activationOptions: unknown;
+        (vscode.commands as any).executeCommand = async (
+            command: string,
+            arg?: unknown,
+            options?: unknown,
+        ) => {
             calls.push(command);
             if (command===`${ROOT_NAME}.remoteFileSystem.deactivateProject`) {
                 calls.push((arg as vscode.Uri).toString());
             }
             if (command===`${ROOT_NAME}.remoteFileSystem.activateProject`) {
                 assert.strictEqual((arg as vscode.Uri).toString(), newProjectUri.toString());
+                activationOptions = options;
                 return { origin: newProjectUri };
             }
             if (command===`${ROOT_NAME}.projectSCM.newExactLocalReplicaSCM`) {
@@ -3723,6 +6170,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.ok(calls.includes(newProjectUri.toString()));
         assert.ok(calls.includes('updateWorkspaceFolders:0:1'));
         assert.strictEqual(getActiveReplicaRoot(), undefined);
+        assert.deepStrictEqual(activationOptions, {restorePersistedSCMs: false});
     });
 
     test('uses remote-authoritative cleanup only when resetLocalFilesToRemote is explicit', async () => {
@@ -4862,12 +7310,126 @@ suite('Select Project Folder Local Replica', function () {
             REPLICA_SETTINGS_DIR,
             'operations',
         );
+        await Promise.all([
+            ...(restartedScm as any).localGuardCleanupPromises.values(),
+        ]);
         const operationEntries = await vscode.workspace.fs.readDirectory(operationsRoot);
-        assert.strictEqual(operationEntries.filter(([name]) => name.endsWith('.json')).length, 1);
-        assert.strictEqual(operationEntries.filter(([name]) => name.endsWith('.committed')).length, 1);
-        const guardName = operationEntries.find(([name]) => name.endsWith('.guard'))?.[0];
-        assert.ok(guardName);
-        assert.strictEqual(await readText(vscode.Uri.joinPath(operationsRoot, guardName)), 'baseline');
+        assert.deepStrictEqual(
+            operationEntries.filter(([name]) =>
+                name.endsWith('.guard')
+                || name.endsWith('.json')
+                || name.endsWith('.committed')),
+            [],
+        );
+    });
+
+    test('does not revive an unchanged committed write after its parent was deleted', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-deleted-parent-remote-');
+        const localRoot = await tempDir('sr-overleaf-deleted-parent-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const id = `feedface-${Date.now()}-00112233`;
+        const record = {
+            version: 1,
+            id,
+            kind: 'write',
+            relPath: '/removed/child.tex',
+            entityKind: 'file',
+            expectedRevision: sha1('original inode'),
+            installedRevision: sha1('installed remote bytes'),
+            stageName: `.sr-overleaf-${id}.new`,
+            backupName: `.sr-overleaf-${id}.old`,
+            guardName: `.sr-overleaf-${id}.guard`,
+            createdAt: new Date().toISOString(),
+        };
+        await (firstScm as any).createLocalOperationRecord(record);
+        const operationsRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'operations',
+        );
+        await writeText(
+            vscode.Uri.joinPath(operationsRoot, record.guardName),
+            'original inode',
+        );
+        await (firstScm as any).markLocalOperationCommitted(id);
+        await firstScm.deactivate();
+
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.strictEqual(
+            await pathExists(vscode.Uri.joinPath(localRoot, 'removed')),
+            false,
+        );
+        await Promise.all([
+            ...(restartedScm as any).localGuardCleanupPromises.values(),
+        ]);
+        const remainingEntries = await vscode.workspace.fs.readDirectory(operationsRoot);
+        assert.deepStrictEqual(
+            remainingEntries.filter(([name]) =>
+                name.endsWith('.guard')
+                || name.endsWith('.json')
+                || name.endsWith('.committed')),
+            [],
+        );
+    });
+
+    test('restores a changed committed inode when its deleted parent is missing', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-changed-parent-remote-');
+        const localRoot = await tempDir('sr-overleaf-changed-parent-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const id = `facefeed-${Date.now()}-44556677`;
+        const record = {
+            version: 1,
+            id,
+            kind: 'write',
+            relPath: '/removed/child.tex',
+            entityKind: 'file',
+            expectedRevision: sha1('original inode'),
+            installedRevision: sha1('installed remote bytes'),
+            stageName: `.sr-overleaf-${id}.new`,
+            backupName: `.sr-overleaf-${id}.old`,
+            guardName: `.sr-overleaf-${id}.guard`,
+            createdAt: new Date().toISOString(),
+        };
+        await (firstScm as any).createLocalOperationRecord(record);
+        const operationsRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'operations',
+        );
+        await writeText(
+            vscode.Uri.joinPath(operationsRoot, record.guardName),
+            'late write through old inode',
+        );
+        await (firstScm as any).markLocalOperationCommitted(id);
+        await firstScm.deactivate();
+
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            false,
+        );
+        assert.strictEqual(
+            await readText(vscode.Uri.joinPath(localRoot, 'removed', 'child.tex')),
+            'late write through old inode',
+        );
+        assert.strictEqual(
+            (restartedScm as any).syncConflicts.has('/removed/child.tex'),
+            true,
+        );
+        assert.strictEqual(
+            await pathExists(vscode.Uri.joinPath(remoteRoot, 'removed')),
+            false,
+        );
     });
 
     test('restores a changed open inode to the visible local path during a pull', async () => {
@@ -4967,6 +7529,8 @@ suite('Select Project Folder Local Replica', function () {
             error.code = 'EXDEV';
             throw error;
         };
+        let descriptorOpen = true;
+        (scm as any).retainedPathHasOpenFileDescriptor = async () => descriptorOpen;
 
         const event = await (scm as any).applySync(
             'pull',
@@ -4988,6 +7552,7 @@ suite('Select Project Folder Local Replica', function () {
             vscode.Uri.joinPath(operationsRoot, guardName),
             'late agent edit through retained inode',
         );
+        descriptorOpen = false;
 
         await assert.rejects(
             () => scm.flushBeforeCompile([]),
@@ -5011,32 +7576,32 @@ suite('Select Project Folder Local Replica', function () {
         const scm = createSCM(remoteRoot, localRoot);
         await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
         await writeText(remoteMain, 'remote update');
-        const event = await (scm as any).applySync(
-            'pull',
-            'update',
-            '/main.tex',
-            remoteMain,
-            localMain,
-        ) as Events['scmSyncCompleteEvent'];
-        assert.strictEqual(event.outcome, 'success');
-
+        const openGuard = await fs.open(localMain.fsPath, 'r');
         const operationsRoot = vscode.Uri.joinPath(
             localRoot,
             REPLICA_SETTINGS_DIR,
             'operations',
         );
-        const operationEntries = await vscode.workspace.fs.readDirectory(operationsRoot);
-        const guardName = operationEntries.find(([name]) => name.endsWith('.guard'))?.[0];
-        assert.ok(guardName);
-        const guardPath = path.join(operationsRoot.fsPath, guardName);
-        const openGuard = await fs.open(guardPath, 'r');
-        assert.strictEqual(
-            await (scm as any).retainedPathHasOpenFileDescriptor(guardPath),
-            true,
-        );
         let descriptorOpen = true;
-        (scm as any).retainedPathHasOpenFileDescriptor = async () => descriptorOpen;
         try {
+            const event = await (scm as any).applySync(
+                'pull',
+                'update',
+                '/main.tex',
+                remoteMain,
+                localMain,
+            ) as Events['scmSyncCompleteEvent'];
+            assert.strictEqual(event.outcome, 'success');
+
+            const operationEntries = await vscode.workspace.fs.readDirectory(operationsRoot);
+            const guardName = operationEntries.find(([name]) => name.endsWith('.guard'))?.[0];
+            assert.ok(guardName);
+            const guardPath = path.join(operationsRoot.fsPath, guardName);
+            assert.strictEqual(
+                await (scm as any).retainedPathHasOpenFileDescriptor(guardPath),
+                true,
+            );
+            (scm as any).retainedPathHasOpenFileDescriptor = async () => descriptorOpen;
             await scm.flushBeforeCompile([]);
             await Promise.all([
                 ...(scm as any).localGuardCleanupPromises.values(),
@@ -5071,6 +7636,8 @@ suite('Select Project Folder Local Replica', function () {
         const scm = createSCM(remoteRoot, localRoot);
         await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
         await vscode.workspace.fs.delete(remoteMain);
+        let descriptorOpen = true;
+        (scm as any).retainedPathHasOpenFileDescriptor = async () => descriptorOpen;
         const event = await (scm as any).applySync(
             'pull',
             'delete',
@@ -5092,6 +7659,7 @@ suite('Select Project Folder Local Replica', function () {
             vscode.Uri.joinPath(operationsRoot, guardName),
             'late edit after delete',
         );
+        descriptorOpen = false;
 
         await assert.rejects(
             () => scm.flushBeforeCompile([]),
@@ -5388,6 +7956,731 @@ suite('Select Project Folder Local Replica', function () {
         assert.deepStrictEqual(journalEntries.filter(([name]) => name.endsWith('.json')), []);
     });
 
+    test('restores a staged binary replacement before restart reconciliation', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-binary-replace-crash-remote-');
+        const localRoot = await tempDir('sr-overleaf-binary-replace-crash-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        const baseline = Buffer.from([1, 2, 3]);
+        const replacement = Buffer.from([9, 8, 7, 6]);
+        await writeBytes(remoteImage, baseline);
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, replacement);
+
+        const generation = (firstScm as any).syncGeneration as number;
+        const expected = await (firstScm as any).captureRemotePathRevision(
+            '/figure.png',
+            generation,
+        );
+        const operationId = (firstScm as any).remoteReplacementOperationId(
+            '/figure.png',
+            expected.revision,
+            sha1(replacement),
+        );
+        const stagingRelPath = (firstScm as any).remoteReplacementStagingPath(
+            '/figure.png',
+            expected.revision,
+            sha1(replacement),
+        );
+        await (firstScm as any).createRemoteDeleteOperationRecord({
+            version: 1,
+            id: operationId,
+            kind: 'replace',
+            relPath: '/figure.png',
+            stagingRelPath,
+            expectedRevision: expected.revision,
+            replacementRevision: sha1(replacement),
+            createdAt: new Date().toISOString(),
+        });
+        await vscode.workspace.fs.rename(
+            remoteImage,
+            (firstScm as any).vfs.pathToUri(stagingRelPath),
+            {overwrite: false},
+        );
+        firstScm.deactivate();
+
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        const originalOverwrite = (restartedScm as any).overwrite.bind(restartedScm);
+        let remoteBeforeReconciliation: Uint8Array | undefined;
+        (restartedScm as any).overwrite = async (...args: unknown[]) => {
+            remoteBeforeReconciliation = await readBytes(remoteImage);
+            return originalOverwrite(...args);
+        };
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+
+        assert.deepStrictEqual(
+            Buffer.from(remoteBeforeReconciliation!),
+            baseline,
+        );
+        assert.deepStrictEqual(await readBytes(remoteImage), replacement);
+        assert.strictEqual(
+            await pathExists((restartedScm as any).vfs.pathToUri(stagingRelPath)),
+            false,
+        );
+        const journalRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'remote-delete-operations',
+        );
+        const journalEntries = await vscode.workspace.fs.readDirectory(journalRoot);
+        assert.deepStrictEqual(journalEntries.filter(([name]) => name.endsWith('.json')), []);
+    });
+
+    test('finishes binary replacement cleanup after restart', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-binary-cleanup-crash-remote-');
+        const localRoot = await tempDir('sr-overleaf-binary-cleanup-crash-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        const replacement = Buffer.from([9, 8, 7, 6]);
+        await writeBytes(remoteImage, Buffer.from([1, 2, 3]));
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, replacement);
+
+        const originalCleanup = (firstScm as any).removeRemoteReplacementStage.bind(firstScm);
+        let retainStage = true;
+        (firstScm as any).removeRemoteReplacementStage = async (...args: unknown[]) => {
+            if (retainStage) {
+                retainStage = false;
+                return false;
+            }
+            return originalCleanup(...args);
+        };
+        const pushed = await (firstScm as any).applySync(
+            'push',
+            'update',
+            '/figure.png',
+            localImage,
+            remoteImage,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(pushed.outcome, 'success');
+        assert.deepStrictEqual(await readBytes(remoteImage), replacement);
+        let remoteEntries = await vscode.workspace.fs.readDirectory(remoteRoot);
+        assert.strictEqual(
+            remoteEntries.filter(([name]) => name.startsWith('.sr-overleaf-replace-')).length,
+            1,
+        );
+        firstScm.deactivate();
+
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.deepStrictEqual(await readBytes(remoteImage), replacement);
+        remoteEntries = await vscode.workspace.fs.readDirectory(remoteRoot);
+        assert.deepStrictEqual(
+            remoteEntries.filter(([name]) => name.startsWith('.sr-overleaf-replace-')),
+            [],
+        );
+        const journalRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'remote-delete-operations',
+        );
+        const journalEntries = await vscode.workspace.fs.readDirectory(journalRoot);
+        assert.deepStrictEqual(journalEntries.filter(([name]) => name.endsWith('.json')), []);
+    });
+
+    test('restores a changed replacement stage to its visible path before blocking recovery', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-binary-changed-stage-remote-');
+        const localRoot = await tempDir('sr-overleaf-binary-changed-stage-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        const baseline = Buffer.from([1, 2, 3]);
+        const replacement = Buffer.from([9, 8, 7]);
+        const collaboratorStage = Buffer.from([4, 5, 6]);
+        await writeBytes(remoteImage, baseline);
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, replacement);
+        const generation = (firstScm as any).syncGeneration as number;
+        const operationId = (firstScm as any).remoteReplacementOperationId(
+            '/figure.png',
+            sha1(baseline),
+            sha1(replacement),
+        );
+        const stagingRelPath = (firstScm as any).remoteReplacementStagingPath(
+            '/figure.png',
+            sha1(baseline),
+            sha1(replacement),
+        );
+        const stagingUri = (firstScm as any).vfs.pathToUri(stagingRelPath);
+        await (firstScm as any).createRemoteDeleteOperationRecord({
+            version: 1,
+            id: operationId,
+            kind: 'replace',
+            relPath: '/figure.png',
+            stagingRelPath,
+            expectedRevision: sha1(baseline),
+            replacementRevision: sha1(replacement),
+            createdAt: new Date().toISOString(),
+        });
+        await vscode.workspace.fs.rename(remoteImage, stagingUri, {overwrite: false});
+        await writeBytes(stagingUri, collaboratorStage);
+        firstScm.deactivate();
+
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.deepStrictEqual(await readBytes(remoteImage), collaboratorStage);
+        assert.strictEqual(await pathExists(stagingUri), false);
+        assert.strictEqual((restartedScm as any).syncConflicts.has('/figure.png'), true);
+        const journalRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'remote-delete-operations',
+        );
+        const journalEntries = await vscode.workspace.fs.readDirectory(journalRoot);
+        assert.deepStrictEqual(journalEntries.filter(([name]) => name.endsWith('.json')), []);
+    });
+
+    test('keeps a superseded cleanup journal from reviving an already resolved conflict', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-binary-superseded-remote-');
+        const localRoot = await tempDir('sr-overleaf-binary-superseded-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        const baseline = Buffer.from([1, 2, 3]);
+        const firstReplacement = Buffer.from([4, 5, 6]);
+        const finalReplacement = Buffer.from([7, 8, 9]);
+        await writeBytes(remoteImage, baseline);
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const originalCleanup = (firstScm as any).removeRemoteReplacementStage.bind(firstScm);
+        let retainFirstStage = true;
+        (firstScm as any).removeRemoteReplacementStage = async (...args: unknown[]) => {
+            if (retainFirstStage) {
+                retainFirstStage = false;
+                return false;
+            }
+            return originalCleanup(...args);
+        };
+        await writeBytes(localImage, firstReplacement);
+        const firstPush = await (firstScm as any).applySync(
+            'push',
+            'update',
+            '/figure.png',
+            localImage,
+            remoteImage,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(firstPush.outcome, 'success');
+        const firstStageName = (await vscode.workspace.fs.readDirectory(remoteRoot))
+            .find(([name]) => name.startsWith('.sr-overleaf-replace-'))?.[0];
+        assert.ok(firstStageName);
+
+        (firstScm as any).removeRemoteReplacementStage = async (
+            stagingUri: vscode.Uri,
+            ...args: unknown[]
+        ) => {
+            if (path.basename(stagingUri.fsPath)===firstStageName) {
+                return false;
+            }
+            return originalCleanup(stagingUri, ...args);
+        };
+        await writeBytes(localImage, finalReplacement);
+        const finalPush = await (firstScm as any).applySync(
+            'push',
+            'update',
+            '/figure.png',
+            localImage,
+            remoteImage,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(finalPush.outcome, 'success');
+        assert.deepStrictEqual(await readBytes(remoteImage), finalReplacement);
+
+        const journalRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'remote-delete-operations',
+        );
+        const retainedJournalNames = (await vscode.workspace.fs.readDirectory(journalRoot))
+            .filter(([name]) => name.endsWith('.json'))
+            .map(([name]) => name);
+        assert.strictEqual(retainedJournalNames.length, 1);
+        const retainedJournal = JSON.parse(await readText(
+            vscode.Uri.joinPath(journalRoot, retainedJournalNames[0]),
+        ));
+        assert.strictEqual(retainedJournal.supersededByRevision, sha1(finalReplacement));
+        firstScm.deactivate();
+
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.deepStrictEqual(await readBytes(remoteImage), finalReplacement);
+        assert.strictEqual((restartedScm as any).syncConflicts.has('/figure.png'), false);
+        assert.deepStrictEqual(
+            (await vscode.workspace.fs.readDirectory(remoteRoot))
+                .filter(([name]) => name.startsWith('.sr-overleaf-replace-')),
+            [],
+        );
+        assert.deepStrictEqual(
+            (await vscode.workspace.fs.readDirectory(journalRoot))
+                .filter(([name]) => name.endsWith('.json')),
+            [],
+        );
+    });
+
+    test('retires unchanged committed guards before Local Replica removal', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-remove-guard-remote-');
+        const localRoot = await tempDir('sr-overleaf-remove-guard-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeText(remoteMain, 'remote update');
+
+        const event = await (scm as any).applySync(
+            'pull',
+            'update',
+            '/main.tex',
+            remoteMain,
+            localMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(event.outcome, 'success');
+
+        await scm.prepareRemovalAndHoldOwnership();
+        try {
+            const operationsRoot = vscode.Uri.joinPath(
+                localRoot,
+                REPLICA_SETTINGS_DIR,
+                'operations',
+            );
+            const remainingEntries = await vscode.workspace.fs.readDirectory(operationsRoot);
+            assert.deepStrictEqual(
+                remainingEntries.filter(([name]) =>
+                    name.endsWith('.guard')
+                    || name.endsWith('.json')
+                    || name.endsWith('.committed')),
+                [],
+            );
+        } finally {
+            await scm.finishRemoval();
+        }
+    });
+
+    test('keeps a detached inode reachable for writes after non-Linux removal', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-detached-guard-remote-');
+        const localRoot = await tempDir('sr-overleaf-detached-guard-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const id = `abcdef0123-${Date.now()}-abcdef12`;
+        const record = {
+            version: 1,
+            id,
+            kind: 'delete',
+            relPath: '/main.tex',
+            entityKind: 'file',
+            expectedRevision: sha1('retained inode'),
+            backupName: `.sr-overleaf-${id}.deleted`,
+            guardName: `.sr-overleaf-${id}.guard`,
+            createdAt: new Date().toISOString(),
+        };
+        await (scm as any).createLocalOperationRecord(record);
+        const operationsRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'operations',
+        );
+        const guardPath = vscode.Uri.joinPath(operationsRoot, record.guardName);
+        await writeText(guardPath, 'retained inode');
+        await (scm as any).markLocalOperationCommitted(id);
+
+        const openGuard = await fs.open(guardPath.fsPath, 'r+');
+        try {
+            await (scm as any).stageDetachedLocalGuard(
+                record,
+                guardPath.fsPath,
+            );
+            await scm.confirmRemovalPersistenceDeleted();
+            await openGuard.truncate(0);
+            await openGuard.writeFile('late write through detached inode');
+        } finally {
+            await openGuard.close();
+        }
+
+        const detachedRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'detached-inode-guards',
+        );
+        assert.strictEqual(
+            await readText(vscode.Uri.joinPath(detachedRoot, `${id}.guard`)),
+            'late write through detached inode',
+        );
+        assert.strictEqual(
+            await pathExists(vscode.Uri.joinPath(detachedRoot, `${id}.json`)),
+            true,
+        );
+        const remainingOperations = await vscode.workspace.fs.readDirectory(operationsRoot);
+        assert.deepStrictEqual(
+            remainingOperations.filter(([name]) =>
+                name.endsWith('.guard')
+                || name.endsWith('.json')
+                || name.endsWith('.committed')),
+            [],
+        );
+    });
+
+    test('restores staged inode tracking when mapping removal rolls back', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-detach-rollback-remote-');
+        const localRoot = await tempDir('sr-overleaf-detach-rollback-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'visible baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const id = `bcdefa0123-${Date.now()}-bcdefa12`;
+        const record = {
+            version: 1,
+            id,
+            kind: 'delete',
+            relPath: '/main.tex',
+            entityKind: 'file',
+            expectedRevision: sha1('retained inode'),
+            backupName: `.sr-overleaf-${id}.deleted`,
+            guardName: `.sr-overleaf-${id}.guard`,
+            createdAt: new Date().toISOString(),
+        };
+        await (scm as any).createLocalOperationRecord(record);
+        const operationsRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'operations',
+        );
+        const guardPath = vscode.Uri.joinPath(operationsRoot, record.guardName);
+        await writeText(guardPath, 'retained inode');
+        await (scm as any).markLocalOperationCommitted(id);
+
+        const openGuard = await fs.open(guardPath.fsPath, 'r+');
+        try {
+            await (scm as any).stageDetachedLocalGuard(record, guardPath.fsPath);
+            await (scm as any).rollbackStagedDetachedLocalGuards();
+            await openGuard.truncate(0);
+            await openGuard.writeFile('late write after removal rollback');
+        } finally {
+            await openGuard.close();
+        }
+
+        assert.strictEqual(await pathExists(guardPath), true);
+        await assert.rejects(
+            () => scm.flushBeforeCompile([]),
+            /older local file handle/i,
+        );
+        assert.strictEqual(
+            await readText(localMain),
+            'late write after removal rollback',
+        );
+    });
+
+    test('recovers staged inode tracking after restart before mapping removal commits', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-detach-restart-remote-');
+        const localRoot = await tempDir('sr-overleaf-detach-restart-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'visible baseline');
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const id = `cdefab0123-${Date.now()}-cdefab12`;
+        const record = {
+            version: 1,
+            id,
+            kind: 'delete',
+            relPath: '/main.tex',
+            entityKind: 'file',
+            expectedRevision: sha1('retained inode'),
+            backupName: `.sr-overleaf-${id}.deleted`,
+            guardName: `.sr-overleaf-${id}.guard`,
+            createdAt: new Date().toISOString(),
+        };
+        await (firstScm as any).createLocalOperationRecord(record);
+        const operationsRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'operations',
+        );
+        const guardPath = vscode.Uri.joinPath(operationsRoot, record.guardName);
+        await writeText(guardPath, 'retained inode');
+        await (firstScm as any).markLocalOperationCommitted(id);
+        await (firstScm as any).stageDetachedLocalGuard(record, guardPath.fsPath);
+        await firstScm.deactivate();
+
+        const detachedRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'detached-inode-guards',
+        );
+        await writeText(
+            vscode.Uri.joinPath(detachedRoot, `${id}.guard`),
+            'late write while extension host was stopped',
+        );
+
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.strictEqual(
+            await readText(localMain),
+            'late write while extension host was stopped',
+        );
+        assert.strictEqual((restartedScm as any).syncConflicts.has('/main.tex'), true);
+        assert.strictEqual(
+            await pathExists(vscode.Uri.joinPath(detachedRoot, `${id}.json`)),
+            false,
+        );
+    });
+
+    test('keeps staged inode rollback retryable after a rename failure', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-detach-rename-retry-remote-');
+        const localRoot = await tempDir('sr-overleaf-detach-rename-retry-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const id = `defabc0123-${Date.now()}-defabc12`;
+        const record = {
+            version: 1,
+            id,
+            kind: 'delete',
+            relPath: '/main.tex',
+            entityKind: 'file',
+            expectedRevision: sha1('retained inode'),
+            backupName: `.sr-overleaf-${id}.deleted`,
+            guardName: `.sr-overleaf-${id}.guard`,
+            createdAt: new Date().toISOString(),
+        };
+        await (scm as any).createLocalOperationRecord(record);
+        const operationsRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'operations',
+        );
+        const guardPath = vscode.Uri.joinPath(operationsRoot, record.guardName);
+        await writeText(guardPath, 'retained inode');
+        await (scm as any).markLocalOperationCommitted(id);
+        await (scm as any).stageDetachedLocalGuard(record, guardPath.fsPath);
+
+        const internals = scm as any;
+        const originalRename = internals.renameDurably.bind(scm);
+        let injected = false;
+        internals.renameDurably = async (sourcePath: string, targetPath: string) => {
+            if (!injected && targetPath===guardPath.fsPath) {
+                injected = true;
+                throw new Error('injected rollback rename failure');
+            }
+            return originalRename(sourcePath, targetPath);
+        };
+        await assert.rejects(
+            () => internals.rollbackStagedDetachedLocalGuards(),
+            /injected rollback rename failure/i,
+        );
+        assert.strictEqual(internals.stagedDetachedLocalGuards.length, 1);
+
+        internals.renameDurably = originalRename;
+        await internals.rollbackStagedDetachedLocalGuards();
+        assert.strictEqual(internals.stagedDetachedLocalGuards.length, 0);
+        assert.strictEqual(await pathExists(guardPath), true);
+    });
+
+    test('keeps staged inode rollback retryable after metadata cleanup fails', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-detach-unlink-retry-remote-');
+        const localRoot = await tempDir('sr-overleaf-detach-unlink-retry-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const id = `efabcd0123-${Date.now()}-efabcd12`;
+        const record = {
+            version: 1,
+            id,
+            kind: 'delete',
+            relPath: '/main.tex',
+            entityKind: 'file',
+            expectedRevision: sha1('retained inode'),
+            backupName: `.sr-overleaf-${id}.deleted`,
+            guardName: `.sr-overleaf-${id}.guard`,
+            createdAt: new Date().toISOString(),
+        };
+        await (scm as any).createLocalOperationRecord(record);
+        const operationsRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'operations',
+        );
+        const guardPath = vscode.Uri.joinPath(operationsRoot, record.guardName);
+        await writeText(guardPath, 'retained inode');
+        await (scm as any).markLocalOperationCommitted(id);
+        await (scm as any).stageDetachedLocalGuard(record, guardPath.fsPath);
+
+        const internals = scm as any;
+        const originalRemoveMetadata =
+            internals.removeDetachedLocalGuardRecord.bind(scm);
+        let injected = false;
+        internals.removeDetachedLocalGuardRecord = async (recordPath: string) => {
+            if (!injected) {
+                injected = true;
+                throw new Error('injected detached metadata cleanup failure');
+            }
+            return originalRemoveMetadata(recordPath);
+        };
+        await assert.rejects(
+            () => internals.rollbackStagedDetachedLocalGuards(),
+            /injected detached metadata cleanup failure/i,
+        );
+        assert.strictEqual(internals.stagedDetachedLocalGuards.length, 1);
+        assert.strictEqual(await pathExists(guardPath), true);
+
+        internals.removeDetachedLocalGuardRecord = originalRemoveMetadata;
+        await internals.rollbackStagedDetachedLocalGuards();
+        assert.strictEqual(internals.stagedDetachedLocalGuards.length, 0);
+        assert.strictEqual(await pathExists(guardPath), true);
+    });
+
+    test('preflights an unmarked older replacement before journal-order recovery', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-binary-unmarked-superseded-remote-');
+        const localRoot = await tempDir('sr-overleaf-binary-unmarked-superseded-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        const baseline = Buffer.from([1, 2, 3]);
+        const firstReplacement = Buffer.from([4, 5, 6]);
+        const finalReplacement = Buffer.from([7, 8, 9]);
+        await writeBytes(remoteImage, baseline);
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, finalReplacement);
+
+        const olderId = '000000000000000000000001';
+        const completedId = 'ffffffffffffffffffffffff';
+        const olderStage = `/.sr-overleaf-replace-${olderId}`;
+        const completedStage = `/.sr-overleaf-replace-${completedId}`;
+        await (firstScm as any).createRemoteDeleteOperationRecord({
+            version: 1,
+            id: olderId,
+            kind: 'replace',
+            relPath: '/figure.png',
+            stagingRelPath: olderStage,
+            expectedRevision: sha1(baseline),
+            replacementRevision: sha1(firstReplacement),
+            createdAt: new Date(Date.now()-1000).toISOString(),
+        });
+        await vscode.workspace.fs.rename(
+            remoteImage,
+            (firstScm as any).vfs.pathToUri(olderStage),
+            {overwrite: false},
+        );
+        await writeBytes(remoteImage, finalReplacement);
+        await (firstScm as any).createRemoteDeleteOperationRecord({
+            version: 1,
+            id: completedId,
+            kind: 'replace',
+            relPath: '/figure.png',
+            stagingRelPath: completedStage,
+            expectedRevision: sha1(firstReplacement),
+            replacementRevision: sha1(finalReplacement),
+            createdAt: new Date().toISOString(),
+        });
+        firstScm.deactivate();
+
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.deepStrictEqual(await readBytes(remoteImage), finalReplacement);
+        assert.strictEqual((restartedScm as any).syncConflicts.has('/figure.png'), false);
+        assert.deepStrictEqual(
+            (await vscode.workspace.fs.readDirectory(remoteRoot))
+                .filter(([name]) => name.startsWith('.sr-overleaf-replace-')),
+            [],
+        );
+        const journalRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'remote-delete-operations',
+        );
+        assert.deepStrictEqual(
+            (await vscode.workspace.fs.readDirectory(journalRoot))
+                .filter(([name]) => name.endsWith('.json')),
+            [],
+        );
+    });
+
+    test('blocks restart recovery when binary target and stage are both missing', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-binary-double-missing-remote-');
+        const localRoot = await tempDir('sr-overleaf-binary-double-missing-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        const replacement = Buffer.from([9, 8, 7, 6]);
+        await writeBytes(remoteImage, Buffer.from([1, 2, 3]));
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, replacement);
+        const generation = (firstScm as any).syncGeneration as number;
+        const expected = await (firstScm as any).captureRemotePathRevision(
+            '/figure.png',
+            generation,
+        );
+        const operationId = (firstScm as any).remoteReplacementOperationId(
+            '/figure.png',
+            expected.revision,
+            sha1(replacement),
+        );
+        const stagingRelPath = (firstScm as any).remoteReplacementStagingPath(
+            '/figure.png',
+            expected.revision,
+            sha1(replacement),
+        );
+        await (firstScm as any).createRemoteDeleteOperationRecord({
+            version: 1,
+            id: operationId,
+            kind: 'replace',
+            relPath: '/figure.png',
+            stagingRelPath,
+            expectedRevision: expected.revision,
+            replacementRevision: sha1(replacement),
+            createdAt: new Date().toISOString(),
+        });
+        await vscode.workspace.fs.delete(remoteImage);
+        firstScm.deactivate();
+
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.strictEqual(await pathExists(remoteImage), false);
+        assert.deepStrictEqual(await readBytes(localImage), replacement);
+        assert.strictEqual((restartedScm as any).syncConflicts.has('/figure.png'), true);
+        const journalRoot = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'remote-delete-operations',
+        );
+        const journalEntries = await vscode.workspace.fs.readDirectory(journalRoot);
+        assert.strictEqual(
+            journalEntries.filter(([name]) => name.endsWith('.json')).length,
+            1,
+        );
+    });
+
     test('rechecks and preserves a remote target recreated after stage deletion', async () => {
         const remoteRoot = await tempDir('sr-overleaf-post-stage-recreate-remote-');
         const localRoot = await tempDir('sr-overleaf-post-stage-recreate-local-');
@@ -5607,6 +8900,553 @@ suite('Select Project Folder Local Replica', function () {
         } finally {
             triggers.forEach(trigger => trigger.dispose());
         }
+    });
+
+    test('reconciles a rapidly renamed local folder when watchers omit destination child events', async function () {
+        this.timeout(20000);
+        const remoteRoot = await tempDir('sr-overleaf-folder-rename-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-rename-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteSource = vscode.Uri.joinPath(remoteRoot, 'source');
+        await writeText(vscode.Uri.joinPath(remoteSource, 'chapter.tex'), 'renamed text');
+        await writeBytes(
+            vscode.Uri.joinPath(remoteSource, 'figure.png'),
+            Buffer.from([1, 3, 5, 7, 9]),
+        );
+        const watchers: TestFileSystemWatcher[] = [];
+        (vscode.workspace as any).createFileSystemWatcher = () => {
+            const watcher = new TestFileSystemWatcher();
+            watchers.push(watcher);
+            return watcher;
+        };
+
+        const scm = createSCM(remoteRoot, localRoot);
+        const triggers = await scm.triggers;
+        try {
+            const localWatcher = watchers[1];
+            const localSource = vscode.Uri.joinPath(localRoot, 'source');
+            const localDestination = vscode.Uri.joinPath(localRoot, 'destination');
+            const oldText = vscode.Uri.joinPath(localSource, 'chapter.tex');
+            const oldImage = vscode.Uri.joinPath(localSource, 'figure.png');
+            await vscode.workspace.fs.rename(
+                oldText,
+                vscode.Uri.joinPath(localSource, 'chapter-renamed.tex'),
+                {overwrite: false},
+            );
+            await vscode.workspace.fs.rename(
+                oldImage,
+                vscode.Uri.joinPath(localSource, 'figure-renamed.png'),
+                {overwrite: false},
+            );
+            await vscode.workspace.fs.rename(localSource, localDestination, {overwrite: false});
+
+            const destinationWait = waitForSyncComplete(
+                localRoot,
+                '/destination',
+                'push',
+                'update',
+            );
+            const sourceDeleteWait = waitForSyncComplete(
+                localRoot,
+                '/source',
+                'push',
+                'delete',
+            );
+            localWatcher.fireDelete(oldText);
+            localWatcher.fireDelete(oldImage);
+            localWatcher.fireCreate(localDestination);
+            localWatcher.fireDelete(localSource);
+
+            assert.strictEqual((await destinationWait).outcome, 'success');
+            assert.strictEqual((await sourceDeleteWait).outcome, 'success');
+            assert.strictEqual(await pathExists(remoteSource), false);
+            assert.strictEqual(
+                await readText(vscode.Uri.joinPath(remoteRoot, 'destination', 'chapter-renamed.tex')),
+                'renamed text',
+            );
+            assert.deepStrictEqual(
+                await readBytes(vscode.Uri.joinPath(remoteRoot, 'destination', 'figure-renamed.png')),
+                Buffer.from([1, 3, 5, 7, 9]),
+            );
+        } finally {
+            triggers.forEach(trigger => trigger.dispose());
+        }
+    });
+
+    test('serializes destination reconciliation with child watcher events', async function () {
+        this.timeout(20000);
+        const remoteRoot = await tempDir('sr-overleaf-folder-queue-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-queue-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(
+            vscode.Uri.joinPath(remoteRoot, 'source', 'chapter.tex'),
+            'first local revision',
+        );
+        const watchers: TestFileSystemWatcher[] = [];
+        (vscode.workspace as any).createFileSystemWatcher = () => {
+            const watcher = new TestFileSystemWatcher();
+            watchers.push(watcher);
+            return watcher;
+        };
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const originalWrite = vfs.writeFileFromRemoteBaseline.bind(vfs);
+        let releaseFirstWrite!: () => void;
+        const firstWriteGate = new Promise<void>(resolve => {
+            releaseFirstWrite = resolve;
+        });
+        let firstWriteStarted!: () => void;
+        const firstWriteStart = new Promise<void>(resolve => {
+            firstWriteStarted = resolve;
+        });
+        let destinationWrites = 0;
+        let inFlightDestinationWrites = 0;
+        let maxInFlightDestinationWrites = 0;
+        vfs.writeFileFromRemoteBaseline = async (...args) => {
+            if (args[0].path.endsWith('/destination/chapter.tex')) {
+                destinationWrites += 1;
+                inFlightDestinationWrites += 1;
+                maxInFlightDestinationWrites = Math.max(
+                    maxInFlightDestinationWrites,
+                    inFlightDestinationWrites,
+                );
+                if (destinationWrites===1) {
+                    firstWriteStarted();
+                    await firstWriteGate;
+                }
+                try {
+                    return await originalWrite(...args);
+                } finally {
+                    inFlightDestinationWrites -= 1;
+                }
+            }
+            return originalWrite(...args);
+        };
+
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        const triggers = await scm.triggers;
+        try {
+            const localSource = vscode.Uri.joinPath(localRoot, 'source');
+            const localDestination = vscode.Uri.joinPath(localRoot, 'destination');
+            const localDestinationChild = vscode.Uri.joinPath(localDestination, 'chapter.tex');
+            await vscode.workspace.fs.rename(localSource, localDestination, {overwrite: false});
+
+            const rootPush = waitForSyncComplete(
+                localRoot,
+                '/destination',
+                'push',
+                'update',
+            );
+            watchers[1].fireCreate(localDestination);
+            watchers[1].fireCreate(localDestinationChild);
+            await firstWriteStart;
+            await writeText(localDestinationChild, 'second local revision');
+            watchers[1].fireChange(localDestinationChild);
+            await new Promise(resolve => setTimeout(resolve, 350));
+            releaseFirstWrite();
+
+            await waitUntil(
+                () => destinationWrites>=2 && inFlightDestinationWrites===0,
+                5000,
+            );
+            assert.strictEqual((await rootPush).outcome, 'success');
+            assert.strictEqual(maxInFlightDestinationWrites, 1);
+            assert.strictEqual(
+                await readText(vscode.Uri.joinPath(remoteRoot, 'destination', 'chapter.tex')),
+                'second local revision',
+            );
+        } finally {
+            releaseFirstWrite();
+            triggers.forEach(trigger => trigger.dispose());
+        }
+    });
+
+    test('drains a promoted parent delete when removal overlaps parent reconciliation', async function () {
+        this.timeout(20000);
+        const remoteRoot = await tempDir('sr-overleaf-folder-delete-queue-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-delete-queue-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(
+            vscode.Uri.joinPath(remoteRoot, 'destination', 'chapter.tex'),
+            'baseline',
+        );
+        const watchers: TestFileSystemWatcher[] = [];
+        (vscode.workspace as any).createFileSystemWatcher = () => {
+            const watcher = new TestFileSystemWatcher();
+            watchers.push(watcher);
+            return watcher;
+        };
+        const scm = createSCM(remoteRoot, localRoot);
+        const triggers = await scm.triggers;
+        const internals = scm as any;
+        const originalEnqueue = internals.enqueueSync.bind(scm);
+        const originalPromote = internals.promoteDeleteToMissingTrackedDirectory.bind(scm);
+        let releaseReconcileChild!: () => void;
+        const reconcileChildGate = new Promise<void>(resolve => {
+            releaseReconcileChild = resolve;
+        });
+        let signalReconcileChild!: () => void;
+        const reconcileChildReached = new Promise<void>(resolve => {
+            signalReconcileChild = resolve;
+        });
+        let signalPromotedDelete!: () => void;
+        const promotedDeleteReached = new Promise<void>(resolve => {
+            signalPromotedDelete = resolve;
+        });
+        let releasePromotedDelete!: () => void;
+        const promotedDeleteGate = new Promise<void>(resolve => {
+            releasePromotedDelete = resolve;
+        });
+        let childEnqueueCount = 0;
+        internals.enqueueSync = (
+            relPath: string,
+            task: () => Promise<unknown>,
+            generation: number,
+            acceptedBeforeRemoval = false,
+        ) => {
+            if (relPath==='/destination/chapter.tex') {
+                childEnqueueCount += 1;
+                if (childEnqueueCount===1) {
+                    signalReconcileChild();
+                    return reconcileChildGate.then(
+                        () => originalEnqueue(
+                            relPath,
+                            task,
+                            generation,
+                            acceptedBeforeRemoval,
+                        ),
+                    );
+                }
+            }
+            return originalEnqueue(
+                relPath,
+                task,
+                generation,
+                acceptedBeforeRemoval,
+            );
+        };
+        internals.promoteDeleteToMissingTrackedDirectory = async (
+            action: 'push' | 'pull',
+            relPath: string,
+            generation: number,
+        ) => {
+            const promoted = await originalPromote(action, relPath, generation);
+            if (
+                action==='push'
+                && relPath==='/destination/chapter.tex'
+                && promoted==='/destination'
+            ) {
+                signalPromotedDelete();
+                await promotedDeleteGate;
+            }
+            return promoted;
+        };
+
+        let removal: Promise<void> | undefined;
+        try {
+            const localDestination = vscode.Uri.joinPath(localRoot, 'destination');
+            const localChild = vscode.Uri.joinPath(localDestination, 'chapter.tex');
+            const rootUpdate = internals.enqueueSync(
+                '/destination',
+                () => internals.applySync(
+                    'push',
+                    'update',
+                    '/destination',
+                    localDestination,
+                    vscode.Uri.joinPath(remoteRoot, 'destination'),
+                    {forcePush: true, reason: 'queue-deadlock-regression'},
+                ),
+                internals.syncGeneration,
+            );
+            await reconcileChildReached;
+
+            await vscode.workspace.fs.delete(localDestination, {recursive: true});
+            await internals.syncToVFS(localChild, 'delete');
+            await Promise.race([
+                promotedDeleteReached,
+                new Promise<never>((_, reject) => setTimeout(
+                    () => reject(new Error(
+                        `child delete was not promoted; queues=${[
+                            ...internals.syncQueues.keys(),
+                        ].join(',')} pending=${[
+                            ...internals.pendingLocalEvents.keys(),
+                        ].join(',')}`,
+                    )),
+                    3_000,
+                )),
+            ]);
+            const rootDelete = waitForSyncComplete(
+                localRoot,
+                '/destination',
+                'push',
+                'delete',
+            );
+            removal = scm.prepareRemovalAndHoldOwnership();
+            releasePromotedDelete();
+            releaseReconcileChild();
+
+            const deleted = await Promise.race([
+                rootDelete,
+                new Promise<never>((_, reject) => setTimeout(
+                    () => reject(new Error('parent/child sync queue deadlocked')),
+                    5_000,
+                )),
+            ]);
+            assert.strictEqual(deleted.outcome, 'success');
+            assert.strictEqual(
+                await pathExists(vscode.Uri.joinPath(remoteRoot, 'destination')),
+                false,
+            );
+            await rootUpdate;
+            await removal;
+            await waitUntil(() => internals.syncQueues.size===0, 5_000);
+            assert.strictEqual(internals.deferredSyncWork.size, 0);
+        } finally {
+            releasePromotedDelete();
+            releaseReconcileChild();
+            if (removal) {
+                await removal.catch(() => undefined);
+                await scm.finishRemoval();
+            }
+            triggers.forEach(trigger => trigger.dispose());
+        }
+    });
+
+    test('refuses symlink descendants during local folder reconciliation', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-folder-symlink-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-symlink-local-');
+        const outsideRoot = await tempDir('sr-overleaf-folder-symlink-outside-');
+        tempRoots.push(remoteRoot, localRoot, outsideRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'baseline');
+        await writeText(vscode.Uri.joinPath(outsideRoot, 'secret.tex'), 'must stay local');
+        const localFolder = vscode.Uri.joinPath(localRoot, 'destination');
+        await vscode.workspace.fs.createDirectory(localFolder);
+        await fs.symlink(
+            outsideRoot.fsPath,
+            vscode.Uri.joinPath(localFolder, 'outside-link').fsPath,
+            'dir',
+        );
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({preserveExistingLocalFiles: true});
+
+        const event = await (scm as any).applySync(
+            'push',
+            'update',
+            '/destination',
+            localFolder,
+            vscode.Uri.joinPath(remoteRoot, 'destination'),
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(event.outcome, 'error');
+        assert.match(event.error ?? '', /refuses symbolic links/i);
+        assert.strictEqual(
+            await pathExists(vscode.Uri.joinPath(remoteRoot, 'destination', 'outside-link', 'secret.tex')),
+            false,
+        );
+    });
+
+    test('revalidates confinement when a scanned ancestor becomes a symlink', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-folder-swap-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-swap-local-');
+        const outsideRoot = await tempDir('sr-overleaf-folder-swap-outside-');
+        tempRoots.push(remoteRoot, localRoot, outsideRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({preserveExistingLocalFiles: true});
+        const localFolder = vscode.Uri.joinPath(localRoot, 'destination');
+        const localChild = vscode.Uri.joinPath(localFolder, 'chapter.tex');
+        await writeText(localChild, 'safe local bytes');
+        await writeText(
+            vscode.Uri.joinPath(outsideRoot, 'chapter.tex'),
+            'external secret bytes',
+        );
+
+        const internals = scm as any;
+        const originalEnqueue = internals.enqueueSync.bind(scm);
+        let swapped = false;
+        internals.enqueueSync = async (
+            relPath: string,
+            task: () => Promise<unknown>,
+            generation: number,
+        ) => {
+            if (!swapped && relPath==='/destination/chapter.tex') {
+                swapped = true;
+                await vscode.workspace.fs.delete(localFolder, {recursive: true});
+                await fs.symlink(outsideRoot.fsPath, localFolder.fsPath, 'dir');
+            }
+            return originalEnqueue(relPath, task, generation);
+        };
+
+        const event = await internals.applySync(
+            'push',
+            'update',
+            '/destination',
+            localFolder,
+            vscode.Uri.joinPath(remoteRoot, 'destination'),
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(swapped, true);
+        assert.strictEqual(event.outcome, 'error');
+        assert.match(event.error ?? '', /escaped the selected folder|symbolic links/i);
+        assert.strictEqual(
+            await pathExists(vscode.Uri.joinPath(remoteRoot, 'destination', 'chapter.tex')),
+            false,
+        );
+    });
+
+    test('revalidates the opened descriptor after local bytes are read', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-read-fd-remote-');
+        const localRoot = await tempDir('sr-overleaf-read-fd-local-');
+        const outsideRoot = await tempDir('sr-overleaf-read-fd-outside-');
+        tempRoots.push(remoteRoot, localRoot, outsideRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        const escapedMain = vscode.Uri.joinPath(outsideRoot, 'escaped.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeText(localMain, 'bytes from the opened inode');
+
+        const internals = scm as any;
+        const originalRead = internals.readOpenedLocalFile.bind(scm);
+        let moved = false;
+        internals.readOpenedLocalFile = async (handle: fs.FileHandle) => {
+            const content = await originalRead(handle);
+            if (!moved) {
+                moved = true;
+                await vscode.workspace.fs.rename(localMain, escapedMain, {overwrite: false});
+                await writeText(localMain, 'replacement inside the replica');
+            }
+            return content;
+        };
+
+        await assert.rejects(
+            () => internals.readConfinedLocalFile('/main.tex'),
+            /escaped the selected folder|changed during confinement validation/i,
+        );
+        assert.strictEqual(moved, true);
+        assert.strictEqual(await readText(escapedMain), 'bytes from the opened inode');
+        assert.strictEqual(await readText(localMain), 'replacement inside the replica');
+    });
+
+    test('rejects a same-inode local mutation while descriptor bytes are read', async () => {
+        if (process.platform!=='linux') { return; }
+        const remoteRoot = await tempDir('sr-overleaf-read-same-inode-remote-');
+        const localRoot = await tempDir('sr-overleaf-read-same-inode-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeText(localMain, 'bytes before same inode mutation');
+        const inodeBefore = (await fs.lstat(localMain.fsPath)).ino;
+
+        const internals = scm as any;
+        const originalRead = internals.readOpenedLocalFile.bind(scm);
+        let mutated = false;
+        internals.readOpenedLocalFile = async (handle: fs.FileHandle) => {
+            const content = await originalRead(handle);
+            if (!mutated) {
+                mutated = true;
+                const writer = await fs.open(localMain.fsPath, 'r+');
+                try {
+                    await writer.truncate(0);
+                    await writer.writeFile('bytes written through the same inode');
+                } finally {
+                    await writer.close();
+                }
+            }
+            return content;
+        };
+
+        await assert.rejects(
+            () => internals.readConfinedLocalFile('/main.tex'),
+            /changed while bytes were read/i,
+        );
+        assert.strictEqual(mutated, true);
+        assert.strictEqual((await fs.lstat(localMain.fsPath)).ino, inodeBefore);
+        assert.strictEqual(
+            await readText(localMain),
+            'bytes written through the same inode',
+        );
+    });
+
+    test('allows sibling directory entries to change during a confined Linux read', async () => {
+        if (process.platform!=='linux') { return; }
+        const remoteRoot = await tempDir('sr-overleaf-read-sibling-remote-');
+        const localRoot = await tempDir('sr-overleaf-read-sibling-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        const localSibling = vscode.Uri.joinPath(localRoot, 'sibling.tex');
+        const renamedSibling = vscode.Uri.joinPath(localRoot, 'sibling-renamed.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeText(localMain, 'stable opened bytes');
+        await writeText(localSibling, 'sibling');
+
+        const internals = scm as any;
+        const originalRead = internals.readOpenedLocalFile.bind(scm);
+        let renamed = false;
+        internals.readOpenedLocalFile = async (handle: fs.FileHandle) => {
+            const content = await originalRead(handle);
+            if (!renamed) {
+                renamed = true;
+                await vscode.workspace.fs.rename(
+                    localSibling,
+                    renamedSibling,
+                    {overwrite: false},
+                );
+            }
+            return content;
+        };
+
+        assert.strictEqual(
+            Buffer.from(await internals.readConfinedLocalFile('/main.tex')).toString(),
+            'stable opened bytes',
+        );
+        assert.strictEqual(renamed, true);
+    });
+
+    test('pulls every descendant when Overleaf reports only a renamed folder event', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-folder-pull-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-pull-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const remoteFolder = vscode.Uri.joinPath(remoteRoot, 'renamed-folder');
+        const localFolder = vscode.Uri.joinPath(localRoot, 'renamed-folder');
+        await writeText(
+            vscode.Uri.joinPath(remoteFolder, 'nested', 'chapter.tex'),
+            'remote renamed text',
+        );
+        await writeBytes(
+            vscode.Uri.joinPath(remoteFolder, 'nested', 'figure.png'),
+            Buffer.from([2, 4, 6, 8]),
+        );
+
+        const event = await (scm as any).applySync(
+            'pull',
+            'update',
+            '/renamed-folder',
+            remoteFolder,
+            localFolder,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(event.outcome, 'success');
+        assert.strictEqual(
+            await readText(vscode.Uri.joinPath(localFolder, 'nested', 'chapter.tex')),
+            'remote renamed text',
+        );
+        assert.deepStrictEqual(
+            await readBytes(vscode.Uri.joinPath(localFolder, 'nested', 'figure.png')),
+            Buffer.from([2, 4, 6, 8]),
+        );
     });
 
     test('finishes buffered Overleaf changes before startup watchers report ready', async () => {

@@ -4,6 +4,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.30] - 2026-07-26
+### Added
+- Add privacy-safe GIF walkthroughs for browser login and `Select Project Folder Locally`.
+- Record the exact remote path kind and revision in persisted Local Replica conflicts so a later resolution can prove that Overleaf has not changed again.
+- Add structured compile-response and unexpected-workflow diagnostics without logging credentials.
+- Add per-folder Local Replica ownership fencing so two VS Code extension hosts cannot watch and submit OT for the same selected folder at once.
+- Add an explicitly confirmed `Repair Local Replica Ownership Marker` command for incomplete or legacy markers; valid current ownership records are never removed by it.
+
+### Changed
+- Store Local Replica SCM mappings under dedicated server, user, and project keys instead of the mutable cached project list. Empty state is retained as a tombstone so removed legacy mappings cannot return after reload.
+- Bind VFS creation, inbound socket events, and every awaited API/socket response to the authenticated user and exact session identity captured by the replica URI. Late responses from a removed or replaced session are rejected before they can update the project tree, caches, settings, outputs, or local replica.
+- Prepare exact-folder selection without first restoring an older persisted SCM, then roll back project activation when selection is cancelled.
+- Removing a selected Local Replica now stops its SCM watchers and active VFS before deleting the mapping, keeps the local files intact, and records per-folder restore suppression so marker files cannot revive removed active or inactive replicas after reload.
+- Replace binary media through a durable remote staging transaction. The old revision remains recoverable until create-if-missing succeeds, and interrupted replacements are reconciled before normal startup sync.
+- Drain activation, queued sync, in-flight remote I/O, inode guards, and journal cleanup before transferring or releasing Local Replica ownership.
+- Stage accepted local writes behind durable detached-inode records while a replica is removed, and recover those records after restart unless the mapping removal was durably committed.
+
+### Fixed
+- Give overlapping login attempts explicit latest-request ownership, and fence delayed project-list, tag, logout, and cached-root results against account replacement before they can mutate persisted state or tree caches.
+- Reclassify queued compile-barrier work immediately before execution, so a watcher delete that finishes during the scan is recognized as already synchronized instead of being retried as a failed stale delete.
+- Fence VFS initialization, document/file creation and verification, linked-file operations, rename/move/delete, compile, SyncTeX, spelling, settings, history, labels, archive, and chat responses against logout or session replacement.
+- Dispose every live project VFS before clearing an expired server login, and discard stale inbound collaboration events after logout or account switching.
+- Preserve a second collaborator edit, binary revision, or ancestor-folder change during conflict resolution. A resolving push now reconnects on that exceptional path, verifies the recorded remote revision, and blocks while retaining the newer Overleaf state when it differs.
+- Preserve both the prior staged binary and a collaborator-created target when they race a media replacement. Lost rename/upload responses, failed uploads, incomplete cleanup, and process restarts are resolved from actual remote digests without overwriting either side.
+- Preflight older replacement journals before journal-order recovery, suppress only journals proved superseded, restore changed stages before blocking, and fail closed when both target and stage are missing.
+- Hydrate remote proof for conflicts written by older releases while retaining the original local conflict revision, so one newly reviewed local edit can resolve the conflict safely.
+- Allow an explicit reviewed local-state decision to resolve file or folder deletion conflicts while retaining the same remote-proof and failed-initial-pull guards as content updates.
+- Prevent conflict-resolution options from bypassing `failedInitialPulls` for either updates or deletes.
+- Accept Overleaf linked-file type bitmasks for remote pull classification while continuing to reject local symbolic links as ordinary replica files.
+- Tolerate missing server/login state after logout, extension removal, reinstall, or partial state restoration instead of throwing from stale Local Replica activation.
+- Prevent a surviving VFS from sending requests with another account's session after logout/login.
+- Prevent duplicate text insertion when multiple local or Remote SSH windows restore the same Local Replica. Same-host ownership uses an OS-lifetime localhost socket with a deterministic 64-port fallback sequence, while a host fingerprint and atomically published disk claim fence shared filesystems. Foreign-host and incomplete ownership markers fail closed instead of guessing that a live owner is stale.
+- Require detached and logged-out removal paths to acquire the same folder ownership before inspecting journals or deleting persisted mappings.
+- Dispose SCM status, history-tree, timer, and global event listeners with their owning VFS so repeated project activation does not accumulate extension-host listeners.
+- Drain accepted watcher work, pending debounce entries, and closed-file fallback classifications before removing a mapping. Transient removal-time classification errors retry immediately first; persistent uncertainty blocks removal instead of discarding the write.
+- Recover staged detached inode guards after an extension-host restart, mark mapping removal before guard cleanup, and make rollback retryable after partial rename or metadata-cleanup failures.
+- Reject a Linux descriptor read when the same inode changes size, modification time, or change time during the read, while allowing unrelated sibling churn without adding delay to healthy reads.
+- Coalesce remote folder rename events without recreating the old local folder, and reconcile descendant text and media at the renamed path.
+
 ## [0.15.29] - 2026-07-25
 ### Added
 - Add a durable Local Replica sync manifest and three-way text merging so offline and concurrent local/Overleaf edits can be reconciled without silently discarding either copy.

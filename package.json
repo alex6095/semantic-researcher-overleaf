@@ -2,7 +2,7 @@
   "name": "semantic-researcher-overleaf",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.29",
+  "version": "0.15.30",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -294,6 +294,13 @@
         "command": "semantic-researcher-overleaf.projectManager.disconnectProjectFolderLocalReplica",
         "title": "%commands.projectManager.disconnectProjectFolderLocalReplica.title%",
         "icon": "$(debug-disconnect)",
+        "enablement": "semantic-researcher-overleaf.activate",
+        "category": "%extension.displayName%"
+      },
+      {
+        "command": "semantic-researcher-overleaf.projectManager.repairLocalReplicaOwnership",
+        "title": "%commands.projectManager.repairLocalReplicaOwnership.title%",
+        "icon": "$(tools)",
         "enablement": "semantic-researcher-overleaf.activate",
         "category": "%extension.displayName%"
       },

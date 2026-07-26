@@ -1,10 +1,25 @@
 import * as vscode from 'vscode';
 import { PREFETCH_COMMAND, ROOT_NAME } from '../consts';
 import { ProjectTagsResponseSchema } from '../api/base';
-import { GlobalStateManager } from '../utils/globalStateManager';
-import { RemoteFileSystemProvider, VFSConnectionState, VirtualFileSystem, parseUri } from './remoteFileSystemProvider';
+import {
+    GlobalStateManager,
+    ServerSessionExpiredError,
+    StaleAuthenticatedSessionError,
+} from '../utils/globalStateManager';
+import {
+    RemoteFileSystemProvider,
+    VFSConnectionState,
+    VirtualFileSystem,
+    parseUri,
+} from './remoteFileSystemProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
-import { getActiveReplicaRoot, readReplicaSettingsSnapshot, setActiveReplicaRoot } from '../utils/localReplicaWorkspace';
+import { removeDetachedLocalReplicaSCM } from '../scm/scmCollectionProvider';
+import {
+    getActiveReplicaRoot,
+    readReplicaSettingsSnapshot,
+    setActiveReplicaRoot,
+    suppressReplicaAutoRestoreRoot,
+} from '../utils/localReplicaWorkspace';
 import { BrowserLogin } from '../auth/browserLogin';
 import { canonicalizeOverleafUri, stringifyOverleafUri } from '../utils/overleafUri';
 
@@ -182,78 +197,156 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         this._onDidChangeTreeData.fire();
     }
 
+    private async logoutExpiredServer(
+        api: any,
+        serverName: string,
+        userId: string,
+        identity: {csrfToken: string, cookies: string},
+    ): Promise<void> {
+        await this.remoteFileSystem?.deactivateServer(serverName);
+        const success = await GlobalStateManager.logoutServer(
+            this.context,
+            api,
+            serverName,
+            userId,
+            identity,
+        );
+        if (success) {
+            this.refresh();
+        }
+    }
+
     getTreeItem(element: DataItem): vscode.TreeItem {
         return element;
+    }
+
+    private async getServerChildren(element: ServerItem): Promise<DataItem[]> {
+        let session;
+        try {
+            session = GlobalStateManager.requireAuthenticatedSession(
+                this.context,
+                element.name,
+            );
+            const projects = await GlobalStateManager.fetchServerProjects(
+                this.context,
+                element.api,
+                element.name,
+            );
+            GlobalStateManager.requireAuthenticatedIdentity(
+                this.context,
+                element.name,
+                session.userId,
+                session.identity,
+            );
+            const tagResponse = await element.api.getAllTags(session.identity);
+            GlobalStateManager.requireAuthenticatedIdentity(
+                this.context,
+                element.name,
+                session.userId,
+                session.identity,
+            );
+            const tags = tagResponse.type==='success'
+                ? tagResponse.tags as ProjectTagsResponseSchema[]
+                : [];
+
+            const allTags:{name:string, tid:string}[] = [];
+            const normalProjects: ProjectItem[] = [];
+            const trashedProjects: ProjectItem[] = [];
+            const archivedProjects: ProjectItem[] = [];
+            const nextIndex = new Map<string, ProjectItem>();
+            for (const project of projects) {
+                const uri = `${ROOT_NAME}://${element.name}/${encodeURIComponent(project.name)}?user=${project.userId}&project=${project.id}`;
+                const status = project.archived ? 'archived' : project.trashed ? 'trashed' : 'normal';
+                const item = new ProjectItem(
+                    element.api,
+                    this.context.extensionUri,
+                    uri,
+                    element,
+                    project.id,
+                    project.name,
+                    status,
+                );
+                const key = `${element.name}::${project.id}`;
+                nextIndex.set(key, item);
+                if (key===this.activeKey) {
+                    item.applyActiveConnection(this.activeState);
+                }
+                switch (status) {
+                    case 'normal': normalProjects.push(item); break;
+                    case 'archived': archivedProjects.push(item); break;
+                    case 'trashed': trashedProjects.push(item); break;
+                }
+            }
+            const allProjectItems = [
+                ...normalProjects,
+                ...archivedProjects,
+                ...trashedProjects,
+            ];
+            const tagProjectItems:TagItem[] = tags.map(tag => {
+                const projectTag = {name:tag.name, tid:tag._id};
+                allTags.push(projectTag);
+                const tagProjects = tag.project_ids.map(pid => {
+                    const item = allProjectItems.find(project => project.pid===pid);
+                    if (!item) {
+                        return undefined;
+                    }
+                    const clone = ProjectItem.clone(item);
+                    item.tag = projectTag;
+                    clone.contextValue = 'project_in_tag';
+                    clone.tag = projectTag;
+                    const key = `${element.name}::${item.pid}`;
+                    if (key===this.activeKey) {
+                        clone.applyActiveConnection(this.activeState);
+                    }
+                    return clone;
+                }).filter(item => item) as ProjectItem[];
+                return new TagItem(
+                    element.api,
+                    element.name,
+                    tag._id,
+                    tag.name,
+                    tagProjects,
+                );
+            });
+            const remainingProjects = allProjectItems.filter(project => !project.tag);
+
+            GlobalStateManager.requireAuthenticatedIdentity(
+                this.context,
+                element.name,
+                session.userId,
+                session.identity,
+            );
+            for (const key of [...this.itemIndex.keys()]) {
+                if (key.startsWith(`${element.name}::`)) {
+                    this.itemIndex.delete(key);
+                }
+            }
+            for (const [key, item] of nextIndex) {
+                this.itemIndex.set(key, item);
+            }
+            element.tags = allTags;
+            return [...tagProjectItems, ...remainingProjects];
+        } catch (error) {
+            if (error instanceof ServerSessionExpiredError && session) {
+                await this.logoutExpiredServer(
+                    element.api,
+                    element.name,
+                    session.userId,
+                    session.identity,
+                );
+                return [];
+            }
+            if (error instanceof StaleAuthenticatedSessionError) {
+                return [];
+            }
+            throw error;
+        }
     }
 
     getChildren(element?: DataItem): Thenable<DataItem[]> {
         if (element) {
             if (element instanceof ServerItem) {
-                return GlobalStateManager.fetchServerProjects(this.context, element.api, element.name)
-                .catch(() => {
-                    // Direct logout if cookie expired
-                    GlobalStateManager.logoutServer(this.context, element.api, element.name)
-                    .then(success => {
-                        if (success) {
-                            this.refresh();
-                        }
-                    });
-                    return Promise.reject();
-                })
-                .then(projects => {
-                    return GlobalStateManager.authenticate(this.context, element.name)
-                    .then(identity => element.api.getAllTags(identity))
-                    .then(res => 
-                        res.type==='success' ? res.tags as ProjectTagsResponseSchema[] : []
-                    )
-                    .then(tags => {
-                        return {projects, tags};
-                    });
-                })
-                .then(({projects, tags}) => {
-                    const allTags:{name:string, tid:string}[] = [];
-                    // get project items
-                    const normalProjects = [], trashedProjects = [], archivedProjects = [];
-                    for (const project of projects) {
-                        const uri = `${ROOT_NAME}://${element.name}/${encodeURIComponent(project.name)}?user=${project.userId}&project=${project.id}`;
-                        const status = project.archived ? 'archived' : project.trashed ? 'trashed' : 'normal';
-                        const item = new ProjectItem(element.api, this.context.extensionUri, uri, element, project.id, project.name, status);
-                        const key = `${element.name}::${project.id}`;
-                        this.itemIndex.set(key, item);
-                        if (key===this.activeKey) {
-                            item.applyActiveConnection(this.activeState);
-                        }
-                        switch (status) {
-                            case 'normal': normalProjects.push(item); break;
-                            case 'archived': archivedProjects.push(item); break;
-                            case 'trashed': trashedProjects.push(item); break;
-                        }
-                    }
-                    const allProjectItems = [...normalProjects, ...archivedProjects, ...trashedProjects];
-                    // create tag items
-                    const tagProjectItems:TagItem[] = tags.map(tag => {
-                        const _tag = {name:tag.name, tid:tag._id};
-                        allTags.push( _tag );
-                        const _projects:ProjectItem[] = tag.project_ids.map(pid => {
-                            const item = allProjectItems.find(project => project.pid===pid);
-                            if (item) {
-                                const _item = ProjectItem.clone(item);
-                                item.tag = _tag; // for filter purpose
-                                _item.contextValue = 'project_in_tag';
-                                _item.tag = _tag;
-                                const key = `${element.name}::${item.pid}`;
-                                if (key===this.activeKey) { _item.applyActiveConnection(this.activeState); }
-                                return _item;
-                            }
-                        }).filter(item => item) as ProjectItem[];
-                        return new TagItem(element.api, element.name, tag._id, tag.name, _projects);
-                    });
-                    // get remaining projects
-                    const remainingProjects = allProjectItems.filter(project => !project.tag);
-                    // return all items
-                    element.tags = allTags;
-                    return [...tagProjectItems, ...remainingProjects];
-                });
+                return this.getServerChildren(element);
             } else if (element instanceof TagItem) {
                 return Promise.resolve(element.projects);
             } else {
@@ -293,8 +386,9 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     removeServer(name:string) {
         vscode.window.showWarningMessage(vscode.l10n.t('Remove server "{name}" ?', {name}), "Yes", "No")
-        .then((answer) => {
+        .then(async (answer) => {
             if (answer === "Yes") {
+                await this.remoteFileSystem?.deactivateServer(name);
                 if (GlobalStateManager.removeServer(this.context, name)) {
                     this.refresh();
                 }
@@ -436,8 +530,9 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     logoutServer(server: ServerItem) {
         vscode.window.showWarningMessage(vscode.l10n.t('Logout server "{name}" ?', {name:server.name}), "Yes", "No")
-        .then((answer) => {
+        .then(async (answer) => {
             if (answer === "Yes") {
+                await this.remoteFileSystem?.deactivateServer(server.name);
                 GlobalStateManager.logoutServer(this.context, server.api, server.name)
                 .then(success => {
                     if (success) {
@@ -735,6 +830,36 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         });
     }
 
+    private async removeLocalReplicaMapping(
+        projectUri: vscode.Uri,
+        scmKey: string,
+        baseUri: vscode.Uri,
+    ): Promise<void> {
+        if (this.remoteFileSystem) {
+            await this.remoteFileSystem.removeLocalReplicaSCM(
+                projectUri,
+                scmKey,
+                baseUri,
+            );
+        } else {
+            await removeDetachedLocalReplicaSCM(
+                this.context,
+                projectUri,
+                scmKey,
+                baseUri,
+            );
+        }
+        if (getActiveReplicaRoot()?.toString()===baseUri.toString()) {
+            await setActiveReplicaRoot(undefined, {
+                suppressAutoRestoreRoot: baseUri,
+            });
+            await this.remoteFileSystem?.deactivateProject(projectUri);
+            this.setActiveProject('', undefined, 'inactive');
+        } else {
+            await suppressReplicaAutoRestoreRoot(baseUri);
+        }
+    }
+
     async openProjectLocalReplica(project: ProjectItem) {
         // should close other open vfs firstly
         const vfsFolder = vscode.workspace.workspaceFolders?.find(folder => folder.uri.scheme===ROOT_NAME);
@@ -744,9 +869,14 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         }
 
         const uri = vscode.Uri.parse(project.uri);
-        const {serverName,projectId} = parseUri(uri);
+        const {serverName,userId,projectId} = parseUri(uri);
         // fetch existing local replica scm
-        let scmPersists = GlobalStateManager.getServerProjectSCMPersists(this.context, serverName, projectId);
+        let scmPersists = GlobalStateManager.getServerProjectSCMPersists(
+            this.context,
+            serverName,
+            userId,
+            projectId,
+        );
         let replicas = Object.values(scmPersists).filter(scmPersist => scmPersist.label===LocalReplicaSCMProvider.label);
         // if not exist, create new one
         if (replicas.length===0) {
@@ -756,7 +886,12 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             if (answer === "Yes") {
                 await (await vscode.commands.executeCommand(`${ROOT_NAME}.projectSCM.newSCM`, LocalReplicaSCMProvider));
                 // fetch local replica scm again
-                scmPersists = GlobalStateManager.getServerProjectSCMPersists(this.context, serverName, projectId);
+                scmPersists = GlobalStateManager.getServerProjectSCMPersists(
+                    this.context,
+                    serverName,
+                    userId,
+                    projectId,
+                );
                 replicas = Object.values(scmPersists).filter(scmPersist => scmPersist.label===LocalReplicaSCMProvider.label);
             } else {
                 vfs.dispose();
@@ -778,23 +913,36 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             return {label, buttons};
         });
 
+        const removeReplica = async (item: {label: string}) => {
+            const scmKey = Object.keys(scmPersists).find(key =>
+                vscode.Uri.parse(scmPersists[key].baseUri).fsPath===item.label
+            );
+            if (!scmKey) {
+                return;
+            }
+            const baseUri = vscode.Uri.parse(scmPersists[scmKey].baseUri);
+            await this.removeLocalReplicaMapping(uri, scmKey, baseUri);
+            delete scmPersists[scmKey];
+        };
+
         // select local replica via quick pick
         new Promise(resolve => {
             const quickPick = vscode.window.createQuickPick();
             quickPick.placeholder = vscode.l10n.t('Select the local replica below.');
             quickPick.items = quickPickItems;
-            quickPick.onDidTriggerItemButton(({button,item}) => {
+            quickPick.onDidTriggerItemButton(async ({button,item}) => {
                 if ((button as any).id === "removal") {
-                    vscode.window.showWarningMessage( vscode.l10n.t('Remove local replica "{label}" ?', {label:item.label}), 'Yes', 'No')
-                    .then(answer => {
-                        if (answer === 'Yes') {
-                            // remove local replica from scm persists
-                            const scmKey = Object.keys(scmPersists).find(key => vscode.Uri.parse(scmPersists[key].baseUri).fsPath===item.label)!;
-                            GlobalStateManager.updateServerProjectSCMPersist(this.context, serverName, projectId, scmKey);
-                            // remove entry from quick pick
-                            quickPick.items = quickPick.items.filter(candidate => candidate.label!==item.label);
-                        }
-                    });
+                    const answer = await vscode.window.showWarningMessage(
+                        vscode.l10n.t('Remove local replica "{label}" ?', {label:item.label}),
+                        'Yes',
+                        'No',
+                    );
+                    if (answer === 'Yes') {
+                        await removeReplica(item);
+                        quickPick.items = quickPick.items.filter(
+                            candidate => candidate.label!==item.label
+                        );
+                    }
                 }
             });
             quickPick.onDidAccept(() => {
@@ -832,7 +980,11 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         }
 
         const previousActiveVfs = this.remoteFileSystem?.getActiveVFS();
-        const activatedVfs = await vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.activateProject`, uri) as VirtualFileSystem;
+        const activatedVfs = await vscode.commands.executeCommand(
+            `${ROOT_NAME}.remoteFileSystem.activateProject`,
+            uri,
+            {restorePersistedSCMs: false},
+        ) as VirtualFileSystem;
         let completed = false;
 
         try {
@@ -941,6 +1093,28 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             return;
         }
         vscode.workspace.updateWorkspaceFolders(index, 1);
+    }
+
+    private async repairLocalReplicaOwnership() {
+        let rootUri = getActiveReplicaRoot();
+        if (!rootUri) {
+            const selected = await vscode.window.showOpenDialog({
+                canSelectFiles: false,
+                canSelectFolders: true,
+                canSelectMany: false,
+                title: vscode.l10n.t('Select the Local Replica folder to repair'),
+            });
+            rootUri = selected?.[0];
+        }
+        if (!rootUri) { return; }
+        try {
+            await LocalReplicaSCMProvider.repairOwnershipMarker(rootUri);
+        } catch (error) {
+            void vscode.window.showErrorMessage(vscode.l10n.t(
+                'Local Replica ownership repair failed: {message}',
+                {message: error instanceof Error ? error.message : String(error)},
+            ));
+        }
     }
 
     private async hasConflictingLocalReplicaWorkspace(projectUri: vscode.Uri) {
@@ -1055,6 +1229,9 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             }),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.disconnectProjectFolderLocalReplica`, () => {
                 return this.disconnectProjectFolderLocalReplica();
+            }),
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.repairLocalReplicaOwnership`, () => {
+                return this.repairLocalReplicaOwnership();
             }),
         ];
     }

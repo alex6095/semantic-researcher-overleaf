@@ -13,7 +13,9 @@ async function main() {
         const extensionDevelopmentPath = process.env.VSCODE_TEST_EXTENSION_PATH
             ? path.resolve(process.env.VSCODE_TEST_EXTENSION_PATH)
             : path.resolve(__dirname, '../..');
-        const extensionTestsPath = path.resolve(__dirname, './suite/index');
+        const extensionTestsPath = process.env.VSCODE_TEST_EXTENSION_TESTS_PATH
+            ? path.resolve(process.env.VSCODE_TEST_EXTENSION_TESTS_PATH)
+            : path.resolve(__dirname, './suite/index');
         const version = process.env.VSCODE_TEST_VERSION;
 
         await runTests({

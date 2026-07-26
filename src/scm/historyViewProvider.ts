@@ -83,6 +83,10 @@ class HistoryDataProvider implements vscode.TreeDataProvider<HistoryItem>, vscod
 
     readonly onDidChangeTreeData: vscode.Event<HistoryItem | undefined | void> = this._onDidChangeTreeData.event;
 
+    dispose() {
+        this._onDidChangeTreeData.dispose();
+    }
+
     refresh(): void {
         this._onDidChangeTreeData.fire();
     }
@@ -391,6 +395,12 @@ export class HistoryViewProvider {
         if (!this.refreshTimer) { return; }
         clearInterval(this.refreshTimer);
         this.refreshTimer = undefined;
+    }
+
+    dispose() {
+        this.stopVisibleRefreshTimer();
+        this.treeDataProvider.dispose();
+        this.historyView.dispose();
     }
 
     get triggers() {

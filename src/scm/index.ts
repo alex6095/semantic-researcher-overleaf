@@ -54,6 +54,7 @@ export class CommitItem {
 
 export abstract class BaseSCM {
     private _status: StatusInfo = {status: 'idle', message: ''};
+    private settingsCache: JSON = {} as JSON;
     public static readonly label: string;
 
     public readonly iconPath: vscode.ThemeIcon = new vscode.ThemeIcon('git-branch');
@@ -64,7 +65,9 @@ export abstract class BaseSCM {
     constructor(
         protected readonly vfs: VirtualFileSystem,
         public readonly baseUri: vscode.Uri,
-    ) {}
+    ) {
+        this.settingsCache = this.vfs.getProjectSCMPersist(this.scmKey)?.settings ?? {} as JSON;
+    }
 
     /**
      * Validate the base URI of the SCM.
@@ -152,7 +155,13 @@ export abstract class BaseSCM {
     }
 
     protected set settings(settings: JSON) {
+        this.settingsCache = settings;
+        const persist = this.vfs.getProjectSCMPersist(this.scmKey);
+        if (!persist) {
+            return;
+        }
         this.vfs.setProjectSCMPersist(this.scmKey, {
+            ...persist,
             label: (this.constructor as any).label,
             baseUri: this.baseUri.toString(),
             settings,
@@ -160,7 +169,11 @@ export abstract class BaseSCM {
     }
 
     protected get settings(): JSON {
-        return this.vfs.getProjectSCMPersist(this.scmKey).settings;
+        const persistedSettings = this.vfs.getProjectSCMPersist(this.scmKey)?.settings;
+        if (persistedSettings) {
+            this.settingsCache = persistedSettings;
+        }
+        return this.settingsCache;
     }
 
     async diff(): Promise<[number,number]> {
