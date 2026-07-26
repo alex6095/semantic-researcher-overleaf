@@ -104,4 +104,4 @@ release harnesses, or live probes.
 - [x] Independent source review has no P0, P1, or P2 finding.
 - [x] Main and Remote Pack VSIX artifacts built and inspected.
 - [x] Exact unpacked Main VSIX tests pass on both VS Code versions.
-- [ ] GitHub and `/workspace/Overleaf-Workshop` point to the same release commit.
+- [x] GitHub and `/workspace/Overleaf-Workshop` point to the same release commit.
