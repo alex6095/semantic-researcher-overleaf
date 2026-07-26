@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.31] - 2026-07-26
+### Changed
+- Selectively port upstream `v0.15.10` without adopting its save-only Local Replica synchronization. Closed files edited by shells or coding agents remain watcher-driven and are still covered by the compile-time saved-disk scan.
+- Use a Node 16 through Node 24 compatible authentication transport for browser-cookie and password login instead of upstream's Node 22-only `undici 8` migration.
+- Preserve all authentication cookies across CSRF, login, and socket handshakes, replace same-name cookies with their newest values, and accept only normalized same-origin `/project` redirects.
+- Update upstream-compatible dependencies for form uploads, UUID generation, Markdown rendering, YAML parsing, temporary files, shell quoting, and link parsing.
+- Replace runtime `minimatch` brace expansion with `picomatch 4.0.5` and override the legacy Overleaf Socket.IO client's WebSocket transport to patched `ws 5.2.5`. Production dependency audit now reports zero vulnerabilities while retaining VS Code 1.80 support.
+
+### Fixed
+- Restore browser-cookie login on Node 22 and newer extension hosts without changing the existing `node-fetch` upload/download behavior used by Local Replica media synchronization.
+- Dispose listeners and disconnect an old Socket.IO connection before replacement, preventing stale sockets from producing spurious connection-lost state.
+- Keep password-login error responses parseable by avoiding unsupported compressed bodies in the low-level compatibility transport.
+
+### Verified
+- Pass 272 extension-host tests on VS Code 1.130.0 and the minimum supported VS Code 1.80.2, including closed text/media/folder synchronization, restart recovery, account/project isolation, and compile save UX.
+- Pass a signed-in `Local Replica Sync Demo` cookie login, compile, and v2 Socket.IO project join with `ws 5.2.5`; compile returned 10 outputs with zero `latexmk` or LaTeX-run errors.
+- Complete independent release review with no unresolved P0, P1, or P2 findings.
+
 ## [0.15.30] - 2026-07-26
 ### Added
 - Add privacy-safe GIF walkthroughs for browser login and `Select Project Folder Locally`.

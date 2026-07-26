@@ -20,7 +20,10 @@ import {
     RemoteDocumentWriteAmbiguousError,
     VirtualFileSystem,
 } from '../../core/remoteFileSystemProvider';
-import { LocalReplicaSCMProvider } from '../../scm/localReplicaSCM';
+import {
+    LocalReplicaSCMProvider,
+    matchesLocalReplicaIgnorePattern,
+} from '../../scm/localReplicaSCM';
 import { SCMCollectionProvider } from '../../scm/scmCollectionProvider';
 import { EventBus, Events } from '../../utils/eventBus';
 import { getActiveReplicaRoot, pathToLocalUri, setActiveReplicaRoot } from '../../utils/localReplicaWorkspace';
@@ -320,6 +323,25 @@ function waitForSyncComplete(
 
 suite('Select Project Folder Local Replica', function () {
     this.timeout(10000);
+
+    test('matches protected, LaTeX, and brace ignore globs without brace expansion', () => {
+        assert.strictEqual(
+            matchesLocalReplicaIgnorePattern('/chapter/.cache/state.json', '**/.*/**'),
+            true,
+        );
+        assert.strictEqual(
+            matchesLocalReplicaIgnorePattern('/chapter/main.aux', '**/*.aux'),
+            true,
+        );
+        assert.strictEqual(
+            matchesLocalReplicaIgnorePattern('/figures/plot.png', '**/*.{png,jpg}'),
+            true,
+        );
+        assert.strictEqual(
+            matchesLocalReplicaIgnorePattern('/figures/plot.pdf', '**/*.{png,jpg}'),
+            false,
+        );
+    });
 
     const tempRoots: vscode.Uri[] = [];
     let originalShowWarningMessage: typeof vscode.window.showWarningMessage;

@@ -2508,7 +2508,9 @@ suite('Extension host and lifecycle isolation', () => {
 
     test('preserves mutation HTTP status for retry classification', async function () {
         this.timeout(10000);
+        let requestCount = 0;
         const server = http.createServer((_request, response) => {
+            requestCount += 1;
             response.statusCode = 409;
             response.setHeader('Connection', 'close');
             response.end('duplicate path');
@@ -2531,6 +2533,222 @@ suite('Extension host and lifecycle isolation', () => {
             assert.strictEqual(response.type, 'error');
             assert.strictEqual(response.status, 409);
             assert.match(response.message ?? '', /duplicate path/);
+            assert.strictEqual(requestCount, 1);
+        } finally {
+            (
+                server as http.Server & {closeAllConnections?: () => void}
+            ).closeAllConnections?.();
+            await new Promise<void>((resolve, reject) => {
+                server.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+
+    test('logs in with browser cookies through the Node-compatible auth transport', async function () {
+        this.timeout(10000);
+        const requestedPaths: string[] = [];
+        const server = http.createServer((request, response) => {
+            requestedPaths.push(request.url ?? '');
+            if (request.url==='/project') {
+                assert.strictEqual(request.headers.cookie, 'session=browser');
+                response.statusCode = 200;
+                response.end([
+                    '<meta name="ol-user_id" content="user-1">',
+                    '<meta name="ol-usersEmail" content="user@example.test">',
+                    '<meta name="ol-csrfToken" content="csrf-project">',
+                ].join(''));
+                return;
+            }
+            if (request.url==='/socket.io/socket.io.js') {
+                assert.strictEqual(request.headers.cookie, 'session=browser');
+                response.statusCode = 200;
+                response.setHeader('Connection', 'close');
+                response.setHeader('Set-Cookie', 'socket=refreshed; Path=/; HttpOnly');
+                response.end('// socket client');
+                return;
+            }
+            response.statusCode = 404;
+            response.end('not found');
+        });
+        await new Promise<void>((resolve, reject) => {
+            server.once('error', reject);
+            server.listen(0, '127.0.0.1', () => resolve());
+        });
+        const address = server.address();
+        assert.ok(address && typeof address!=='string');
+        const api = new BaseAPI(`http://127.0.0.1:${address.port}/`);
+
+        try {
+            const response = await api.cookiesLogin('session=browser');
+            assert.strictEqual(response.type, 'success');
+            assert.deepStrictEqual(response.userInfo, {
+                userId: 'user-1',
+                userEmail: 'user@example.test',
+            });
+            assert.deepStrictEqual(response.identity, {
+                csrfToken: 'csrf-project',
+                cookies: 'session=browser; socket=refreshed',
+            });
+            assert.deepStrictEqual(requestedPaths, [
+                '/project',
+                '/socket.io/socket.io.js',
+            ]);
+        } finally {
+            (
+                server as http.Server & {closeAllConnections?: () => void}
+            ).closeAllConnections?.();
+            await new Promise<void>((resolve, reject) => {
+                server.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+
+    test('preserves passport login cookies across the compatible auth transport', async function () {
+        this.timeout(10000);
+        const requestedPaths: string[] = [];
+        const server = http.createServer((request, response) => {
+            requestedPaths.push(`${request.method} ${request.url}`);
+            if (request.method==='GET' && request.url==='/login') {
+                response.statusCode = 200;
+                response.setHeader('Set-Cookie', [
+                    'prelogin=one; Path=/; HttpOnly',
+                    'csrf-seed=alpha; Path=/; SameSite=Lax',
+                ]);
+                response.end('<input name="_csrf" value="csrf-login">');
+                return;
+            }
+            if (request.method==='POST' && request.url==='/login') {
+                assert.strictEqual(request.headers.cookie, 'prelogin=one; csrf-seed=alpha');
+                assert.strictEqual(request.headers['x-csrf-token'], 'csrf-login');
+                assert.strictEqual(request.headers['accept-encoding'], undefined);
+                let body = '';
+                request.setEncoding('utf8');
+                request.on('data', chunk => {
+                    body += chunk;
+                });
+                request.on('end', () => {
+                    assert.deepStrictEqual(JSON.parse(body), {
+                        _csrf: 'csrf-login',
+                        email: 'user@example.test',
+                        password: 'password',
+                    });
+                    response.statusCode = 302;
+                    response.setHeader('Location', `http://${request.headers.host}/project`);
+                    response.setHeader('Set-Cookie', [
+                        'prelogin=two; Path=/; HttpOnly',
+                        'session=passport; Path=/; HttpOnly',
+                        'feature=initial; Path=/',
+                    ]);
+                    response.end();
+                });
+                return;
+            }
+            if (request.method==='GET' && request.url==='/project') {
+                assert.strictEqual(
+                    request.headers.cookie,
+                    'prelogin=two; csrf-seed=alpha; session=passport; feature=initial',
+                );
+                response.statusCode = 200;
+                response.end([
+                    '<meta name="ol-user_id" content="user-passport">',
+                    '<meta name="ol-usersEmail" content="passport@example.test">',
+                    '<meta name="ol-csrfToken" content="csrf-project">',
+                ].join(''));
+                return;
+            }
+            if (request.method==='GET' && request.url==='/socket.io/socket.io.js') {
+                assert.strictEqual(
+                    request.headers.cookie,
+                    'prelogin=two; csrf-seed=alpha; session=passport; feature=initial',
+                );
+                response.statusCode = 200;
+                response.setHeader('Connection', 'close');
+                response.setHeader('Set-Cookie', [
+                    'feature=refreshed; Path=/',
+                    'socket=passport; Path=/',
+                ]);
+                response.end('// socket client');
+                return;
+            }
+            response.statusCode = 404;
+            response.end('not found');
+        });
+        await new Promise<void>((resolve, reject) => {
+            server.once('error', reject);
+            server.listen(0, '127.0.0.1', () => resolve());
+        });
+        const address = server.address();
+        assert.ok(address && typeof address!=='string');
+        const api = new BaseAPI(`http://127.0.0.1:${address.port}/`);
+
+        try {
+            const response = await api.passportLogin('user@example.test', 'password');
+            assert.strictEqual(response.type, 'success');
+            assert.deepStrictEqual(response.userInfo, {
+                userId: 'user-passport',
+                userEmail: 'passport@example.test',
+            });
+            assert.deepStrictEqual(response.identity, {
+                csrfToken: 'csrf-project',
+                cookies: [
+                    'prelogin=two',
+                    'csrf-seed=alpha',
+                    'session=passport',
+                    'feature=refreshed',
+                    'socket=passport',
+                ].join('; '),
+            });
+            assert.deepStrictEqual(requestedPaths, [
+                'GET /login',
+                'POST /login',
+                'GET /project',
+                'GET /socket.io/socket.io.js',
+            ]);
+        } finally {
+            (
+                server as http.Server & {closeAllConnections?: () => void}
+            ).closeAllConnections?.();
+            await new Promise<void>((resolve, reject) => {
+                server.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+
+    test('keeps passport error responses parseable without advertising compression', async function () {
+        this.timeout(10000);
+        const server = http.createServer((request, response) => {
+            if (request.method==='GET' && request.url==='/login') {
+                response.statusCode = 200;
+                response.setHeader('Set-Cookie', 'prelogin=one; Path=/; HttpOnly');
+                response.end('<input name="_csrf" value="csrf-login">');
+                return;
+            }
+            if (request.method==='POST' && request.url==='/login') {
+                assert.strictEqual(request.headers['accept-encoding'], undefined);
+                request.resume();
+                request.once('end', () => {
+                    response.statusCode = 401;
+                    response.setHeader('Connection', 'close');
+                    response.setHeader('Content-Type', 'application/json');
+                    response.end(JSON.stringify({message: {text: 'Login denied'}}));
+                });
+                return;
+            }
+            response.statusCode = 404;
+            response.end('not found');
+        });
+        await new Promise<void>((resolve, reject) => {
+            server.once('error', reject);
+            server.listen(0, '127.0.0.1', () => resolve());
+        });
+        const address = server.address();
+        assert.ok(address && typeof address!=='string');
+        const api = new BaseAPI(`http://127.0.0.1:${address.port}/`);
+
+        try {
+            const response = await api.passportLogin('user@example.test', 'wrong-password');
+            assert.strictEqual(response.type, 'error');
+            assert.strictEqual(response.message, 'Login denied');
         } finally {
             (
                 server as http.Server & {closeAllConnections?: () => void}
@@ -2710,6 +2928,61 @@ suite('Extension host and lifecycle isolation', () => {
             const headers = capturedOptions?.extraHeaders as Record<string, string>;
             assert.strictEqual(headers['Origin'], 'https://www.overleaf.com');
             assert.strictEqual(headers['Cookie'], 'session=cookie');
+        } finally {
+            socketClient.connect = originalConnect;
+        }
+    });
+
+    test('gracefully disposes an old socket before creating its replacement', () => {
+        const socketClient = require('socket.io-client') as {
+            connect: (url: string, options: Record<string, unknown>) => unknown;
+        };
+        const originalConnect = socketClient.connect;
+        const sockets = [0, 1].map(() => {
+            const state = {
+                disconnects: 0,
+                listenerRemovals: 0,
+            };
+            const socket = {
+                emit: () => undefined,
+                on: () => socket,
+                disconnect: () => {
+                    state.disconnects += 1;
+                },
+                removeAllListeners: () => {
+                    state.listenerRemovals += 1;
+                },
+            };
+            return {socket, state};
+        });
+        let connectionIndex = 0;
+        socketClient.connect = () => sockets[connectionIndex++].socket;
+
+        try {
+            const api = new BaseAPI('https://www.overleaf.com/');
+            const socket = new SocketIOAPI(
+                'https://www.overleaf.com/',
+                api,
+                {csrfToken: 'token', cookies: 'session=cookie'},
+                'project-1',
+            );
+            socket.init();
+
+            assert.strictEqual(connectionIndex, 2);
+            assert.deepStrictEqual(sockets[0].state, {
+                disconnects: 1,
+                listenerRemovals: 1,
+            });
+            assert.deepStrictEqual(sockets[1].state, {
+                disconnects: 0,
+                listenerRemovals: 0,
+            });
+
+            socket.dispose();
+            assert.deepStrictEqual(sockets[1].state, {
+                disconnects: 1,
+                listenerRemovals: 1,
+            });
         } finally {
             socketClient.connect = originalConnect;
         }

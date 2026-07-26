@@ -5,7 +5,7 @@ import * as nodeNet from 'net';
 import * as os from 'os';
 import * as nodePath from 'path';
 import * as vscode from 'vscode';
-import { minimatch } from 'minimatch';
+import picomatch = require('picomatch');
 import { BaseSCM, CommitItem, SettingItem } from ".";
 import {
     RemoteDocumentMergeConflictError,
@@ -46,6 +46,10 @@ const SYNC_OWNER_FILE = 'sync-owner.json';
 const SYNC_OWNER_REPAIR_FILE = 'sync-owner.repair.json';
 const LEGACY_SYNC_OWNER_DIRECTORY = 'sync-owner';
 const LEGACY_SYNC_OWNER_FILE = 'owner.json';
+
+export function matchesLocalReplicaIgnorePattern(path: string, pattern: string): boolean {
+    return picomatch.isMatch(path, pattern, {dot: true});
+}
 
 // Single shared output channel for Local Replica sync diagnostics. Lazy-created.
 let sharedOutput: vscode.OutputChannel | undefined;
@@ -7078,7 +7082,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private matchIgnorePatterns(path: string): boolean {
         const ignorePatterns = this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns;
         for (const pattern of [...PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS, ...ignorePatterns]) {
-            if (minimatch(path, pattern, {dot:true})) {
+            if (matchesLocalReplicaIgnorePattern(path, pattern)) {
                 return true;
             }
         }

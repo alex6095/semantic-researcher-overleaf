@@ -7,6 +7,54 @@ import { v4 as uuidv4 } from 'uuid';
 import fetch from 'node-fetch';
 import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
 
+function getSetCookie(response: any): string[] {
+    const nodeHeaders = response.headers?.['set-cookie'];
+    if (Array.isArray(nodeHeaders)) {
+        return nodeHeaders;
+    }
+    if (typeof nodeHeaders==='string') {
+        return [nodeHeaders];
+    }
+    const direct = response.headers?.getSetCookie?.();
+    if (Array.isArray(direct)) {
+        return direct;
+    }
+    const raw = response.headers?.raw?.()?.['set-cookie'];
+    if (Array.isArray(raw)) {
+        return raw;
+    }
+    const fallback = response.headers?.get?.('set-cookie');
+    return fallback ? [fallback] : [];
+}
+
+function parseCookiePair(cookie: string|undefined): [string, string]|undefined {
+    const pair = cookie?.split(';', 1)[0]?.trim();
+    const separator = pair?.indexOf('=') ?? -1;
+    if (!pair || separator<=0) {
+        return undefined;
+    }
+    const name = pair.slice(0, separator).trim();
+    const value = pair.slice(separator+1).trim();
+    return name ? [name, value] : undefined;
+}
+
+function mergeCookieHeader(existing: string, setCookies: string[]): string {
+    const cookies = new Map<string, string>();
+    for (const value of existing.split(';')) {
+        const pair = parseCookiePair(value);
+        if (pair) {
+            cookies.set(pair[0], pair[1]);
+        }
+    }
+    for (const setCookie of setCookies) {
+        const pair = parseCookiePair(setCookie);
+        if (pair) {
+            cookies.set(pair[0], pair[1]);
+        }
+    }
+    return [...cookies].map(([name, value]) => `${name}=${value}`).join('; ');
+}
+
 export interface Identity {
     csrfToken: string;
     cookies: string;
@@ -192,6 +240,13 @@ export interface ResponseSchema {
     settings?: ProjectSettingsSchema;
 }
 
+interface AuthResponse {
+    status: number;
+    headers: http.IncomingHttpHeaders;
+    text: () => Promise<string>;
+    json: () => Promise<unknown>;
+}
+
 export class BaseAPI {
     private url: string;
     private agent: http.Agent | https.Agent;
@@ -202,9 +257,50 @@ export class BaseAPI {
         this.agent = new URL(url).protocol==='http:' ? new http.Agent({keepAlive: true}) : new https.Agent({keepAlive: true});
     }
 
+    private authRequest(
+        route: string,
+        options: {
+            method: 'GET'|'POST';
+            headers?: http.OutgoingHttpHeaders;
+            body?: string;
+        },
+    ): Promise<AuthResponse> {
+        const target = new URL(route, this.url);
+        const requestOptions = {
+            method: options.method,
+            headers: options.headers,
+            agent: this.agent,
+        };
+        return new Promise((resolve, reject) => {
+            const request = (
+                target.protocol==='http:' ? http.request : https.request
+            )(target, requestOptions, response => {
+                const chunks: Buffer[] = [];
+                response.on('data', chunk => {
+                    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+                });
+                response.once('error', reject);
+                response.once('end', () => {
+                    const body = Buffer.concat(chunks).toString('utf8');
+                    resolve({
+                        status: response.statusCode ?? 0,
+                        headers: response.headers,
+                        text: async () => body,
+                        json: async () => JSON.parse(body),
+                    });
+                });
+            });
+            request.once('error', reject);
+            if (options.body!==undefined) {
+                request.write(options.body);
+            }
+            request.end();
+        });
+    }
+
     private async getCsrfToken(): Promise<Identity> {
-        const res = await fetch(this.url+'login', {
-            method: 'GET', redirect: 'manual', agent: this.agent,
+        const res = await this.authRequest('login', {
+            method: 'GET',
         });
         const body = await res.text();
         const match = body.match(/<input.*name="_csrf".*value="([^"]*)">/);
@@ -212,14 +308,17 @@ export class BaseAPI {
             throw new Error('Failed to get CSRF token.');
         } else {
             const csrfToken = match[1];
-            const cookies = res.headers.raw()['set-cookie'][0].split(';')[0];
+            const cookies = mergeCookieHeader('', getSetCookie(res));
+            if (!cookies) {
+                throw new Error('Failed to get login cookie.');
+            }
             return { csrfToken, cookies };
         }
     }
 
     private async getUserId(cookies:string) {
-        const res = await fetch(this.url+'project', {
-            method: 'GET', redirect:'manual', agent: this.agent,
+        const res = await this.authRequest('project', {
+            method: 'GET',
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': cookies,
@@ -259,28 +358,45 @@ export class BaseAPI {
 
     async passportLogin(email:string, password:string): Promise<ResponseSchema> {
         const identity = await this.getCsrfToken();
-        const res = await fetch(this.url+'login', {
-            method: 'POST', redirect: 'manual', agent: this.agent,
+        const body = JSON.stringify({ _csrf: identity.csrfToken, email: email, password: password });
+        const res = await this.authRequest('login', {
+            method: 'POST',
             headers: {
                 'Accept': '*/*',
-                'Accept-Encoding': 'gzip, deflate, br',
                 'Connection': 'keep-alive',
                 'Content-Type': 'application/json',
                 'Cookie': identity.cookies,
                 'X-Csrf-Token': identity.csrfToken,
+                'Content-Length': Buffer.byteLength(body),
             },
-            body: JSON.stringify({ _csrf: identity.csrfToken, email: email, password: password })
+            body,
         });
 
         if (res.status===302) {
-            const redirect = ((await res.text()).match(/Found. Redirecting to (.*)/) as any)[1];
-            if (redirect==='/project') {
-                const cookies = res.headers.raw()['set-cookie'][0];
+            const responseBody = await res.text();
+            const redirectValue = res.headers.location
+                ?? responseBody.match(/Found. Redirecting to (.*)/)?.[1];
+            let redirect: URL|undefined;
+            try {
+                redirect = redirectValue ? new URL(redirectValue, this.url) : undefined;
+            } catch {
+                redirect = undefined;
+            }
+            const expectedOrigin = new URL(this.url).origin;
+            if (redirect?.origin===expectedOrigin && redirect.pathname==='/project') {
+                const setCookies = getSetCookie(res);
+                if (setCookies.length===0) {
+                    return {
+                        type: 'error',
+                        message: 'Login response did not include a session cookie.'
+                    };
+                }
+                const cookies = mergeCookieHeader(identity.cookies, setCookies);
                 return (await this.cookiesLogin(cookies));
             } else {
                 return {
                     type: 'error',
-                    message: `Redirecting to /${redirect}`
+                    message: `Unexpected login redirect: ${redirectValue ?? '(missing)'}`
                 };
             }
         }
@@ -322,21 +438,16 @@ export class BaseAPI {
     }
 
     async updateCookies(identity: Identity) {
-        const res = await fetch(this.url + 'socket.io/socket.io.js', {
+        const res = await this.authRequest('socket.io/socket.io.js', {
             method: 'GET',
-            redirect: 'manual',
-            agent: this.agent,
             headers: {
                 'Connection': 'keep-alive',
                 'Cookie': identity.cookies,
             }
         });
-        const header = res.headers.raw()['set-cookie'];
-        if (header !== undefined) {
-            const cookies = header[0].split(';')[0];
-            if (cookies) {
-                identity.cookies = `${identity.cookies}; ${cookies}`;
-            }
+        const setCookies = getSetCookie(res);
+        if (setCookies.length>0) {
+            identity.cookies = mergeCookieHeader(identity.cookies, setCookies);
         }
         return identity;
     };

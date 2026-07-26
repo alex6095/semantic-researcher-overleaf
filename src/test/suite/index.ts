@@ -20,6 +20,10 @@ export function run(): Promise<void> {
         ui: 'tdd',
         color: true,
     });
+    const grep = process.env.VSCODE_TEST_GREP;
+    if (grep) {
+        mocha.grep(new RegExp(grep));
+    }
 
     for (const file of findTestFiles(__dirname)) {
         mocha.addFile(file);

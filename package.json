@@ -2,7 +2,7 @@
   "name": "semantic-researcher-overleaf",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.30",
+  "version": "0.15.31",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -982,16 +982,16 @@
     "@unified-latex/unified-latex-util-parse": "^1.8.3",
     "@vscode/l10n": "^0.0.18",
     "diff-match-patch": "^1.0.5",
-    "form-data": "^4.0.4",
+    "form-data": "^4.0.6",
     "fuzzysearch": "^1.0.3",
     "mime-types": "^2.1.35",
-    "minimatch": "^9.0.9",
     "node-diff3": "3.2.1",
     "node-fetch": "^2.7.0",
+    "picomatch": "4.0.5",
     "playwright-core": "1.42.1",
     "prettier": "^3.1.1",
     "socket.io-client": "github:overleaf/socket.io-client#0.9.17-overleaf-5",
-    "uuid": "^9.0.1"
+    "uuid": "11.1.1"
   },
   "devDependencies": {
     "@commitlint/cli": "^18.4.3",
@@ -1001,8 +1001,8 @@
     "@types/mocha": "^10.0.1",
     "@types/node": "20.2.5",
     "@types/node-fetch": "^2.6.11",
+    "@types/picomatch": "4.0.2",
     "@types/socket.io-client": "^1.4.36",
-    "@types/uuid": "^9.0.6",
     "@types/vscode": "^1.80.0",
     "@typescript-eslint/eslint-plugin": "^5.59.8",
     "@typescript-eslint/parser": "^5.59.8",
@@ -1017,7 +1017,8 @@
   },
   "overrides": {
     "fast-uri": "^3.1.2",
-    "serialize-javascript": "^7.0.5"
+    "serialize-javascript": "^7.0.5",
+    "ws": "5.2.5"
   },
   "extensionKind": [
     "workspace"
