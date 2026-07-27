@@ -368,6 +368,7 @@ async function isReplicaRootRemoved(rootUri: vscode.Uri): Promise<boolean> {
 }
 
 export function configureLocalReplicaWorkspace(context: vscode.ExtensionContext) {
+    const previousContext = extensionContext;
     extensionContext = context;
     context.subscriptions.push(
         vscode.window.onDidChangeActiveTextEditor(() => {
@@ -377,6 +378,11 @@ export function configureLocalReplicaWorkspace(context: vscode.ExtensionContext)
             void syncActiveEditorContexts();
         }),
     );
+    return new vscode.Disposable(() => {
+        if (extensionContext===context) {
+            extensionContext = previousContext;
+        }
+    });
 }
 
 export async function initializeLocalReplicaWorkspace() {

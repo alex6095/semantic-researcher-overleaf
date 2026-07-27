@@ -2,7 +2,7 @@
   "name": "semantic-researcher-overleaf-remote-pack",
   "displayName": "Semantic Researcher Overleaf Remote Pack",
   "description": "Local UI support pack for Semantic Researcher Overleaf in VS Code Remote windows.",
-  "version": "0.15.31",
+  "version": "0.15.32",
   "icon": "resources/icons/app_icon.png",
   "publisher": "alex6095",
   "license": "SEE LICENSE IN LICENSE",
@@ -17,7 +17,7 @@
   "categories": [
     "Other"
   ],
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "contributes": {
     "commands": [
       {
@@ -38,9 +38,11 @@
     }
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
-    "compile": "tsc -p ./",
-    "package:vsix": "npx @vscode/vsce package --no-yarn"
+    "vscode:prepublish": "npm run compile:package",
+    "bundle": "node ../scripts/bundle-extension.js --remote-pack",
+    "compile": "tsc -p ./ && npm run bundle",
+    "compile:package": "tsc -p ./ && npm run bundle -- --production && node ../scripts/prepare-package-runtime.js --remote-pack",
+    "package:vsix": "npx @vscode/vsce package --no-yarn --no-dependencies"
   },
   "dependencies": {
     "playwright-core": "1.42.1"

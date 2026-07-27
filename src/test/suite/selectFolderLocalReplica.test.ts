@@ -356,8 +356,33 @@ suite('Select Project Folder Local Replica', function () {
     let originalWatcherProbeTimeoutMs: number;
     let originalWatcherHealthIntervalMs: number;
     let originalFallbackScanIntervalMs: number;
+    let restoreLocalReplicaWorkspaceContext: vscode.Disposable;
+    const localReplicaWorkspaceState = new Map<string, unknown>();
+    const localReplicaWorkspaceSubscriptions: vscode.Disposable[] = [];
+    const localReplicaWorkspaceMemento = {
+        get<T>(key: string, defaultValue?: T): T | undefined {
+            return localReplicaWorkspaceState.has(key)
+                ? localReplicaWorkspaceState.get(key) as T
+                : defaultValue;
+        },
+        async update(key: string, value: unknown) {
+            if (value===undefined) {
+                localReplicaWorkspaceState.delete(key);
+            } else {
+                localReplicaWorkspaceState.set(key, value);
+            }
+        },
+        keys() {
+            return [...localReplicaWorkspaceState.keys()];
+        },
+    } as vscode.Memento;
 
     setup(() => {
+        localReplicaWorkspaceState.clear();
+        restoreLocalReplicaWorkspaceContext = localReplicaWorkspace.configureLocalReplicaWorkspace({
+            workspaceState: localReplicaWorkspaceMemento,
+            subscriptions: localReplicaWorkspaceSubscriptions,
+        } as unknown as vscode.ExtensionContext);
         originalShowWarningMessage = vscode.window.showWarningMessage;
         originalShowInformationMessage = vscode.window.showInformationMessage;
         originalShowErrorMessage = vscode.window.showErrorMessage;
@@ -400,6 +425,11 @@ suite('Select Project Folder Local Replica', function () {
         while (tempRoots.length>0) {
             await removeUri(tempRoots.pop()!);
         }
+        for (const subscription of localReplicaWorkspaceSubscriptions.splice(0)) {
+            subscription.dispose();
+        }
+        localReplicaWorkspaceState.clear();
+        restoreLocalReplicaWorkspaceContext.dispose();
     });
 
     test('prompts before using a non-empty exact folder and can empty it', async () => {

@@ -2,7 +2,7 @@
   "name": "semantic-researcher-overleaf",
   "displayName": "%extension.displayName%",
   "description": "%extension.description%",
-  "version": "0.15.31",
+  "version": "0.15.32",
   "icon": "resources/icons/app_icon.png",
   "author": {
     "name": "iamhyc",
@@ -73,7 +73,7 @@
     "workspaceContains:.semantic-researcher-overleaf/settings.json",
     "workspaceContains:.overleaf/settings.json"
   ],
-  "main": "./out/extension.js",
+  "main": "./dist/extension.js",
   "l10n": "./l10n",
   "contributes": {
     "languages": [
@@ -964,14 +964,19 @@
     "download-pdfjs": "node scripts/download-vendor.js pdfjs",
     "download-latex-basics": "node scripts/download-vendor.js latex-basics",
     "postinstall": "patch-package && npm run download-pdfjs && npm run download-latex-basics",
-    "vscode:prepublish": "npm run compile",
-    "package:vsix": "npx @vscode/vsce package --no-yarn",
+    "vscode:prepublish": "npm run compile:package",
+    "package:vsix": "npx @vscode/vsce package --no-yarn --no-dependencies",
     "compile:remote-pack": "npm --prefix remote-pack run compile",
-    "package:remote-pack": "npm --prefix remote-pack run package:vsix",
-    "publish:marketplace": "npx @vscode/vsce publish --no-yarn",
+    "package:remote-pack": "npm --prefix remote-pack run package:vsix --",
+    "publish:marketplace": "npx @vscode/vsce publish --no-yarn --no-dependencies",
     "update-l10n": "npx @vscode/l10n-dev export -o ./l10n ./src",
-    "compile": "tsc -p ./ && cd views/chat-view && npm run build",
-    "watch": "tsc -watch -p ./",
+    "bundle": "node scripts/bundle-extension.js",
+    "prepare:package-runtime": "node scripts/prepare-package-runtime.js",
+    "compile": "tsc -p ./ && npm run bundle && cd views/chat-view && npm run build",
+    "compile:package": "tsc -p ./ && npm run bundle -- --production && npm run prepare:package-runtime && cd views/chat-view && npm run build",
+    "watch": "node scripts/watch-extension.js",
+    "watch:types": "tsc -watch -p ./",
+    "watch:bundle": "node scripts/bundle-extension.js --watch",
     "pretest": "npm run compile && npm run lint",
     "lint": "eslint src --ext ts",
     "test": "node ./out/test/runTest.js",
@@ -1013,7 +1018,9 @@
     "husky": "^8.0.3",
     "mocha": "^10.8.2",
     "patch-package": "^8.0.1",
-    "typescript": "^5.1.3"
+    "ts-loader": "9.6.2",
+    "typescript": "^5.1.3",
+    "webpack": "5.109.0"
   },
   "overrides": {
     "fast-uri": "^3.1.2",

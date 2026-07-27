@@ -3,8 +3,16 @@
 .github/**
 .husky/**
 src/**
-out/test/**
+out/**
+dist/**
+!dist/extension.js
+!dist/runtime/
+!dist/runtime/**
 patches/**
+
+node_modules/**
+!dist/node_modules/
+!dist/node_modules/**
 docs/**
 .gitignore
 .yarnrc

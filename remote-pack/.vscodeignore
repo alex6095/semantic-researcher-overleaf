@@ -1,6 +1,12 @@
 .vscode/**
 .vscode-test/**
 src/**
+out/**
+dist/**
+!dist/extension.js
+!dist/runtime/
+!dist/runtime/**
+node_modules/**
 node_modules/**/.bin/**
 **/tsconfig.json
 **/*.map

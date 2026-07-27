@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.32] - 2026-07-27
+### Changed
+- Bundle the main extension and Remote Pack into one CommonJS file each with Webpack while preserving the circular module initialization behavior required by the language providers.
+- Package only the runtime portions of Playwright, Prettier, and Unified LaTeX that the extension executes. The VSIX no longer carries the complete development or production dependency trees.
+- Replace the watch-only `npm-run-all` dependency with a small Node process supervisor and ignore generated bundle directories in Git.
+- Remove five unreferenced legacy tutorial images after preserving the prior 0.15.31 VSIX artifacts in its GitHub Release.
+
+### Fixed
+- Keep formatter packages in a normal staged Node module layout so Prettier's dynamic module loader works after VSIX installation.
+- Forward output arguments from the root Remote Pack packaging command.
+- Give Local Replica folder-selection tests an explicit disposable workspace-state store, preventing extension activation or bundled module state from leaking between tests.
+
+### Verified
+- Pass all 272 extension-host tests on both VS Code 1.130.0 and the minimum supported VS Code 1.80.2 after bundling.
+- Install and activate both generated VSIX files in a clean VS Code 1.130.0 profile, load each staged Playwright runtime, and format LaTeX through the packaged Prettier plugin.
+- Report zero production dependency vulnerabilities for both packages. The optimized main VSIX is 3.02 MB and the Remote Pack is 1.01 MB, down from 7.03 MB and 1.75 MB respectively.
+
 ## [0.15.31] - 2026-07-26
 ### Changed
 - Selectively port upstream `v0.15.10` without adopting its save-only Local Replica synchronization. Closed files edited by shells or coding agents remain watcher-driven and are still covered by the compile-time saved-disk scan.

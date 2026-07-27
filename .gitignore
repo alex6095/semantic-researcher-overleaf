@@ -2,6 +2,8 @@
 
 node_modules
 out
+/dist/
+/remote-pack/dist/
 *.vsix
 
 **/vendor/**
