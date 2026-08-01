@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.33] - 2026-08-02
+### Changed
+- Add a selected-folder-only recursive Node watcher on Remote SSH hosts. It feeds the existing Local Replica debounce, confinement, manifest, conflict, and three-way merge pipeline without scanning the wider workspace.
+- Keep the exact-content 750 ms scan as a correctness fallback only when both VS Code event delivery and the direct Remote SSH watcher are unavailable.
+- Package the legacy Overleaf Socket.IO client and its dependency closure as normal CommonJS runtime modules instead of rewriting their module-parent behavior inside the Webpack bundle.
+
+### Fixed
+- Restore immediate synchronization for closed text and media files when the Remote SSH VS Code file watcher starts successfully but later stops delivering events.
+- Prevent the packaged extension from failing during Socket.IO initialization on current Node extension hosts with `Cannot read properties of undefined (reading 'exports')`.
+- Detect newer Remote Agent Host SSH sessions even when `vscode.env.remoteName` does not report the traditional `ssh-remote` value.
+
+### Verified
+- Pass all 273 extension-host tests on VS Code 1.130.0, including direct-watcher text and PNG create/delete coverage, confinement, watcher teardown, and content-scan failover.
+- Pass focused browser-cookie login, Socket.IO handshake, direct-watcher, and fallback tests on the minimum supported VS Code 1.80.2.
+- Extract the production VSIX and load its staged Socket.IO runtime successfully; activate the fixed package on the Remote SSH Node 24 extension host without the prior bundled-module exception.
+
 ## [0.15.32] - 2026-07-27
 ### Changed
 - Bundle the main extension and Remote Pack into one CommonJS file each with Webpack while preserving the circular module initialization behavior required by the language providers.

@@ -1,5 +1,5 @@
 import * as crypto from 'crypto';
-import {constants as nodeFsConstants} from 'fs';
+import {constants as nodeFsConstants, watch as nodeFsWatch} from 'fs';
 import * as nodeFs from 'fs/promises';
 import * as nodeNet from 'net';
 import * as os from 'os';
@@ -215,6 +215,16 @@ interface ApplySyncOptions {
     skipDirectoryDescendants?: boolean;
 }
 
+interface DirectLocalWatcher {
+    close(): void;
+    on(event: 'error', listener: (error: Error) => void): DirectLocalWatcher;
+}
+
+type DirectLocalWatcherFactory = (
+    rootPath: string,
+    listener: (eventType: string, filename: string | Buffer | null) => void,
+) => DirectLocalWatcher;
+
 interface SyncOwnerRecord {
     version: 4;
     token: string;
@@ -345,6 +355,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     };
     private vfsWatcher?: vscode.FileSystemWatcher;
     private localWatcher?: vscode.FileSystemWatcher;
+    private directLocalWatcher?: DirectLocalWatcher;
+    private directLocalWatcherGeneration?: number;
     private localWatcherProbe?: {
         generation: number;
         uri: string;
@@ -396,6 +408,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private static readonly watcherProbeTimeoutMs = 750;
     private static readonly watcherHealthIntervalMs = 1000;
     private static readonly fallbackScanIntervalMs = 750;
+    private static readonly shouldUseDirectLocalWatcher = () => {
+        const remoteName = vscode.env.remoteName?.toLowerCase();
+        return remoteName?.includes('ssh')===true || Boolean(
+            process.env.SSH_CONNECTION && process.env.VSCODE_AGENT_FOLDER,
+        );
+    };
+    private static readonly createDirectLocalWatcher: DirectLocalWatcherFactory = (rootPath, listener) => (
+        nodeFsWatch(rootPath, {recursive: true}, listener)
+    );
     private static readonly syncOwnerHeartbeatMs = 10_000;
     private static readonly syncOwnerPortBase = 10_000;
     private static readonly syncOwnerPortRange = 10_000;
@@ -1463,6 +1484,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         this.dynamicLocalDisposables = [];
         this.localWatcher = undefined;
+        if (this.directLocalWatcher) {
+            try {
+                this.directLocalWatcher.close();
+            } catch {
+                // It may already have closed after emitting an error.
+            }
+        }
+        this.directLocalWatcher = undefined;
+        this.directLocalWatcherGeneration = undefined;
         this.armLocalWatcher = undefined;
         const localWatcherProbe = this.localWatcherProbe;
         this.localWatcherProbe = undefined;
@@ -10510,6 +10540,94 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return true;
     }
 
+    private directLocalWatcherUri(filename: string | Buffer | null): vscode.Uri | undefined {
+        if (filename===null) { return undefined; }
+        const relativeName = Buffer.isBuffer(filename) ? filename.toString('utf8') : filename;
+        if (!relativeName || relativeName.includes('\0')) { return undefined; }
+
+        try {
+            const rootPath = nodePath.resolve(this.baseUri.fsPath);
+            const targetPath = nodePath.resolve(rootPath, relativeName);
+            const relativePath = nodePath.relative(rootPath, targetPath);
+            if (
+                relativePath===''
+                || relativePath==='..'
+                || relativePath.startsWith(`..${nodePath.sep}`)
+                || nodePath.isAbsolute(relativePath)
+            ) {
+                return undefined;
+            }
+            return vscode.Uri.file(targetPath);
+        } catch {
+            return undefined;
+        }
+    }
+
+    private startDirectLocalWatcher(
+        generation: number,
+        onEvent: (uri: vscode.Uri) => void,
+    ): void {
+        if (
+            !this.isSyncSessionActive(generation)
+            || this.baseUri.scheme!=='file'
+            || !LocalReplicaSCMProvider.shouldUseDirectLocalWatcher()
+            || this.directLocalWatcherGeneration===generation
+        ) {
+            return;
+        }
+
+        let watcher: DirectLocalWatcher;
+        try {
+            watcher = LocalReplicaSCMProvider.createDirectLocalWatcher(
+                this.baseUri.fsPath,
+                (_eventType, filename) => {
+                    if (
+                        !this.isSyncSessionActive(generation)
+                        || this.directLocalWatcher!==watcher
+                    ) {
+                        return;
+                    }
+                    const uri = this.directLocalWatcherUri(filename);
+                    if (uri) {
+                        onEvent(uri);
+                    }
+                },
+            );
+        } catch (error) {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [direct local watcher unavailable] ` +
+                `${this.baseUri.toString()}: ${formatUnknownError(error)}`,
+            );
+            return;
+        }
+
+        this.directLocalWatcher = watcher;
+        this.directLocalWatcherGeneration = generation;
+        watcher.on('error', error => {
+            if (
+                !this.isSyncSessionActive(generation)
+                || this.directLocalWatcher!==watcher
+            ) {
+                return;
+            }
+            try {
+                watcher.close();
+            } catch {
+                // The error may have closed the watcher already.
+            }
+            this.directLocalWatcher = undefined;
+            this.directLocalWatcherGeneration = undefined;
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [direct local watcher failed] ` +
+                `${this.baseUri.toString()}: ${formatUnknownError(error)}`,
+            );
+            this.markLocalWatcherDegraded(generation);
+        });
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [direct local watcher active] ${this.baseUri.toString()}`,
+        );
+    }
+
     private async scanLocalChangesWithoutWatcher(generation: number): Promise<number> {
         this.requireSyncSession(generation);
         const snapshot = await this.collectLocalReplicaSnapshot(
@@ -10814,6 +10932,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.localWatcher.onDidDelete(uri => bufferOrRun('push', uri, 'delete')),
         );
         this.armLocalWatcher = () => undefined;
+        this.startDirectLocalWatcher(generation, uri => bufferOrRun('push', uri, 'update'));
 
         let initialized: boolean;
         try {

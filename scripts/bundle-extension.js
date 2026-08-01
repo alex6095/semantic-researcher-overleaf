@@ -25,7 +25,11 @@ const configuration = {
             vscode: 'commonjs vscode',
         },
         ({request}, callback) => {
-            if (request==='prettier' || request?.startsWith('@unified-latex/')) {
+            if (
+                request==='socket.io-client'
+                || request==='prettier'
+                || request?.startsWith('@unified-latex/')
+            ) {
                 callback(null, `commonjs ${request}`);
                 return;
             }

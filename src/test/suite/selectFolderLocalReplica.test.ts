@@ -356,6 +356,8 @@ suite('Select Project Folder Local Replica', function () {
     let originalWatcherProbeTimeoutMs: number;
     let originalWatcherHealthIntervalMs: number;
     let originalFallbackScanIntervalMs: number;
+    let originalShouldUseDirectLocalWatcher: () => boolean;
+    let originalCreateDirectLocalWatcher: unknown;
     let restoreLocalReplicaWorkspaceContext: vscode.Disposable;
     const localReplicaWorkspaceState = new Map<string, unknown>();
     const localReplicaWorkspaceSubscriptions: vscode.Disposable[] = [];
@@ -395,6 +397,9 @@ suite('Select Project Folder Local Replica', function () {
         originalWatcherProbeTimeoutMs = (LocalReplicaSCMProvider as any).watcherProbeTimeoutMs;
         originalWatcherHealthIntervalMs = (LocalReplicaSCMProvider as any).watcherHealthIntervalMs;
         originalFallbackScanIntervalMs = (LocalReplicaSCMProvider as any).fallbackScanIntervalMs;
+        originalShouldUseDirectLocalWatcher = (LocalReplicaSCMProvider as any).shouldUseDirectLocalWatcher;
+        originalCreateDirectLocalWatcher = (LocalReplicaSCMProvider as any).createDirectLocalWatcher;
+        (LocalReplicaSCMProvider as any).shouldUseDirectLocalWatcher = () => false;
         (LocalReplicaSCMProvider as any).watcherProbeTimeoutMs = 60_000;
         (LocalReplicaSCMProvider as any).watcherHealthIntervalMs = 60_000;
     });
@@ -410,6 +415,8 @@ suite('Select Project Folder Local Replica', function () {
         (LocalReplicaSCMProvider as any).watcherProbeTimeoutMs = originalWatcherProbeTimeoutMs;
         (LocalReplicaSCMProvider as any).watcherHealthIntervalMs = originalWatcherHealthIntervalMs;
         (LocalReplicaSCMProvider as any).fallbackScanIntervalMs = originalFallbackScanIntervalMs;
+        (LocalReplicaSCMProvider as any).shouldUseDirectLocalWatcher = originalShouldUseDirectLocalWatcher;
+        (LocalReplicaSCMProvider as any).createDirectLocalWatcher = originalCreateDirectLocalWatcher;
         await Promise.allSettled(
             createdSCMsForTest.splice(0).map(scm => scm.deactivate()),
         );
@@ -6353,6 +6360,117 @@ suite('Select Project Folder Local Replica', function () {
 
         assert.strictEqual(await pathExists(outsideUri), false);
         assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, 'escape.tex')), false);
+    });
+
+    test('uses a confined direct watcher for immediate Remote SSH closed-file changes', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-direct-watch-remote-');
+        const localRoot = await tempDir('sr-overleaf-direct-watch-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote v1');
+
+        let directListener: ((eventType: string, filename: string | Buffer | null) => void) | undefined;
+        let directRoot = '';
+        let closeCount = 0;
+        let errorListener: ((error: Error) => void) | undefined;
+        (LocalReplicaSCMProvider as any).shouldUseDirectLocalWatcher = () => true;
+        (LocalReplicaSCMProvider as any).createDirectLocalWatcher = (
+            rootPath: string,
+            listener: (eventType: string, filename: string | Buffer | null) => void,
+        ) => {
+            directRoot = rootPath;
+            directListener = listener;
+            return {
+                close() {
+                    closeCount += 1;
+                },
+                on(event: string, listener: (error: Error) => void) {
+                    if (event==='error') { errorListener = listener; }
+                    return this;
+                },
+            };
+        };
+
+        const watchers: TestFileSystemWatcher[] = [];
+        (vscode.workspace as any).createFileSystemWatcher = () => {
+            const watcher = new TestFileSystemWatcher();
+            watchers.push(watcher);
+            return watcher;
+        };
+        (LocalReplicaSCMProvider as any).watcherProbeTimeoutMs = 100;
+        (LocalReplicaSCMProvider as any).watcherHealthIntervalMs = 1000;
+        let warningCount = 0;
+        (vscode.window as any).showWarningMessage = async () => {
+            warningCount += 1;
+            return undefined;
+        };
+
+        const scm = createSCM(remoteRoot, localRoot);
+        const internals = scm as any;
+        const triggers = await scm.triggers;
+        try {
+            assert.strictEqual(directRoot, localRoot.fsPath);
+            assert.ok(directListener);
+            assert.ok(errorListener);
+
+            await waitUntil(() => Boolean(internals.localWatcherProbe));
+            const probePath = vscode.Uri.parse(internals.localWatcherProbe.uri).fsPath;
+            directListener!('change', path.relative(localRoot.fsPath, probePath));
+            await waitUntil(() => internals.localWatcherHealthState==='healthy');
+            assert.strictEqual(warningCount, 0);
+            assert.strictEqual(internals.fallbackScanGeneration, undefined);
+
+            const nestedUri = vscode.Uri.joinPath(localRoot, 'sections', 'closed.tex');
+            const pushWait = waitForSyncComplete(localRoot, '/sections/closed.tex', 'push', 'update');
+            await writeText(nestedUri, 'closed agent edit through direct watcher');
+            directListener!('rename', Buffer.from('sections/closed.tex'));
+            assert.strictEqual((await pushWait).outcome, 'success');
+            assert.strictEqual(
+                await readText(vscode.Uri.joinPath(remoteRoot, 'sections', 'closed.tex')),
+                'closed agent edit through direct watcher',
+            );
+
+            const mediaUri = vscode.Uri.joinPath(localRoot, 'figures', 'direct-watch.png');
+            const mediaCreateWait = waitForSyncComplete(
+                localRoot,
+                '/figures/direct-watch.png',
+                'push',
+                'update',
+            );
+            await writeBytes(mediaUri, Buffer.from([137, 80, 78, 71, 1, 2, 3]));
+            directListener!('rename', 'figures/direct-watch.png');
+            assert.strictEqual((await mediaCreateWait).outcome, 'success');
+            assert.deepStrictEqual(
+                await readBytes(vscode.Uri.joinPath(remoteRoot, 'figures', 'direct-watch.png')),
+                Buffer.from([137, 80, 78, 71, 1, 2, 3]),
+            );
+
+            const mediaDeleteWait = waitForSyncComplete(
+                localRoot,
+                '/figures/direct-watch.png',
+                'push',
+                'delete',
+            );
+            await vscode.workspace.fs.delete(mediaUri);
+            directListener!('rename', 'figures/direct-watch.png');
+            assert.strictEqual((await mediaDeleteWait).outcome, 'success');
+            assert.strictEqual(
+                await pathExists(vscode.Uri.joinPath(remoteRoot, 'figures', 'direct-watch.png')),
+                false,
+            );
+
+            const escapedUri = internals.directLocalWatcherUri('../escape.tex') as vscode.Uri | undefined;
+            assert.strictEqual(escapedUri, undefined);
+            assert.strictEqual(internals.directLocalWatcherUri(localRoot.fsPath), undefined);
+
+            errorListener!(new Error('simulated direct watcher failure'));
+            await waitUntil(() => internals.localWatcherHealthState==='degraded');
+            assert.strictEqual(internals.directLocalWatcher, undefined);
+            assert.strictEqual(internals.fallbackScanGeneration, internals.syncGeneration);
+            assert.strictEqual(warningCount, 1);
+        } finally {
+            triggers.forEach(trigger => trigger.dispose());
+        }
+        assert.strictEqual(closeCount, 1);
     });
 
     test('falls back to content scans when the local watcher emits no events', async () => {

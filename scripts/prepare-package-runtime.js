@@ -18,11 +18,12 @@ const playwrightExcludedPaths = [
     'types',
 ];
 
-const formatterTargetRoot = path.join(outputRoot, 'node_modules');
-const formatterRoots = [
+const nodeRuntimeTargetRoot = path.join(outputRoot, 'node_modules');
+const nodeRuntimeRoots = [
     'prettier',
     '@unified-latex/unified-latex-prettier',
     '@unified-latex/unified-latex-util-parse',
+    'socket.io-client',
 ];
 
 function isWithin(relativePath, excludedPath) {
@@ -55,8 +56,8 @@ function installedPackageRoot(packageName) {
     return path.join(projectRoot, 'node_modules', ...packageName.split('/'));
 }
 
-function collectFormatterPackages() {
-    const pending = [...formatterRoots];
+function collectNodeRuntimePackages() {
+    const pending = [...nodeRuntimeRoots];
     const packages = new Set();
 
     while (pending.length>0) {
@@ -67,7 +68,7 @@ function collectFormatterPackages() {
         const packageRoot = installedPackageRoot(packageName);
         const packageJsonPath = path.join(packageRoot, 'package.json');
         if (!fs.existsSync(packageJsonPath)) {
-            throw new Error(`Missing formatter runtime dependency: ${packageName}`);
+            throw new Error(`Missing packaged Node runtime dependency: ${packageName}`);
         }
         const packageJson = JSON.parse(fs.readFileSync(packageJsonPath, 'utf8'));
         packages.add(packageName);
@@ -82,7 +83,7 @@ function collectFormatterPackages() {
     return [...packages].sort();
 }
 
-function shouldCopyFormatterPath(packageName, sourceRoot, sourcePath) {
+function shouldCopyNodeRuntimePath(packageName, sourceRoot, sourcePath) {
     const relativePath = path.relative(sourceRoot, sourcePath);
     if (relativePath.length===0) {
         return true;
@@ -151,18 +152,18 @@ function stagePlaywrightRuntime() {
     return directoryStats(playwrightTargetRoot);
 }
 
-async function stageFormatterRuntime() {
-    fs.rmSync(formatterTargetRoot, { recursive: true, force: true });
-    const packages = collectFormatterPackages();
+async function stageNodeRuntime() {
+    fs.rmSync(nodeRuntimeTargetRoot, { recursive: true, force: true });
+    const packages = collectNodeRuntimePackages();
 
     for (const packageName of packages) {
         const sourceRoot = installedPackageRoot(packageName);
-        const targetRoot = path.join(formatterTargetRoot, ...packageName.split('/'));
+        const targetRoot = path.join(nodeRuntimeTargetRoot, ...packageName.split('/'));
         fs.mkdirSync(path.dirname(targetRoot), { recursive: true });
         fs.cpSync(sourceRoot, targetRoot, {
             recursive: true,
             filter(source) {
-                return shouldCopyFormatterPath(packageName, sourceRoot, source);
+                return shouldCopyNodeRuntimePath(packageName, sourceRoot, source);
             },
         });
     }
@@ -180,10 +181,14 @@ async function stageFormatterRuntime() {
     if (!formatted.includes('\\section{Runtime}')) {
         throw new Error('Staged formatter runtime produced unexpected LaTeX output.');
     }
+    const socketClient = runtimeRequire('socket.io-client');
+    if (typeof socketClient.connect!=='function') {
+        throw new Error('Staged socket.io-client runtime does not expose connect().');
+    }
 
     return {
         packages: packages.length,
-        ...directoryStats(formatterTargetRoot),
+        ...directoryStats(nodeRuntimeTargetRoot),
     };
 }
 
@@ -196,12 +201,12 @@ async function main() {
     );
 
     if (!isRemotePack) {
-        const formatterStats = await stageFormatterRuntime();
+        const nodeRuntimeStats = await stageNodeRuntime();
         console.log(
-            `Staged formatter runtime in ` +
-            `${path.relative(repositoryRoot, formatterTargetRoot)} ` +
-            `(${formatterStats.packages} packages, ${formatterStats.files} files, ` +
-            `${formatterStats.bytes} bytes).`,
+            `Staged Node runtime in ` +
+            `${path.relative(repositoryRoot, nodeRuntimeTargetRoot)} ` +
+            `(${nodeRuntimeStats.packages} packages, ${nodeRuntimeStats.files} files, ` +
+            `${nodeRuntimeStats.bytes} bytes).`,
         );
     }
 }
