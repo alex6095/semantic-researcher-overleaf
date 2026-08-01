@@ -262,4 +262,101 @@ suite('Compile save UX', () => {
             manager.status.dispose();
         }
     });
+
+    test('project-root compile survives root-doc detection failure', async () => {
+        const origin = vscode.Uri.parse(
+            'semantic-researcher-overleaf://www.overleaf.com/Compile%20UX?user=user-1&project=project-1',
+        );
+        const compileRootArgs: Array<string | undefined> = [];
+        const fakeVfs = {
+            flushLocalReplicaBeforeCompile: async () => {},
+            // Local Replica compiles pass the project ROOT uri, which resolves
+            // to a folder. Reading it as a file used to fail the whole compile
+            // with `Overleaf download failed (404)` before the request was sent.
+            _resolveUri: async () => ({fileType: 'folder', fileId: 'root-folder-id'}),
+            openFile: async () => {
+                throw new Error('Overleaf download failed (404)');
+            },
+            compile: async (
+                _force: boolean,
+                _draft: boolean,
+                _stop: boolean,
+                rootDocId?: string,
+            ) => {
+                compileRootArgs.push(rootDocId);
+                return undefined;
+            },
+        };
+        const manager = new CompileManager({
+            prefetch: async () => fakeVfs,
+        } as unknown as RemoteFileSystemProvider);
+        const statuses: string[] = [];
+        (manager as any).update = async (status: string) => {
+            statuses.push(status);
+            return origin;
+        };
+        try {
+            await manager.compile(true, [], origin);
+            // The compile request must still be issued, deferring the root
+            // document to the project's stored setting.
+            assert.deepStrictEqual(compileRootArgs, [undefined]);
+            assert.ok(!statuses.includes('failed'), `unexpected failed status in ${statuses}`);
+        } finally {
+            manager.status.dispose();
+        }
+    });
+
+    test('empty output.log after a successful compile is not reported as failure', async () => {
+        const origin = vscode.Uri.parse(
+            'semantic-researcher-overleaf://www.overleaf.com/Compile%20UX?user=user-1&project=project-1',
+        );
+        let openFileCalls = 0;
+        const fakeVfs = {
+            pathToUri: (...pathParts: string[]) => vscode.Uri.joinPath(origin, ...pathParts),
+            openFile: async () => {
+                openFileCalls += 1;
+                return new Uint8Array(0);
+            },
+        };
+        const manager = new CompileManager({
+            prefetch: async () => fakeVfs,
+        } as unknown as RemoteFileSystemProvider);
+        try {
+            const hasError = await (manager as any).diagnosticProvider.updateDiagnostics(origin);
+            // The compile response already reported success by the time the
+            // error check runs; an empty log download must not flip the
+            // result to 'failed'.
+            assert.strictEqual(hasError, false);
+            // The empty first download is retried once before giving up.
+            assert.strictEqual(openFileCalls, 2);
+        } finally {
+            manager.status.dispose();
+        }
+    });
+
+    test('non-empty output.log with LaTeX errors is still reported as failure', async () => {
+        const origin = vscode.Uri.parse(
+            'semantic-researcher-overleaf://www.overleaf.com/Compile%20UX?user=user-1&project=project-1',
+        );
+        const failingLog = [
+            'This is pdfTeX, Version 3.141592653 (TeX Live 2025)',
+            '(./main.tex',
+            '! Undefined control sequence.',
+            'l.3 \\thiscommanddoesnotexist',
+            ')',
+        ].join('\n');
+        const fakeVfs = {
+            pathToUri: (...pathParts: string[]) => vscode.Uri.joinPath(origin, ...pathParts),
+            openFile: async () => Buffer.from(failingLog),
+        };
+        const manager = new CompileManager({
+            prefetch: async () => fakeVfs,
+        } as unknown as RemoteFileSystemProvider);
+        try {
+            const hasError = await (manager as any).diagnosticProvider.updateDiagnostics(origin);
+            assert.strictEqual(hasError, true);
+        } finally {
+            manager.status.dispose();
+        }
+    });
 });

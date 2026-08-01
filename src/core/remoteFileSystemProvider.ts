@@ -18,6 +18,7 @@ import {
     getActiveReplicaRoot,
 } from '../utils/localReplicaWorkspace';
 import { decodeUtf8Text, mergeUtf8Text } from '../utils/threeWayMerge';
+import { getOutputChannel } from '../utils/outputChannel';
 
 const __OUTPUTS_ID = `${ROOT_NAME}-outputs`;
 
@@ -1725,8 +1726,19 @@ export class VirtualFileSystem extends vscode.Disposable {
                     console.warn(`Unable to resolve root document id '${resolvedRootDocId}' to a path; compiling without explicit rootResourcePath.`);
                 }
             }
-            const res = await this.api.compile(identity, this.projectId, rootResourcePath, draft, stopOnFirstError);
+            let res = await this.api.compile(identity, this.projectId, rootResourcePath, draft, stopOnFirstError);
             this.requireCurrentSession();
+            // Overleaf rate-limits auto compiles; a backoff status is transient,
+            // so retry once after a short delay instead of reporting a failure.
+            const transientStatus = res.type==='success' ? res.compile?.status : undefined;
+            if (transientStatus==='autocompile-backoff' || transientStatus==='too-recently-compiled') {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [compile backoff] status=${transientStatus}; retrying in 2s`,
+                );
+                await new Promise(resolve => setTimeout(resolve, 2000));
+                res = await this.api.compile(identity, this.projectId, rootResourcePath, draft, stopOnFirstError);
+                this.requireCurrentSession();
+            }
             if (res.type==='success' && res.compile?.status==='success') {
                 // Store CDN download info from the response for subsequent output file requests
                 this.compileGroup = res.compile.compileGroup;
@@ -1735,13 +1747,18 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.updateOutputs(res.compile.outputFiles);
                 return true;
             } else {
-                console.error('Compile response rejected.', {
+                const details = {
                     responseType: res.type,
                     httpStatus: res.status,
                     compileStatus: res.compile?.status,
                     outputCount: res.compile?.outputFiles?.length,
                     latexmkErrors: res.compile?.stats?.['latexmk-errors'],
-                });
+                };
+                console.error('Compile response rejected.', details);
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [compile rejected] ${JSON.stringify(details)}` +
+                    (res.message ? ` message=${res.message}` : ''),
+                );
                 return false;
             }
         }

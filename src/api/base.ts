@@ -67,7 +67,11 @@ export interface NewProjectResponseSchema {
 }
 
 export interface CompileResponseSchema {
-    status: 'success' | 'failure' | 'error';
+    // Overleaf also returns transient/limit statuses beyond the three
+    // terminal ones, e.g. when auto-compile rate limiting kicks in.
+    status: 'success' | 'failure' | 'error'
+        | 'autocompile-backoff' | 'too-recently-compiled'
+        | 'unavailable' | 'timedout' | 'terminated' | 'validation-problems';
     compileGroup: string;
     clsiServerId?: string;
     pdfDownloadDomain?: string;
@@ -848,6 +852,11 @@ export class BaseAPI {
                 break;
             } else if (res.status === 206) {
                 content.push(await res.buffer());
+            } else if (content.length === 0) {
+                // Surfacing the failure beats silently returning an empty
+                // buffer, which downstream code would mistake for real content
+                // (e.g. an empty output.log reads as a failed compile).
+                throw new Error(`Download failed with HTTP ${res.status} for ${absoluteUrl.split('?')[0]}`);
             } else {
                 break;
             }

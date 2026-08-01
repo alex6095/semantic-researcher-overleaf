@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.35] - 2026-08-02
+### Changed
+- Log the full compile lifecycle (start, skip, server rejection details, LaTeX error-check verdict, and workflow exceptions) to the shared Semantic Researcher Overleaf output channel so failed compiles are diagnosable after the fact.
+- Widen the compile response schema to cover Overleaf transient statuses such as autocompile-backoff.
+
+### Fixed
+- Compile from a Local Replica project no longer fails before the request is sent: best-effort root-document detection previously read the project root folder as a file and died with Overleaf download failed (404); detection failures now fall back to the project's stored root document.
+- Stop reporting a successful compile as failed when the output.log download arrives empty; retry the download once and keep the server-reported success.
+- Count LaTeX errors toward the compile verdict even when the referenced source file cannot be opened for a diagnostic range.
+- Retry a compile once after two seconds when Overleaf answers with a transient auto-compile backoff status instead of surfacing an immediate failure.
+- Raise a descriptive error when an output-file download returns an unexpected HTTP status instead of silently yielding empty content that downstream code mistakes for a failed compile.
+
+### Verified
+- Pass all 279 extension-host tests on VS Code 1.130.0, including new project-root compile, empty-output.log, and unmappable-error compile verdict cases.
+
 ## [0.15.34] - 2026-08-02
 ### Changed
 - Treat the legacy v1 and current project-query v2 Socket.IO handshakes as separate retry strategies. Switching protocols receives a fresh retry budget instead of consuming the final retry without opening the replacement socket.

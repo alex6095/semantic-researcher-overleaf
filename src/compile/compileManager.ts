@@ -11,6 +11,7 @@ import { EventBus } from '../utils/eventBus';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
 import { getActiveReplicaOriginUri, isWithinActiveReplica } from '../utils/localReplicaWorkspace';
 import { formatUnknownError } from '../utils/errorMessage';
+import { getOutputChannel } from '../utils/outputChannel';
 
 // map string level to severity
 const severityMap: Record<string, vscode.DiagnosticSeverity> = {
@@ -78,14 +79,37 @@ class CompileDiagnosticProvider {
         const _uri = vfs.pathToUri(logPath);
         let content ='';
         content = new TextDecoder().decode(await vfs.openFile(_uri));
+        if (content === '') {
+            // A transient empty download must not fail a compile the server
+            // reported as successful. Retry once before deciding.
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [compile log empty] retrying output.log download`,
+            );
+            content = new TextDecoder().decode(await vfs.openFile(_uri));
+        }
         const logs = new LatexParser(content).parse();
         if (logs === undefined) {
-            return content === ''? true :false;
+            if (content === '') {
+                // The compile response already reported success; an empty log
+                // after a retry is a download problem, not a LaTeX error.
+                // Surface it in the output channel instead of a false 'failed'.
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [compile log empty] output.log still empty after retry; ` +
+                    'treating compile as successful (server reported success)',
+                );
+            }
+            return false;
         }
         let hasError = false;
         const diagnosticsRecorder: { [key: string]: vscode.Diagnostic[] } = {};
         for (const log of logs.all) {
             if (!log.file.startsWith('./')) { continue; }
+            // Count the error even when the source file cannot be opened for a
+            // diagnostic range below — a LaTeX error must fail the compile
+            // regardless of whether we can attach an editor squiggle to it.
+            if (log.level === 'error') {
+                hasError = true;
+            }
             const path = this.validatePath(log.file);
             const range = await this.getRange(log, path, vfs);
             if (range === null) {
@@ -97,10 +121,6 @@ class CompileDiagnosticProvider {
             const diagnostic = new vscode.Diagnostic(range, log.message, severityMap[log.level]);
             diagnostic.source = vscode.l10n.t('Compile Checker');
             diagnosticsRecorder[path].push(diagnostic);
-
-            if (log.level === 'error') {
-                hasError = true;
-            }
         }
         for (const file in diagnosticsRecorder) {
             const diagnostics = diagnosticsRecorder[file];
@@ -311,6 +331,10 @@ export class CompileManager {
             return;
         }
         await this.update('compiling', uri);
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [compile start] force=${force} ` +
+            `saved=${savedLocalReplicaUris.length} project=${uri.toString()}`,
+        );
 
         const work = this.vfsm.prefetch(uri)
             .then(async (vfs) => {
@@ -320,23 +344,50 @@ export class CompileManager {
                     this.warnLocalReplicaPrecompileFlushFailed(error);
                     throw error;
                 }
-                const content = new TextDecoder().decode( await vfs?.openFile(uri) );
-                const match = RegExp(documentClassRegex).exec(content);
-                const fileId = (await vfs._resolveUri(uri)).fileId;
-                const rootDocId = match ? fileId : undefined;
+                // Root-document detection: when the compile was triggered from
+                // a specific .tex document, prefer it as the compile root. In
+                // the Local Replica flow `uri` is the project ROOT (a folder),
+                // which must not be read as a file — doing so downloads the
+                // root folder id via the file API and dies with a 404 before
+                // the compile request is ever sent. Detection is best-effort:
+                // on any failure fall back to the project's stored root doc.
+                let rootDocId: string | undefined;
+                try {
+                    const {fileType, fileId} = await vfs._resolveUri(uri);
+                    if (fileType==='doc' && fileId) {
+                        const content = new TextDecoder().decode( await vfs.openFile(uri) );
+                        if (RegExp(documentClassRegex).exec(content)) {
+                            rootDocId = fileId;
+                        }
+                    }
+                } catch (error) {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [compile root detect] skipped: ${formatUnknownError(error)}`,
+                    );
+                }
                 return await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId);
             })
             .then(async (res) => {
                 switch (res) {
                     case undefined:
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [compile skipped] no pending changes; keeping last status`,
+                        );
                         await this.update('success', uri);
                         break;
                     case false:
+                        // vfs.compile already logged the rejected response details.
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [compile result] failed: server rejected the compile request`,
+                        );
                         await this.update('failed', uri);
                         break;
                     case true:
                         return true;
                     default:
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [compile result] alert: not connected`,
+                        );
                         await this.update('alert', uri);
                         break;
                 }
@@ -347,6 +398,9 @@ export class CompileManager {
                     : Promise.reject()
             )
             .then(async (hasError) => {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [compile result] ${hasError ? 'failed: LaTeX errors in output.log' : 'success'}`,
+                );
                 if (hasError) {
                     await this.update('failed', uri);
                 } else {
@@ -366,6 +420,9 @@ export class CompileManager {
                 // isn't permanently locked out by the inCompiling guard.
                 if (error!==undefined) {
                     console.error('Compile workflow failed.', formatUnknownError(error));
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [compile error] ${formatUnknownError(error)}`,
+                    );
                 }
                 if (this.inCompiling) {
                     await this.update('failed', uri);

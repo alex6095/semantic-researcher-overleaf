@@ -35,6 +35,7 @@ import {
 import { stringifyOverleafUri } from '../utils/overleafUri';
 import { EventBus, Events } from '../utils/eventBus';
 import { formatUnknownError } from '../utils/errorMessage';
+import { getOutputChannel } from '../utils/outputChannel';
 import { PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS, getAgentReviewManager } from '../agentReview';
 import { decodeUtf8Text, mergeUtf8Text } from '../utils/threeWayMerge';
 
@@ -51,14 +52,8 @@ export function matchesLocalReplicaIgnorePattern(path: string, pattern: string):
     return picomatch.isMatch(path, pattern, {dot: true});
 }
 
-// Single shared output channel for Local Replica sync diagnostics. Lazy-created.
-let sharedOutput: vscode.OutputChannel | undefined;
-function getOutputChannel() {
-    if (!sharedOutput) {
-        sharedOutput = vscode.window.createOutputChannel('Semantic Researcher Overleaf');
-    }
-    return sharedOutput;
-}
+// The shared output channel now lives in src/utils/outputChannel so the
+// compile pipeline can log to the same 'Semantic Researcher Overleaf' channel.
 
 // De-dupe warning notifications: remember the last error signature we surfaced.
 const lastWarnByRel = new Map<string, {signature: string, at: number}>();
