@@ -2933,6 +2933,114 @@ suite('Extension host and lifecycle isolation', () => {
         }
     });
 
+    test('falls back to a fresh v2 handshake after a v1 HTTP upgrade failure', () => {
+        const socketClient = require('socket.io-client') as {
+            connect: (url: string, options: Record<string, unknown>) => unknown;
+        };
+        const originalConnect = socketClient.connect;
+        const sockets: Array<{
+            handlers: Map<string, (...args:any[]) => void>;
+            disconnects: number;
+            socket: Record<string, unknown>;
+        }> = [];
+        const capturedQueries: unknown[] = [];
+        socketClient.connect = (_url, options) => {
+            const handlers = new Map<string, (...args:any[]) => void>();
+            let disconnects = 0;
+            const socket = {
+                emit: () => undefined,
+                on: (event: string, handler: (...args:any[]) => void) => {
+                    handlers.set(event, handler);
+                    return socket;
+                },
+                disconnect: () => {
+                    disconnects += 1;
+                },
+                removeAllListeners: () => undefined,
+            };
+            const state = {
+                handlers,
+                get disconnects() {
+                    return disconnects;
+                },
+                socket,
+            };
+            sockets.push(state);
+            capturedQueries.push(options.query);
+            return state.socket;
+        };
+
+        try {
+            const api = new BaseAPI('https://www.overleaf.com/');
+            const socket = new SocketIOAPI(
+                'https://www.overleaf.com/',
+                api,
+                {csrfToken: 'token', cookies: 'session=cookie'},
+                'project-1',
+            );
+            assert.strictEqual(socket.needsReinit, false);
+
+            sockets[0].handlers.get('error')?.(new Error('Unexpected server response: 502'));
+            assert.strictEqual(socket.needsReinit, true);
+            assert.strictEqual(sockets[0].disconnects, 1);
+
+            socket.init();
+            assert.strictEqual(socket.needsReinit, false);
+            assert.strictEqual(capturedQueries.length, 2);
+            assert.strictEqual(capturedQueries[0], '');
+            assert.match(String(capturedQueries[1]), /^projectId=project-1&t=\d+$/);
+        } finally {
+            socketClient.connect = originalConnect;
+        }
+    });
+
+    test('does not exhaust retries before a changed socket scheme is attempted', async () => {
+        const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
+        const internals = vfs as any;
+        attachAuthenticatedSession(internals);
+        internals.disposed = false;
+        internals.origin = vscode.Uri.parse(
+            `${ROOT_NAME}://www.overleaf.com/Project?user=user-1&project=project-1`,
+        );
+        internals.projectId = 'project-1';
+        internals.retryConnection = 2;
+        internals._connectionState = 'initial';
+        internals.setConnectionState = () => undefined;
+        internals.remoteWatch = () => undefined;
+        internals.ensureActiveManagers = () => undefined;
+        const project = {_id: 'project-1', name: 'Project', rootFolder: []};
+        let needsReinit = false;
+        let initCalls = 0;
+        let joinCalls = 0;
+        internals.socket = {
+            get needsReinit() {
+                return needsReinit;
+            },
+            init: () => {
+                initCalls += 1;
+                needsReinit = false;
+            },
+            joinProject: async () => {
+                joinCalls += 1;
+                if (joinCalls===1) {
+                    needsReinit = true;
+                    throw new Error('client not handshaken');
+                }
+                return project;
+            },
+        };
+        internals.api = {
+            getProjectSettings: async () => ({settings: {compiler: 'pdflatex'}}),
+        };
+
+        const initialized = await vfs.init();
+
+        assert.strictEqual(initialized, project);
+        assert.strictEqual(joinCalls, 2);
+        assert.strictEqual(initCalls, 2);
+        assert.strictEqual(internals.retryConnection, 0);
+    });
+
     test('gracefully disposes an old socket before creating its replacement', () => {
         const socketClient = require('socket.io-client') as {
             connect: (url: string, options: Record<string, unknown>) => unknown;

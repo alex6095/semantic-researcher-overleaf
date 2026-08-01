@@ -4,6 +4,22 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.34] - 2026-08-02
+### Changed
+- Treat the legacy v1 and current project-query v2 Socket.IO handshakes as separate retry strategies. Switching protocols receives a fresh retry budget instead of consuming the final retry without opening the replacement socket.
+- Apply the authenticated Socket.IO runtime patch during every production package build, not only during dependency installation.
+- Verify that the staged VSIX runtime forwards authentication headers through both the HTTP handshake and WebSocket upgrade before packaging can succeed.
+
+### Fixed
+- Restore signed-in Overleaf project connections that failed with `Unexpected server response: 502` followed by `client not handshaken` after the Socket.IO runtime was externalized in 0.15.33.
+- Fall back from v1 to the project-query v2 handshake immediately on HTTP 4xx/5xx WebSocket upgrade failures.
+- Keep Local Replica symbols and folding responsive from the current document when the remote root index is temporarily unavailable or references a deleted file.
+
+### Verified
+- Pass all 276 extension-host tests on VS Code 1.130.0, including the exact `502` protocol fallback, exhausted-retry, and unavailable-root intellisense regression cases.
+- Build and install a production VSIX whose staged CommonJS Socket.IO runtime contains the authenticated HTTP and WebSocket header patch.
+- Reconnect the signed-in `Local Replica Sync Demo` over Remote SSH, pull an existing remote file, and round-trip creation and deletion of a closed `.tex` file and PNG through Overleaf while returning to `Connected / Synced`.
+
 ## [0.15.33] - 2026-08-02
 ### Changed
 - Add a selected-folder-only recursive Node watcher on Remote SSH hosts. It feeds the existing Local Replica debounce, confinement, manifest, conflict, and three-way merge pipeline without scanning the wider workspace.

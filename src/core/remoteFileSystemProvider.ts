@@ -426,7 +426,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             throw new Error(message);
         }
         // if evert connection failed, reset socketio
-        if (this.retryConnection > 0) {
+        if (this.retryConnection > 0 || this.socket.needsReinit) {
             this.setConnectionState('reconnecting');
             this.socket.init();
         }
@@ -462,7 +462,13 @@ export class VirtualFileSystem extends vscode.Disposable {
                 vscode.window.showErrorMessage(message);
                 throw new Error(message);
             }
-            this.retryConnection += 1;
+            if (this.socket.needsReinit) {
+                // A protocol fallback is a new connection strategy, not another
+                // failed attempt of the old strategy. Give it a fresh retry budget.
+                this.retryConnection = 0;
+            } else {
+                this.retryConnection += 1;
+            }
             return this.initializingPromise;
         });
     }

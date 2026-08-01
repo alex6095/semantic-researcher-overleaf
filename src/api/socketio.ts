@@ -88,6 +88,7 @@ export class SocketIOAPI {
 
     private socket?: any;
     private emit: any;
+    private initializedScheme?: ConnectionScheme;
 
     constructor(private url:string,
                 private readonly api:BaseAPI,
@@ -116,6 +117,7 @@ export class SocketIOAPI {
                 this.socket = this.api._initSocketV0(this.identity, query);
                 break;
         }
+        this.initializedScheme = this.scheme;
         // create emit
         (this.socket.emit)[require('util').promisify.custom] = (event:string, ...args:any[]) => {
             let timeout: NodeJS.Timeout;
@@ -155,7 +157,8 @@ export class SocketIOAPI {
     }
 
     private isHandshakeFallbackError(error: Error): boolean {
-        return error.message==='client not handshaken';
+        return error.message==='client not handshaken'
+            || /^Unexpected server response:\s*[45]\d{2}$/i.test(error.message);
     }
 
     private isKnownFallbackError(error: Error): boolean {
@@ -192,6 +195,7 @@ export class SocketIOAPI {
         const normalizedError = this.normalizeSocketError(error);
         if (this.scheme==='v1' && this.isHandshakeFallbackError(normalizedError)) {
             this.scheme = 'v2';
+            console.log(`SocketIOAPI: falling back to v2 (${normalizedError.message})`);
             this.disconnectSocket();
         }
 
@@ -218,6 +222,7 @@ export class SocketIOAPI {
             console.log('SocketIOAPI: connectionRejected.', error.message);
             if (this.scheme==='v1') {
                 this.scheme = 'v2';
+                console.log(`SocketIOAPI: falling back to v2 (${error.message})`);
                 this.disconnectSocket();
             }
             this.notifySocketError(error);
@@ -302,6 +307,10 @@ export class SocketIOAPI {
 
     get isUsingAlternativeConnectionScheme() {
         return this.scheme==='Alt';
+    }
+
+    get needsReinit() {
+        return this.initializedScheme!==this.scheme || !this.socket;
     }
 
     toggleAlternativeConnectionScheme(url: string, updatedRecord?: ProjectEntity) {

@@ -172,8 +172,29 @@ class ProjectStructRecord {
         return normalizeProjectPath(this.vfs.getRootDocName());
     }
 
-    async init() {
-        const rootFileStruct = await this.refreshRecord( this.rootPath );
+    private documentPath(document: vscode.TextDocument): string {
+        const relativePath = document.uri.scheme===ROOT_NAME
+            ? parseUri(document.uri).pathParts.join('/')
+            : '';
+        return normalizeProjectPath(relativePath);
+    }
+
+    async init(seedDocument?: vscode.TextDocument) {
+        let rootFileStruct: TexFileStruct;
+        try {
+            const seededRoot = seedDocument
+                && this.documentPath(seedDocument)===this.rootPath
+                ? this.fileRecordMap.get(this.rootPath)
+                    ?? await this.refreshRecord(seedDocument)
+                : undefined;
+            rootFileStruct = seededRoot ?? await this.refreshRecord(this.rootPath);
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            console.warn(
+                `TexDocumentSymbolProvider: project index unavailable for ${this.rootPath}: ${message}`,
+            );
+            return;
+        }
         const fileQueue: TexFileStruct[] = [ rootFileStruct ];
 
         // iteratively traverse file node tree
@@ -194,7 +215,7 @@ class ProjectStructRecord {
         if (document.uri.scheme!==ROOT_NAME) {
             return undefined;
         }
-        const filePath = normalizeProjectPath(parseUri(document.uri).pathParts.join('/'));
+        const filePath = this.documentPath(document);
         return this.fileRecordMap.get(filePath);
     }
 
@@ -267,13 +288,17 @@ export class TexDocumentSymbolProvider extends IntellisenseProvider implements v
         if (!vfsUri) { return environmentRange; }
         const {projectName} = parseUri(vfsUri);
         let projectRecord = this.projectRecordMap.get(projectName);
+        let initializeProjectRecord = false;
         if (projectRecord===undefined) {
             const vfs = await this.vfsm.prefetch(vfsUri);
             projectRecord = new ProjectStructRecord(vfs);
-            await projectRecord.init();
             this.projectRecordMap.set(projectName, projectRecord);
+            initializeProjectRecord = true;
         }
         const fileStruct = projectRecord.getTexFileStruct(document) ?? await projectRecord.refreshRecord(document);
+        if (initializeProjectRecord) {
+            void projectRecord.init(document);
+        }
 
         return environmentRange.concat( fileStruct ? elementsToFoldingRanges(fileStruct.texElements) : [] );
     }
@@ -287,14 +312,18 @@ export class TexDocumentSymbolProvider extends IntellisenseProvider implements v
 
         // init project record if not exist
         let projectRecord = this.projectRecordMap.get(projectName);
+        let initializeProjectRecord = false;
         if (projectRecord === undefined) {
             projectRecord = new ProjectStructRecord(vfs);
-            await projectRecord.init();
             this.projectRecordMap.set(projectName, projectRecord);
+            initializeProjectRecord = true;
         }
 
         // return symbols
         const fileStruct = projectRecord.getTexFileStruct(document) ?? await projectRecord.refreshRecord(document);
+        if (initializeProjectRecord) {
+            void projectRecord.init(document);
+        }
         return elementsToSymbols( fileStruct.texElements );
     }
 

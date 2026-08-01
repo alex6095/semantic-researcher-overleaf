@@ -185,6 +185,25 @@ async function stageNodeRuntime() {
     if (typeof socketClient.connect!=='function') {
         throw new Error('Staged socket.io-client runtime does not expose connect().');
     }
+    const socketRuntimeRoot = path.dirname(
+        runtimeRequire.resolve('socket.io-client/package.json'),
+    );
+    const socketHandshakeSource = fs.readFileSync(
+        path.join(socketRuntimeRoot, 'lib', 'socket.js'),
+        'utf8',
+    );
+    const socketWebSocketSource = fs.readFileSync(
+        path.join(socketRuntimeRoot, 'lib', 'transports', 'websocket.js'),
+        'utf8',
+    );
+    if (
+        !socketHandshakeSource.includes('applyExtraHeaders(xhr, this.options')
+        || !socketWebSocketSource.includes('headers: extraHeaders || {}')
+    ) {
+        throw new Error(
+            'Staged socket.io-client runtime is missing authenticated handshake headers.',
+        );
+    }
 
     return {
         packages: packages.length,
