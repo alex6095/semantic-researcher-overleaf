@@ -294,7 +294,10 @@ export class GlobalStateManager {
             return projects;
         }
         const cookieExpireRegex = /^302/;
-        if (res.message && cookieExpireRegex.test(res.message)) {
+        // The HTTP layer now flags a login redirect / rotated CSRF token
+        // centrally; the legacy prefix match stays as a fallback for responses
+        // that never reach that detection.
+        if (res.sessionExpired || (res.message && cookieExpireRegex.test(res.message))) {
             vscode.window.showErrorMessage(vscode.l10n.t('Cookie Expired. Please Re-Login'));
             throw new ServerSessionExpiredError(name);
         }

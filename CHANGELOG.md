@@ -4,20 +4,68 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.15.35] - 2026-08-02
+## [0.16.0] - 2026-08-02
+
+First release published to the VS Marketplace since 0.15.28 (Remote Pack
+0.15.11). Versions 0.15.31 through 0.15.34 shipped only as GitHub Releases,
+and 0.15.29-0.15.30 and 0.15.35-0.15.36 were internal iterations published
+nowhere. This entry describes the net change from Marketplace 0.15.28, so
+fixes for regressions that existed only inside those interim versions are
+deliberately omitted; users upgrading from a v0.15.31-v0.15.34 GitHub Release
+can find the interim details in the entries below.
+
+### Added
+- Add a durable Local Replica sync manifest and guarded three-way merging so offline and concurrent local/Overleaf edits are reconciled without silently discarding either copy. States that cannot be proven safe become conflicts.
+- Add per-folder Local Replica ownership fencing so two VS Code extension hosts cannot watch and submit changes for the same folder, plus an explicitly confirmed `Repair Local Replica Ownership Marker` command that can reclaim a marker whose owner is provably gone.
+- Add a selected-folder-only recursive watcher for Remote SSH hosts, and a watcher-health monitor that falls back to exact-content scanning when event delivery is lost and reports paths it cannot scan.
+- Add compile-barrier coverage for closed files, folders, and binary media, including additions, edits, renames, and deletes that happen with no editor or watcher event.
+- Ask before a new Local Replica pulls into a folder that already holds files: the prompt names the folder, counts the affected files, and offers replacing them with the Overleaf copy, keeping them and merging, or cancelling. An empty folder proceeds without a prompt.
+- Back up the local-only files a remote-authoritative pull would remove into `.semantic-researcher-overleaf/replaced-local-files-<timestamp>/`, and report where they went.
+- Ask before attaching to an auto-discovered Local Replica the user never activated in this workspace, and remember the answer.
+- Report when a window takes over Local Replica ownership instead of resuming synchronization silently.
+- Detect an expired Overleaf session centrally in the HTTP layer and offer to sign in again.
+- Log the compile lifecycle to the `Semantic Researcher Overleaf` output channel so a failed compile can be diagnosed after the fact.
+
 ### Changed
-- Log the full compile lifecycle (start, skip, server rejection details, LaTeX error-check verdict, and workflow exceptions) to the shared Semantic Researcher Overleaf output channel so failed compiles are diagnosable after the fact.
-- Widen the compile response schema to cover Overleaf transient statuses such as autocompile-backoff.
+- Make <kbd>Ctrl</kbd>+<kbd>S</kbd> on a supported source file sync the saved disk bytes and then compile. Manual Compile and PDF Recompile keep using saved state and never transmit unsaved editor buffers.
+- Run the main extension on the workspace extension host and the Remote Pack on the local UI host, so Local Replica state is isolated correctly in Remote SSH windows.
+- Port upstream `v0.15.10` selectively, without adopting its save-only synchronization: closed files edited by shells or coding agents stay watcher-driven. Authentication, connection compatibility, and dependency updates were adopted or adapted.
+- Bundle the extension and Remote Pack with Webpack and package only the runtime portions of Playwright, Prettier, and Unified LaTeX, so the VSIX no longer carries complete dependency trees.
+- Verify at package time that the PDF viewer and LaTeX language vendor trees are present, that every staged runtime module resolves inside the packaged runtime, and that every authenticated-handshake hunk of the Socket.IO patch survives.
 
 ### Fixed
-- Compile from a Local Replica project no longer fails before the request is sent: best-effort root-document detection previously read the project root folder as a file and died with Overleaf download failed (404); detection failures now fall back to the project's stored root document.
-- Stop reporting a successful compile as failed when the output.log download arrives empty; retry the download once and keep the server-reported success.
-- Count LaTeX errors toward the compile verdict even when the referenced source file cannot be opened for a diagnostic range.
-- Retry a compile once after two seconds when Overleaf answers with a transient auto-compile backoff status instead of surfacing an immediate failure.
-- Raise a descriptive error when an output-file download returns an unexpected HTTP status instead of silently yielding empty content that downstream code mistakes for a failed compile.
+- Preserve the three-way merge baseline across a reconnect. A rejoin previously reset the baseline to the current remote text, so the next save deleted every collaborator edit made during the outage.
+- Reject a cached realtime project record belonging to a superseded or dead socket, and treat a disconnected socket as needing re-initialization, instead of reporting a live connection while serving pre-outage content.
+- Notify the connection state machine before stripping socket listeners, so a mid-session protocol fallback reconnects instead of leaving the project permanently unable to save.
+- Reset the connection retry budget only after the project join succeeds, back off between attempts, and re-arm collaborator, chat, and connection handlers on the socket a reconnect creates.
+- Join the project before joining a document, so a write racing a reconnect does not fail after repeated acknowledgement timeouts.
+- Bound every Overleaf HTTP request with a timeout, and continue a partial download with a real range request instead of re-fetching the same bytes forever.
+- Fall back to the manifest baseline when Overleaf deletes a file, and raise a conflict when no baseline can prove the local copy is unmodified, instead of deleting a locally edited file.
+- Choose the compare-and-swap remote replacement by Overleaf entity type rather than filename extension, so replacing a `.csv`, `.json`, or `.xlsx` can no longer discard a concurrent remote change.
+- Keep scanning local files when one path cannot be classified, and report paths that stay unscannable, instead of silently synchronizing nothing while the watcher is degraded.
+- Verify descendant conflicts before clearing them, and record conflicts durably.
+- Derive Local Replica ownership identity from stable system identity, recognize markers written by earlier versions, treat an unidentifiable ownership peer as possibly live, and abort a sync session disposed while ownership was being acquired.
+- Fsync a pulled file before installing it, so a crash cannot leave a truncated file that is later pushed over the remote copy.
+- Probe local watcher health inside the replica tree, so an excluded project subtree no longer reports healthy.
+- Compile a Local Replica project again: best-effort root-document detection read the project root folder as a file and failed with `Overleaf download failed (404)` before the request was sent.
+- Publish diagnostics for a compile the server rejected, re-establish the compile outputs folder after a reconnect, and stop reporting a successful compile as failed when `output.log` arrives empty.
+- Refresh the PDF before reporting compile success and report an unavailable PDF, instead of leaving a stale or blank document under a success badge.
+- Count LaTeX errors raised inside a package toward the compile verdict.
+- Send the active document's project-relative path and a 1-based line for SyncTeX forward search, open the local replica file on reverse search, and guard against a closed PDF panel or an empty result.
+- Keep a stopped compile from reporting a failure the server refused, and from clobbering the status of the compile that follows it.
+- Parse `output.log` iteratively, including its first line, so a large log cannot overflow the stack and fail a successful compile.
+- Terminate project indexing and bibliography collection on an `\input` cycle, which previously froze the extension host from citation completion.
+- Keep Local Replica symbols and folding responsive from the current document when the remote root index is unavailable or references a deleted file.
+- Clear collaborator decorations when a collaborator moves to another file, and reject malformed cursor payloads before storing them.
+- Read Local Replica settings without rewriting them on the push path, so a settings migration no longer reports in-flight pushes as blocked.
+- Register the PDF panel tracking listener once per process instead of once per `CompileManager`, which leaked event listeners whenever a manager was constructed.
+- Delete the browser-login profile once its cookies are handed over, confine the profile directory name, require confirmation before a caller-supplied server receives cookies, and preserve a self-hosted server's path prefix.
+- Retain a Local Replica mapping another window owns during startup cleanup, and never let that cleanup prevent the selected replica from being created.
 
 ### Verified
-- Pass all 279 extension-host tests on VS Code 1.130.0, including new project-root compile, empty-output.log, and unmappable-error compile verdict cases.
+- Pass all 340 extension-host tests on VS Code 1.130.0, including 45 regression tests added for the fixes above.
+- `npm run lint`, `npm audit --omit=dev`, and `npm --prefix remote-pack audit --omit=dev` report no errors, warnings, or vulnerabilities.
+- Reload a signed-in Remote SSH window on the packaged build and round-trip a closed `.tex` and a PNG through Overleaf in both directions, including deletion, with no connection or provider failures.
 
 ## [0.15.34] - 2026-08-02
 ### Changed

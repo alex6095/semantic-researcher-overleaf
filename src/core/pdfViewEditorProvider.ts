@@ -2,9 +2,17 @@ import * as vscode from 'vscode';
 import { CONFIG_SECTION, PDF_VIEW_TYPE, ROOT_NAME } from '../consts';
 import { EventBus } from '../utils/eventBus';
 import { GlobalStateManager } from '../utils/globalStateManager';
+import { formatUnknownError } from '../utils/errorMessage';
+
+export type PdfRefreshResult = {ok: true} | {ok: false, message: string};
 
 export class PdfDocument implements vscode.CustomDocument {
     cache: Uint8Array = new Uint8Array(0);
+    // Message of the last failed refresh, `undefined` while `cache` holds the
+    // bytes of the current build. A failed download must never be indistinguishable
+    // from "nothing changed": the viewer would keep the previous build's page on
+    // screen and the user would read a stale PDF as if it were the new one.
+    private _lastError: string | undefined;
 
     private readonly _onDidChange = new vscode.EventEmitter<{}>();
     readonly onDidChange = this._onDidChange.event;
@@ -18,14 +26,25 @@ export class PdfDocument implements vscode.CustomDocument {
 
     dispose() { }
 
-    async refresh(): Promise<Uint8Array> {
+    get lastError(): string | undefined {
+        return this._lastError;
+    }
+
+    async refresh(): Promise<PdfRefreshResult> {
         try {
             this.cache = new Uint8Array(await vscode.workspace.fs.readFile(this.uri));
-        } catch {
-            this.cache = new Uint8Array();
+            this._lastError = this.cache.byteLength===0
+                // An empty output.pdf is not a document; treat it like a failed
+                // download so the viewer shows an error instead of nothing.
+                ? vscode.l10n.t('The compiled PDF is empty.')
+                : undefined;
+        } catch (error) {
+            this._lastError = formatUnknownError(error);
         }
-        this._onDidChange.fire({content:this.cache});
-        return this.cache;
+        this._onDidChange.fire({content:this.cache, error:this._lastError});
+        return this._lastError===undefined
+            ? {ok: true}
+            : {ok: false, message: this._lastError};
     }
 }
 
@@ -52,7 +71,16 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
 
     public async openCustomDocument(uri: vscode.Uri): Promise<PdfDocument> {
         const doc = new PdfDocument(uri);
-        await doc.refresh();
+        const result = await doc.refresh();
+        if (!result.ok) {
+            // The editor still opens (so the viewer can show the error and the
+            // next compile can retry), but the failure has to reach the user —
+            // it used to leave a permanently blank viewer with no explanation.
+            vscode.window.showErrorMessage(vscode.l10n.t(
+                'Could not load the compiled PDF: {message}',
+                {message: result.message},
+            ));
+        }
         return doc;
     }
 
@@ -60,9 +88,14 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
         EventBus.fire('pdfWillOpenEvent', {uri: doc.uri, doc, webviewPanel});
 
         const updateWebview = () => {
-            if (doc.cache.buffer.byteLength !== 0) {
-                webviewPanel.webview.postMessage({type:'update', content:doc.cache.buffer});
+            // A failed refresh must produce a visible error state instead of
+            // posting nothing: silence leaves the previous build's page on
+            // screen, and the user reads it as the current one.
+            if (doc.lastError!==undefined) {
+                webviewPanel.webview.postMessage({type:'error', content:doc.lastError});
+                return;
             }
+            webviewPanel.webview.postMessage({type:'update', content:doc.cache.buffer});
         };
 
         const docOnDidChangeListener = doc.onDidChange(() => {
@@ -89,6 +122,15 @@ export class PdfViewEditorProvider implements vscode.CustomEditorProvider<PdfDoc
                     break;
                 case 'saveState':
                     GlobalStateManager.updatePdfViewPersist(this.context, doc.uri.toString(), e.content);
+                    break;
+                case 'pdfLoadError':
+                    // pdf.js rejected the bytes we handed it (truncated/corrupt
+                    // build output). Only the webview can see that, so it reports
+                    // back rather than leaving the previous page up silently.
+                    vscode.window.showErrorMessage(vscode.l10n.t(
+                        'Could not render the compiled PDF: {message}',
+                        {message: String(e.content ?? '')},
+                    ));
                     break;
                 case 'ready':
                     const state = GlobalStateManager.getPdfViewPersist(this.context, doc.uri.toString());

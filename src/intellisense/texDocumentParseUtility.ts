@@ -308,7 +308,17 @@ function hierarchyStructFormat(parentStruct: TeXElement[]): TeXElement[] {
 // reference: https://github.com/James-Yu/LaTeX-Workshop/blob/master/src/outline/structurelib/latex.ts#L30
 export async function genTexElements(documentText: string): Promise<TeXElement[]> {
     const resElement = { children: [] as TeXElement[] };
-    let ast = unifiedParser.parse(documentText);
+    let ast: Ast.Root;
+    try {
+        ast = unifiedParser.parse(documentText);
+    }
+    catch (e) {
+        // A document the parser cannot handle must degrade to "no structure",
+        // not reject provideDocumentSymbols/provideFoldingRanges for the file —
+        // the outline, folding and the whole refreshRecord chain would break.
+        console.error(e);
+        return [];
+    }
     for (const node of ast.content) {
         if (['string', 'parbreak', 'whitespace'].includes(node.type)) {
             continue;

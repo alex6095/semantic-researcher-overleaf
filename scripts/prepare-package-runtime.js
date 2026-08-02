@@ -26,6 +26,53 @@ const nodeRuntimeRoots = [
     'socket.io-client',
 ];
 
+// Vendor trees are produced by `postinstall` (download-vendor.js) and are not
+// checked in. `vscode:prepublish` does not re-run them, so `npm ci
+// --ignore-scripts` or a restored node_modules cache would otherwise package a
+// vsix with a broken PDF preview and language configurations that point at
+// files which do not exist.
+const vendorAssetRoots = [
+    path.join(repositoryRoot, 'views', 'pdf-viewer', 'vendor'),
+    path.join(repositoryRoot, 'data', 'vendor'),
+];
+const vendorAssetFiles = [
+    // Read by pdfViewEditorProvider and rewritten into the webview html.
+    path.join(repositoryRoot, 'views', 'pdf-viewer', 'vendor', 'web', 'viewer.html'),
+    path.join(repositoryRoot, 'views', 'pdf-viewer', 'vendor', 'web', 'viewer.css'),
+    path.join(repositoryRoot, 'views', 'pdf-viewer', 'vendor', 'web', 'viewer.js'),
+    path.join(repositoryRoot, 'views', 'pdf-viewer', 'vendor', 'build', 'pdf.js'),
+    path.join(repositoryRoot, 'views', 'pdf-viewer', 'vendor', 'build', 'pdf.worker.js'),
+];
+
+// Every hunk of patches/socket.io-client+0.9.17-overleaf-5.patch that matters
+// for authentication. Without the xhr.js hunks a WebSocket-blocking proxy
+// silently falls back to xhr-polling with no Cookie header.
+const socketRuntimeMarkers = [
+    {
+        file: ['lib', 'socket.js'],
+        markers: [
+            'function applyExtraHeaders (xhr, headers)',
+            'applyExtraHeaders(xhr, this.options',
+            'function mergeSetCookieHeader (cookieHeader, setCookieHeader)',
+            "self.transport.open(self.options['extraHeaders'])",
+        ],
+    },
+    {
+        file: ['lib', 'transports', 'websocket.js'],
+        markers: [
+            'WS.prototype.open = function (extraHeaders)',
+            'headers: extraHeaders || {}',
+        ],
+    },
+    {
+        file: ['lib', 'transports', 'xhr.js'],
+        markers: [
+            'function applyExtraHeaders (req, headers)',
+            'applyExtraHeaders(req, this.socket.options.extraHeaders)',
+        ],
+    },
+];
+
 function isWithin(relativePath, excludedPath) {
     return relativePath===excludedPath
         || relativePath.startsWith(`${excludedPath}${path.sep}`);
@@ -117,6 +164,103 @@ function shouldCopyNodeRuntimePath(packageName, sourceRoot, sourcePath) {
     return true;
 }
 
+function contributedLanguageConfigurations() {
+    const packageJson = JSON.parse(
+        fs.readFileSync(path.join(repositoryRoot, 'package.json'), 'utf8'),
+    );
+    const languages = packageJson.contributes?.languages ?? [];
+    return [...new Set(
+        languages
+            .map(language => language.configuration)
+            .filter(Boolean),
+    )].map(relativePath => path.join(repositoryRoot, relativePath));
+}
+
+function verifyVendorAssets(options = {}) {
+    const roots = options.roots ?? vendorAssetRoots;
+    const files = options.files
+        ?? [...vendorAssetFiles, ...contributedLanguageConfigurations()];
+    const missing = [];
+
+    for (const root of roots) {
+        if (!fs.existsSync(root) || !fs.statSync(root).isDirectory()) {
+            missing.push(path.relative(repositoryRoot, root));
+            continue;
+        }
+        const stats = directoryStats(root);
+        if (stats.files===0 || stats.bytes===0) {
+            missing.push(`${path.relative(repositoryRoot, root)} (empty)`);
+        }
+    }
+
+    for (const filePath of files) {
+        if (!fs.existsSync(filePath) || fs.statSync(filePath).size===0) {
+            missing.push(path.relative(repositoryRoot, filePath));
+        }
+    }
+
+    if (missing.length>0) {
+        throw new Error(
+            'Missing vendor assets required by the packaged extension:\n' +
+            missing.map(entry => `  - ${entry}`).join('\n') +
+            '\nRun `npm run download-pdfjs` and `npm run download-latex-basics` ' +
+            '(or reinstall without --ignore-scripts) before packaging.',
+        );
+    }
+
+    return roots.reduce(
+        (totals, root) => {
+            const stats = directoryStats(root);
+            return {files: totals.files+stats.files, bytes: totals.bytes+stats.bytes};
+        },
+        {files: 0, bytes: 0},
+    );
+}
+
+// `createRequire` walks up to <repoRoot>/node_modules, so an assertion could
+// otherwise be satisfied by the UNSTAGED copy of a package that never made it
+// into dist/node_modules.
+function resolveStagedRuntime(runtimeRequire, request) {
+    const resolvedPath = runtimeRequire.resolve(request);
+    const relativePath = path.relative(nodeRuntimeTargetRoot, resolvedPath);
+    if (relativePath.startsWith('..') || path.isAbsolute(relativePath)) {
+        throw new Error(
+            `Runtime assertion for "${request}" resolved outside the staged runtime: ` +
+            `${resolvedPath}`,
+        );
+    }
+    return resolvedPath;
+}
+
+function requireStagedRuntime(runtimeRequire, request) {
+    resolveStagedRuntime(runtimeRequire, request);
+    return runtimeRequire(request);
+}
+
+function verifyStagedSocketRuntime(socketRuntimeRoot) {
+    const missing = [];
+    for (const {file, markers} of socketRuntimeMarkers) {
+        const filePath = path.join(socketRuntimeRoot, ...file);
+        if (!fs.existsSync(filePath)) {
+            missing.push(`${file.join('/')} (missing)`);
+            continue;
+        }
+        const source = fs.readFileSync(filePath, 'utf8');
+        for (const marker of markers) {
+            if (!source.includes(marker)) {
+                missing.push(`${file.join('/')}: ${marker}`);
+            }
+        }
+    }
+
+    if (missing.length>0) {
+        throw new Error(
+            'Staged socket.io-client runtime is missing authenticated handshake hunks:\n' +
+            missing.map(entry => `  - ${entry}`).join('\n'),
+        );
+    }
+}
+
 function stagePlaywrightRuntime() {
     if (!fs.existsSync(playwrightSourceRoot)) {
         throw new Error(
@@ -169,8 +313,9 @@ async function stageNodeRuntime() {
     }
 
     const runtimeRequire = createRequire(path.join(outputRoot, 'runtime-smoke.cjs'));
-    const prettier = runtimeRequire('prettier');
-    const { prettierPluginLatex } = runtimeRequire(
+    const prettier = requireStagedRuntime(runtimeRequire, 'prettier');
+    const { prettierPluginLatex } = requireStagedRuntime(
+        runtimeRequire,
         '@unified-latex/unified-latex-prettier',
     );
     const formatted = await prettier.format('\\section{Runtime}Text', {
@@ -181,29 +326,14 @@ async function stageNodeRuntime() {
     if (!formatted.includes('\\section{Runtime}')) {
         throw new Error('Staged formatter runtime produced unexpected LaTeX output.');
     }
-    const socketClient = runtimeRequire('socket.io-client');
+    const socketClient = requireStagedRuntime(runtimeRequire, 'socket.io-client');
     if (typeof socketClient.connect!=='function') {
         throw new Error('Staged socket.io-client runtime does not expose connect().');
     }
     const socketRuntimeRoot = path.dirname(
-        runtimeRequire.resolve('socket.io-client/package.json'),
+        resolveStagedRuntime(runtimeRequire, 'socket.io-client/package.json'),
     );
-    const socketHandshakeSource = fs.readFileSync(
-        path.join(socketRuntimeRoot, 'lib', 'socket.js'),
-        'utf8',
-    );
-    const socketWebSocketSource = fs.readFileSync(
-        path.join(socketRuntimeRoot, 'lib', 'transports', 'websocket.js'),
-        'utf8',
-    );
-    if (
-        !socketHandshakeSource.includes('applyExtraHeaders(xhr, this.options')
-        || !socketWebSocketSource.includes('headers: extraHeaders || {}')
-    ) {
-        throw new Error(
-            'Staged socket.io-client runtime is missing authenticated handshake headers.',
-        );
-    }
+    verifyStagedSocketRuntime(socketRuntimeRoot);
 
     return {
         packages: packages.length,
@@ -220,6 +350,12 @@ async function main() {
     );
 
     if (!isRemotePack) {
+        const vendorStats = verifyVendorAssets();
+        console.log(
+            `Verified vendor assets ` +
+            `(${vendorStats.files} files, ${vendorStats.bytes} bytes).`,
+        );
+
         const nodeRuntimeStats = await stageNodeRuntime();
         console.log(
             `Staged Node runtime in ` +
@@ -230,7 +366,17 @@ async function main() {
     }
 }
 
-main().catch(error => {
-    console.error(error);
-    process.exitCode = 1;
-});
+if (require.main===module) {
+    main().catch(error => {
+        console.error(error);
+        process.exitCode = 1;
+    });
+}
+
+// Exported so the packaging assertions themselves can be regression-tested.
+module.exports = {
+    contributedLanguageConfigurations,
+    resolveStagedRuntime,
+    verifyStagedSocketRuntime,
+    verifyVendorAssets,
+};

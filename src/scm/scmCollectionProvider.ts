@@ -12,7 +12,7 @@ import { LocalGitBridgeSCMProvider } from './localGitBridgeSCM';
 import { HistoryViewProvider } from './historyViewProvider';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { EventBus } from '../utils/eventBus';
-import { ROOT_NAME } from '../consts';
+import { REPLICA_SETTINGS_DIR, ROOT_NAME } from '../consts';
 import { formatUnknownError } from '../utils/errorMessage';
 import { stringifyOverleafUri } from '../utils/overleafUri';
 import {
@@ -89,9 +89,31 @@ interface SCMCollectionOptions {
     restorePersistedSCMs?: boolean;
 }
 
+interface ReplaceableLocalFiles {
+    /** Top-level entry names a remote-authoritative reset would delete. */
+    names: string[];
+    fileCount: number;
+    /** The walk stopped at the counting limit, so `fileCount` is a lower bound. */
+    truncated: boolean;
+}
+
+interface NewLocalReplicaPlan {
+    options: CreateSCMOptions;
+    /** Set when the user chose the destructive, remote-authoritative path. */
+    backupEntryNames?: string[];
+}
+
 function parsePersistedBaseUri(baseUri: string): vscode.Uri {
     const uri = vscode.Uri.parse(baseUri);
     return uri.scheme==='' ? vscode.Uri.file(baseUri) : uri;
+}
+
+// Mirrors `shouldPreserveLocalPathForRemoteReset` in localReplicaSCM: a
+// remote-authoritative reset keeps dot-prefixed entries (replica metadata,
+// agent instructions) plus AGENTS.md/CLAUDE.md, so those are neither counted
+// as "at risk" nor moved aside.
+function isReplaceableLocalEntry(name: string): boolean {
+    return !name.startsWith('.') && name!=='AGENTS.md' && name!=='CLAUDE.md';
 }
 
 export async function removeDetachedLocalReplicaSCM(
@@ -155,6 +177,13 @@ export class SCMCollectionProvider extends vscode.Disposable {
         LocalReplicaSCMProvider,
         ReturnType<typeof setTimeout>
     >();
+    private readonly ownershipRetryAttempts = new Map<LocalReplicaSCMProvider, number>();
+    private readonly ownershipTakeoverPrompts = new Set<LocalReplicaSCMProvider>();
+    // Silent retries only cover a hand-off race (window reload, the other
+    // window shutting down while this one starts). Taking sync over minutes
+    // later is a user decision: activation runs a startup reconcile that can
+    // push this window's disk state and delete remote files.
+    private static readonly unattendedOwnershipRetryLimit = 10;
     private readonly statusBarItem: vscode.StatusBarItem;
     private readonly statusListener: vscode.Disposable;
     private initSCMsPromise: Promise<void>;
@@ -186,6 +215,8 @@ export class SCMCollectionProvider extends vscode.Disposable {
                 clearTimeout(timer);
             }
             this.ownershipRetryTimers.clear();
+            this.ownershipRetryAttempts.clear();
+            this.ownershipTakeoverPrompts.clear();
             this.statusListener?.dispose();
             this.statusBarItem?.dispose();
             this.historyDataProvider?.dispose();
@@ -196,9 +227,21 @@ export class SCMCollectionProvider extends vscode.Disposable {
         this.statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left);
         this.statusBarItem.command = `${ROOT_NAME}.projectSCM.configSCM`;
         this.statusListener = EventBus.on('scmStatusChangeEvent', () => {this.updateStatus();});
+        // A rejected restore promise would make every later `await
+        // this.initSCMsPromise` reject forever, including the compile barrier,
+        // so the failure is reported once and the collection stays usable.
         this.initSCMsPromise = options.restorePersistedSCMs===false
             ? Promise.resolve()
-            : this.initSCMs();
+            : this.initSCMs().catch(error => {
+                console.error(
+                    `Local Replica mappings could not be restored for ${vfs.origin.toString()}:`,
+                    error,
+                );
+                vscode.window.showWarningMessage(vscode.l10n.t(
+                    'Local Replica mappings could not be fully restored: {message}',
+                    {message: formatUnknownError(error)},
+                ));
+            });
     }
 
     private updateStatus() {
@@ -257,9 +300,45 @@ export class SCMCollectionProvider extends vscode.Disposable {
             clearTimeout(timer);
             timers.delete(scm);
         }
+        this.ownershipRetryAttempts?.delete(scm);
+        this.ownershipTakeoverPrompts?.delete(scm);
     }
 
-    private scheduleOwnershipRetry(item: SCMRecord) {
+    // Taking ownership over from another window activates sync, and activation
+    // reconciles this window's disk state with Overleaf. That must not happen
+    // unattended, so ask once the hand-off grace period is over.
+    private promptOwnershipTakeover(item: SCMRecord) {
+        const scm = item.scm;
+        if (
+            !(scm instanceof LocalReplicaSCMProvider)
+            || this.disposed
+            || this.ownershipTakeoverPrompts.has(scm)
+        ) {
+            return;
+        }
+        this.ownershipTakeoverPrompts.add(scm);
+        const takeOver = vscode.l10n.t('Sync in This Window');
+        vscode.window.showWarningMessage(
+            vscode.l10n.t(
+                'Local Replica {path} is being synced by another window, so this window is not syncing it. Taking over reconciles this window\'s files with Overleaf, which can upload local changes and delete remote files.',
+                {path: scm.baseUri.fsPath || scm.baseUri.toString()},
+            ),
+            takeOver,
+        ).then(choice => {
+            this.ownershipTakeoverPrompts.delete(scm);
+            if (
+                choice!==takeOver
+                || this.disposed
+                || !item.enabled
+                || !this.scms.includes(item)
+            ) {
+                return;
+            }
+            this.scheduleOwnershipRetry(item, {attended: true});
+        });
+    }
+
+    private scheduleOwnershipRetry(item: SCMRecord, options?: {attended?: boolean}) {
         if (
             this.disposed
             || !item.enabled
@@ -270,6 +349,14 @@ export class SCMCollectionProvider extends vscode.Disposable {
             return;
         }
         const scm = item.scm;
+        const attempts = options?.attended
+            ? 0
+            : (this.ownershipRetryAttempts.get(scm) ?? 0);
+        if (attempts>=SCMCollectionProvider.unattendedOwnershipRetryLimit) {
+            this.promptOwnershipTakeover(item);
+            return;
+        }
+        this.ownershipRetryAttempts.set(scm, attempts+1);
         const timer = setTimeout(() => {
             if (this.ownershipRetryTimers.get(scm)!==timer) { return; }
             this.ownershipRetryTimers.delete(scm);
@@ -303,6 +390,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     || persist.baseUri!==scm.baseUri.toString()
                 ) {
                     await scm.deactivate();
+                    this.cancelOwnershipRetry(scm);
                     const index = this.scms.indexOf(item);
                     if (index!==-1) {
                         this.scms.splice(index, 1);
@@ -322,7 +410,15 @@ export class SCMCollectionProvider extends vscode.Disposable {
                         return;
                     }
                     item.triggers = triggers;
+                    this.ownershipRetryAttempts.delete(scm);
+                    this.ownershipTakeoverPrompts.delete(scm);
                     this.updateStatus();
+                    // Ownership moved between windows: say so, because this
+                    // window just reconciled the folder against Overleaf.
+                    vscode.window.showInformationMessage(vscode.l10n.t(
+                        'This window now syncs the Local Replica {path} with Overleaf.',
+                        {path: scm.baseUri.fsPath || scm.baseUri.toString()},
+                    ));
                 } catch (error) {
                     if (error instanceof LocalReplicaOwnershipUnavailableError) {
                         scm.markWaitingForOwnership(error.message);
@@ -494,19 +590,6 @@ export class SCMCollectionProvider extends vscode.Disposable {
         ) ?? localReplicaCandidates.find(candidate => candidate.enabled)
             ?? localReplicaCandidates[0];
 
-        for (const candidate of localReplicaCandidates) {
-            if (candidate===selectedLocalReplica) { continue; }
-            await this.removeDetachedPersistedSCM(
-                candidate.scmKey,
-                candidate.baseUri,
-                LocalReplicaSCMProvider.label,
-            );
-            console.warn(
-                `Removed duplicate Local Replica mapping ${candidate.baseUri.toString()} ` +
-                `for ${expectedProjectUri}.`,
-            );
-        }
-
         if (selectedLocalReplica && !this.disposed) {
             await this.createSCM(
                 LocalReplicaSCMProvider,
@@ -517,6 +600,37 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     preserveExistingLocalFiles: true,
                     resetLocalFilesToRemote: false,
                 },
+            );
+        }
+
+        // Duplicate-mapping cleanup runs last and never throws: SCM persists
+        // live in globalState shared by every window, so a folder that looks
+        // like a duplicate here may be the replica another window is using, and
+        // failing to clean it up must never stop this window's own replica from
+        // being created.
+        for (const candidate of localReplicaCandidates) {
+            if (candidate===selectedLocalReplica) { continue; }
+            if (this.disposed) { return; }
+            try {
+                await this.removeDetachedPersistedSCM(
+                    candidate.scmKey,
+                    candidate.baseUri,
+                    LocalReplicaSCMProvider.label,
+                );
+            } catch (error) {
+                // `removeDetachedPersistedSCM` acquires sync ownership before
+                // it writes the removal tombstone, so a folder a live window
+                // still owns fails here before anything is destroyed. That
+                // mapping is that window's replica, not a stale duplicate.
+                console.warn(
+                    `Retained Local Replica mapping ${candidate.baseUri.toString()} ` +
+                    `for ${expectedProjectUri}: ${formatUnknownError(error)}`,
+                );
+                continue;
+            }
+            console.warn(
+                `Removed duplicate Local Replica mapping ${candidate.baseUri.toString()} ` +
+                `for ${expectedProjectUri}.`,
             );
         }
     }
@@ -768,7 +882,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
             if (item.scm instanceof LocalReplicaSCMProvider) {
                 await this.restoreSCMAfterFailedStop(item);
                 if (item.enabled && item.triggers.length===0) {
-                    this.scheduleOwnershipRetry(item);
+                    // The user asked for this removal, so restoring the mapping
+                    // afterwards is an attended retry.
+                    this.scheduleOwnershipRetry(item, {attended: true});
                 }
             }
             throw error;
@@ -872,7 +988,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     && error instanceof LocalReplicaOwnershipUnavailableError
                 ) {
                     item.scm.markWaitingForOwnership(error.message);
-                    this.scheduleOwnershipRetry(item);
+                    // Restoring a replica the user just suspended as part of an
+                    // explicit selection flow is attended.
+                    this.scheduleOwnershipRetry(item, {attended: true});
                     continue;
                 }
                 console.error(`Could not restore "${(item.scm.constructor as any).label}" watcher for ${item.scm.baseUri.toString()}:`, error);
@@ -992,6 +1110,162 @@ export class SCMCollectionProvider extends vscode.Disposable {
         }
     }
 
+    private static readonly replaceableFileCountLimit = 1000;
+
+    /**
+     * Lists the top-level entries a remote-authoritative reset would delete and
+     * counts the files below them. The walk stops at
+     * `replaceableFileCountLimit` so selecting a folder can never block on a
+     * huge tree; the count is then reported as a lower bound.
+     */
+    private async inspectReplaceableLocalFiles(baseUri: vscode.Uri): Promise<ReplaceableLocalFiles> {
+        let entries: [string, vscode.FileType][];
+        try {
+            entries = await vscode.workspace.fs.readDirectory(baseUri);
+        } catch {
+            // An unreadable folder is not something we can back up; creation
+            // fails later with the real filesystem error.
+            return {names: [], fileCount: 0, truncated: false};
+        }
+
+        const replaceable = entries.filter(([name]) => isReplaceableLocalEntry(name));
+        const pending: Array<[vscode.Uri, vscode.FileType]> = replaceable.map(
+            ([name, type]): [vscode.Uri, vscode.FileType] => [vscode.Uri.joinPath(baseUri, name), type],
+        );
+        let fileCount = 0;
+        let truncated = false;
+        while (pending.length>0) {
+            if (fileCount>=SCMCollectionProvider.replaceableFileCountLimit) {
+                truncated = true;
+                break;
+            }
+            const [uri, type] = pending.pop()!;
+            if (type!==vscode.FileType.Directory) {
+                fileCount += 1;
+                continue;
+            }
+            let children: [string, vscode.FileType][];
+            try {
+                children = await vscode.workspace.fs.readDirectory(uri);
+            } catch {
+                // Still content the user has; count it rather than hide it.
+                fileCount += 1;
+                continue;
+            }
+            for (const [name, childType] of children) {
+                pending.push([vscode.Uri.joinPath(uri, name), childType]);
+            }
+        }
+
+        return {names: replaceable.map(([name]) => name), fileCount, truncated};
+    }
+
+    private replaceableLocalFilesBackupUri(baseUri: vscode.Uri): vscode.Uri {
+        const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+        // Inside the metadata folder: the remote-authoritative reset and the
+        // sync watchers both skip it, so the backup survives and never gets
+        // uploaded to Overleaf.
+        return vscode.Uri.joinPath(
+            baseUri,
+            REPLICA_SETTINGS_DIR,
+            `replaced-local-files-${timestamp}`,
+        );
+    }
+
+    private async backupReplaceableLocalFiles(
+        baseUri: vscode.Uri,
+        backupUri: vscode.Uri,
+        names: string[],
+    ): Promise<void> {
+        await vscode.workspace.fs.createDirectory(backupUri);
+        for (const name of names) {
+            await vscode.workspace.fs.rename(
+                vscode.Uri.joinPath(baseUri, name),
+                vscode.Uri.joinPath(backupUri, name),
+                {overwrite: false},
+            );
+        }
+    }
+
+    /**
+     * Overleaf is authoritative for a new Local Replica, but nothing on disk is
+     * destroyed without asking first. Returns `undefined` when the user
+     * cancels, in which case no replica is created.
+     */
+    private async resolveNewLocalReplicaPlan(
+        baseUri: vscode.Uri,
+        options?: CreateSCMOptions,
+    ): Promise<NewLocalReplicaPlan | undefined> {
+        // A caller that already decided (`newSCM`/`newSCMWithOptions` with
+        // explicit options) keeps its choice.
+        if (
+            options?.preserveExistingLocalFiles!==undefined
+            || options?.resetLocalFilesToRemote!==undefined
+        ) {
+            return {options: {...options}};
+        }
+
+        // Re-attaching this project's own replica destroys nothing: the normal
+        // three-way reconcile handles it.
+        if (await this.isSameProjectLocalReplica(baseUri)) {
+            return {options: {
+                ...options,
+                preserveExistingLocalFiles: true,
+                resetLocalFilesToRemote: false,
+            }};
+        }
+
+        const replaceable = await this.inspectReplaceableLocalFiles(baseUri);
+        // The good path stays promptless: an empty folder has nothing to lose.
+        if (replaceable.names.length===0) {
+            return {options: {
+                ...options,
+                preserveExistingLocalFiles: false,
+                resetLocalFilesToRemote: true,
+            }};
+        }
+
+        const path = baseUri.fsPath || baseUri.toString();
+        const count = replaceable.truncated
+            ? `${SCMCollectionProvider.replaceableFileCountLimit}+`
+            : `${replaceable.fileCount}`;
+        const replaceWithRemote = vscode.l10n.t('Replace with Overleaf copy');
+        const keepLocalFiles = vscode.l10n.t('Keep local files and merge');
+        const choice = await vscode.window.showWarningMessage(
+            vscode.l10n.t(
+                '"{path}" already contains {count} file(s) that are not part of this Overleaf project.',
+                {path, count},
+            ),
+            {
+                modal: true,
+                detail: vscode.l10n.t(
+                    'Replace with Overleaf copy: the {count} existing file(s) are moved into "{backup}" inside the replica, then the Overleaf copy is downloaded. Overleaf stays the source of truth and nothing is deleted outright.\n\nKeep local files and merge: the existing files stay where they are, and anything Overleaf does not have is uploaded to Overleaf.\n\nCancel: no Local Replica is created.',
+                    {count, backup: `${REPLICA_SETTINGS_DIR}/replaced-local-files-<timestamp>`},
+                ),
+            },
+            replaceWithRemote,
+            keepLocalFiles,
+        );
+        if (choice===keepLocalFiles) {
+            return {options: {
+                ...options,
+                preserveExistingLocalFiles: true,
+                resetLocalFilesToRemote: false,
+            }};
+        }
+        if (choice!==replaceWithRemote) {
+            return undefined;
+        }
+        return {
+            options: {
+                ...options,
+                preserveExistingLocalFiles: false,
+                resetLocalFilesToRemote: true,
+            },
+            backupEntryNames: replaceable.names,
+        };
+    }
+
     private createNewSCM(scmProto: SupportedSCM, options?: CreateSCMOptions) {
         if (options?.exactBaseUri && scmProto===LocalReplicaSCMProvider) {
             return this.createNewExactLocalReplicaSCM();
@@ -1003,10 +1277,42 @@ export class SCMCollectionProvider extends vscode.Disposable {
         })
         .then(async (baseUri) => {
             if (baseUri) {
-                if (options?.replaceExistingLabel) {
+                let createOptions = options;
+                if (scmProto===LocalReplicaSCMProvider) {
+                    const plan = await this.resolveNewLocalReplicaPlan(baseUri, options);
+                    if (plan===undefined) { return undefined; }
+                    createOptions = plan.options;
+                    if (options?.replaceExistingLabel) {
+                        await this.removeSCMsByLabel(options.replaceExistingLabel);
+                    }
+                    if (plan.backupEntryNames?.length) {
+                        const backupUri = this.replaceableLocalFilesBackupUri(baseUri);
+                        try {
+                            await this.backupReplaceableLocalFiles(
+                                baseUri,
+                                backupUri,
+                                plan.backupEntryNames,
+                            );
+                        } catch (error) {
+                            vscode.window.showErrorMessage(vscode.l10n.t(
+                                'Local Replica creation was stopped: existing files in {path} could not be moved to {backup}: {message}',
+                                {
+                                    path: baseUri.fsPath || baseUri.toString(),
+                                    backup: backupUri.fsPath || backupUri.toString(),
+                                    message: formatUnknownError(error),
+                                },
+                            ));
+                            return undefined;
+                        }
+                        vscode.window.showInformationMessage(vscode.l10n.t(
+                            'Existing files were moved to {backup} before the Overleaf copy was downloaded.',
+                            {backup: backupUri.fsPath || backupUri.toString()},
+                        ));
+                    }
+                } else if (options?.replaceExistingLabel) {
                     await this.removeSCMsByLabel(options.replaceExistingLabel);
                 }
-                const scm = await this.createSCM(scmProto, baseUri, true, true, options);
+                const scm = await this.createSCM(scmProto, baseUri, true, true, createOptions);
                 if (scm) {
                     vscode.window.showInformationMessage( vscode.l10n.t('"{scm}" created: {uri}.', {scm:scmProto.label, uri: decodeURI(scm.baseUri.toString()) }) );
                     return scm;
@@ -1172,7 +1478,8 @@ export class SCMCollectionProvider extends vscode.Disposable {
                                 && error instanceof LocalReplicaOwnershipUnavailableError
                             ) {
                                 scmItem.scm.markWaitingForOwnership(error.message);
-                                this.scheduleOwnershipRetry(scmItem);
+                                // The user just enabled this mapping by hand.
+                                this.scheduleOwnershipRetry(scmItem, {attended: true});
                             } else {
                                 throw error;
                             }
@@ -1291,9 +1598,10 @@ export class SCMCollectionProvider extends vscode.Disposable {
             vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.configSCM`, () => {
                 return this.showSCMConfiguration();
             }),
-            vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.newSCM`, (scmProto) => {
-                return this.createNewSCM(scmProto);
+            vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.newSCM`, (scmProto, options?: CreateSCMOptions) => {
+                return this.createNewSCM(scmProto, options);
             }),
+            // Retained as an alias of `newSCM`, which now carries options too.
             vscode.commands.registerCommand(`${ROOT_NAME}.projectSCM.newSCMWithOptions`, (scmProto, options?: CreateSCMOptions) => {
                 return this.createNewSCM(scmProto, options);
             }),

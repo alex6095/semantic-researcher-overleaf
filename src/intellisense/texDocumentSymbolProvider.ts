@@ -196,12 +196,18 @@ class ProjectStructRecord {
             return;
         }
         const fileQueue: TexFileStruct[] = [ rootFileStruct ];
+        // `\input` cycles are legal LaTeX (two files including each other, or a
+        // shared preamble pulled in twice). Without a visited set this walk
+        // re-downloads the same files forever and never returns.
+        const visitedPaths = new Set<string>([ this.rootPath ]);
 
         // iteratively traverse file node tree
         while (fileQueue.length > 0) {
             const fileNode = fileQueue.shift()!;
             const subFiles = fileNode.childrenPaths;
             for (const subFile of subFiles) {
+                if (visitedPaths.has(subFile)) { continue; }
+                visitedPaths.add(subFile);
                 // Get fileStruct can be failed due to file not exist
                 try {
                     const fileStruct = await this.refreshRecord(subFile);
@@ -258,6 +264,10 @@ class ProjectStructRecord {
 
         const queue = [rootStruct];
         const bibFilePaths = new Set<string>();
+        // This runs synchronously from `\cite{` completion: an `\input` cycle
+        // without a visited set is an infinite loop that freezes the extension
+        // host, not just a slow completion.
+        const visitedPaths = new Set<string>([ this.rootPath ]);
         // iteratively traverse file node tree
         while (queue.length > 0) {
             const item = queue.shift()!;
@@ -266,6 +276,8 @@ class ProjectStructRecord {
             });
             // append children to queue
             item.childrenPaths.forEach( child => {
+                if (visitedPaths.has(child)) { return; }
+                visitedPaths.add(child);
                 const childItem = this.fileRecordMap.get(child);
                 childItem && queue.push(childItem);
             });
@@ -352,7 +364,15 @@ export class TexDocumentSymbolProvider extends IntellisenseProvider implements v
                 if (!vfsUri) { return; }
                 const {projectName} = parseUri(vfsUri);
                 const projectRecord = this.projectRecordMap.get(projectName);
-                projectRecord?.refreshRecord(e.document);
+                // Fire-and-forget, but never unhandled: this runs on every
+                // keystroke, so a rejected refresh would raise one unhandled
+                // rejection per character typed.
+                void projectRecord?.refreshRecord(e.document).catch((error) => {
+                    const message = error instanceof Error ? error.message : String(error);
+                    console.warn(
+                        `TexDocumentSymbolProvider: could not refresh ${e.document.uri.toString()}: ${message}`,
+                    );
+                });
             }),
         ];
     }

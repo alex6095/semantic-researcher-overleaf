@@ -182,22 +182,40 @@
         }
         PDFViewerApplication.isViewerEmbedded = true;
         PDFViewerApplication.load(doc);
+        // Only once the new document is actually loaded is the previous error
+        // (if any) no longer describing what is on screen.
+        hideViewerError();
     }
 
     // Reference: https://github.com/James-Yu/LaTeX-Workshop/blob/master/viewer/latexworkshop.ts#L306
     function syncCode(pdf) {
+        // A line with no SyncTeX record (a comment, or anything in the preamble)
+        // comes back as an empty array; `Math.ceil(0/2)-1` is -1 and `pdf[-1]`
+        // would throw straight into window.onerror.
+        if (!Array.isArray(pdf) || pdf.length === 0) {
+            return;
+        }
         const _idx = Math.ceil(pdf.length / 2) - 1;
+        const record = pdf[_idx];
+        if (!record) {
+            return;
+        }
         const container = document.getElementById('viewerContainer');
         const maxScrollX = window.innerWidth * 0.9;
         const minScrollX = window.innerWidth * 0.1;
-        const pageNum = pdf[_idx].page;
-        const h = pdf[_idx].h;
-        const v = pdf[_idx].v;
+        const pageNum = record.page;
+        const h = record.h;
+        const v = record.v;
         const page = document.getElementsByClassName('page')[pageNum - 1];
         if (page === null || page === undefined) {
             return;
         }
-        const {viewport} = PDFViewerApplication.pdfViewer.getPageView(pageNum - 1);
+        // The page can exist in the DOM before pdf.js has built its view.
+        const pageView = PDFViewerApplication.pdfViewer.getPageView(pageNum - 1);
+        if (!pageView || !pageView.viewport) {
+            return;
+        }
+        const {viewport} = pageView;
         let [left, top] = viewport.convertToPdfPoint(h , v);
         let scrollX = page.offsetLeft + left;
         scrollX = Math.min(scrollX, maxScrollX);
@@ -1774,6 +1792,15 @@
                 label = 'Compile failed';
                 autoHideMs = 4000;
                 break;
+            case 'pdfError':
+                // Distinct from 'failed': the compile itself may well have
+                // succeeded, but what is on screen is not its output. Never
+                // auto-hidden — the page below it stays wrong until the next
+                // successful load.
+                el.classList.add('compileBadge--failed');
+                iconChar = '✕';
+                label = 'PDF unavailable';
+                break;
             case 'alert':
                 el.classList.add('compileBadge--alert');
                 iconChar = '⚠';
@@ -1795,11 +1822,50 @@
         }
     }
 
+    // Persistent, non-destructive error banner. The viewer must survive every
+    // failure: a stale page silently left on screen reads as the current build,
+    // and tearing the DOM down leaves a dead tab that only a reopen can fix.
+    const viewerErrorState = { element: null };
+    function ensureViewerErrorBanner() {
+        if (viewerErrorState.element) { return viewerErrorState.element; }
+        const el = document.createElement('div');
+        el.className = 'viewerError';
+        el.setAttribute('role', 'alert');
+        // Styled inline so the banner never depends on a stylesheet that may
+        // itself have failed to load.
+        el.style.cssText = [
+            'position:fixed', 'left:0', 'right:0', 'bottom:0', 'z-index:1000',
+            'padding:8px 12px', 'font-size:12px', 'line-height:1.4',
+            'background:#8b0000', 'color:#fff', 'display:none',
+            'white-space:pre-wrap', 'word-break:break-word',
+        ].join(';');
+        document.body.appendChild(el);
+        viewerErrorState.element = el;
+        return el;
+    }
+    function showViewerError(message) {
+        const el = ensureViewerErrorBanner();
+        el.textContent = message;
+        el.style.display = 'block';
+    }
+    function hideViewerError() {
+        if (viewerErrorState.element) {
+            viewerErrorState.element.style.display = 'none';
+        }
+    }
+
     //Reference: https://github.com/overleaf/overleaf/blob/main/services/web/frontend/js/features/pdf-preview/util/pdf-js-wrapper.js#L163
     function syncPdf(pageElem, pageNum, clientX, clientY, innerText) {
         const pageCanvas = pageElem.querySelector('canvas');
+        if (!pageCanvas) {
+            return;
+        }
         const pageRect = pageCanvas.getBoundingClientRect();
-        const {viewport} = PDFViewerApplication.pdfViewer.getPageView(pageNum - 1);
+        const pageView = PDFViewerApplication.pdfViewer.getPageView(pageNum - 1);
+        if (!pageView || !pageView.viewport) {
+            return;
+        }
+        const {viewport} = pageView;
         const dx = clientX - pageRect.left;
         const dy = clientY - pageRect.top;
         let [left, top] = viewport.convertToPdfPoint(dx, dy);
@@ -1842,7 +1908,21 @@
             const message = e.data;
             switch (message.type) {
                 case 'update':
-                    updatePdf(message.content);
+                    // Awaited and caught: a rejected getDocument (truncated or
+                    // corrupt build output) used to leave the previous page on
+                    // screen with no signal at all that it is out of date.
+                    try {
+                        await updatePdf(message.content);
+                    } catch (error) {
+                        const detail = (error && error.message) || String(error);
+                        showViewerError(`Could not render the compiled PDF: ${detail}`);
+                        updateCompileBadge('pdfError');
+                        vscode.postMessage({type: 'pdfLoadError', content: detail});
+                    }
+                    break;
+                case 'error':
+                    showViewerError(message.content);
+                    updateCompileBadge('pdfError');
                     break;
                 case 'syncCode':
                     syncCode(message.content);
@@ -1869,7 +1949,14 @@
 
         // add mouse double click listener
         window.addEventListener('dblclick', (e) => {
-            const pageElem = e.target.parentElement.parentElement;
+            // A double click anywhere outside a text layer span (the toolbar,
+            // the empty area around a page, the document itself) has fewer than
+            // two ancestors; dereferencing them unguarded threw straight into
+            // window.onerror.
+            const pageElem = e.target?.parentElement?.parentElement;
+            if (!pageElem || typeof pageElem.getAttribute !== 'function') {
+                return;
+            }
             const pageNum = pageElem.getAttribute('data-page-number');
             if (pageNum === null || pageNum === undefined) {
                 return;
@@ -1878,10 +1965,12 @@
         });
 
         // Display Error Message
-        window.onerror = () => {
-            const msg = document.createElement('body');
-            msg.innerText = 'An error occurred while loading the file. Please open it again.';
-            document.body = msg;
+        window.onerror = (message) => {
+            // Non-destructive on purpose: replacing document.body tore the whole
+            // pdf.js viewer out of the DOM, so a single stray handler exception
+            // left a permanently dead tab that only a reopen could fix.
+            showViewerError(`An error occurred while loading the file: ${message}`);
+            return false;
         };
     }, { once : true });
 

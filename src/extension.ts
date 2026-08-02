@@ -27,7 +27,9 @@ export async function activate(context: vscode.ExtensionContext) {
     // Register: [core] RemoteFileSystemProvider
     const remoteFileSystemProvider = new RemoteFileSystemProvider(context);
     context.subscriptions.push(remoteFileSystemProvider, ...remoteFileSystemProvider.triggers);
-    configureLocalReplicaWorkspace(context);
+    // Keep the returned disposable: it restores the previously configured
+    // extension context, which the extension-host tests rely on.
+    context.subscriptions.push(configureLocalReplicaWorkspace(context));
 
     // Register: [core] ProjectManagerProvider on Activitybar
     const projectManagerProvider = new ProjectManagerProvider(context, remoteFileSystemProvider);

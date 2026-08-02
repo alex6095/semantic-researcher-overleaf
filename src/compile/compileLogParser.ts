@@ -236,8 +236,16 @@ export class LatexParser {
     // Check if we're entering or leaving a new file in this line
 
     parseParensForFilenames() {
-        const pos = this.currentLine.search(/\(|\)/);
-        if (pos !== -1) {
+        // Iterative on purpose: `LogText` joins every run of exactly-79-char
+        // lines into a single line, so one line of a real manuscript log can
+        // carry thousands of parentheses. Recursing once per parenthesis blew
+        // the stack (`RangeError`), which aborted updateDiagnostics and made a
+        // successful compile report as failed with no PDF refresh.
+        while (true) {
+            const pos = this.currentLine.search(/\(|\)/);
+            if (pos === -1) {
+                return;
+            }
             const token = this.currentLine[pos];
             this.currentLine = this.currentLine.slice(pos + 1);
             if (token === '(') {
@@ -270,7 +278,6 @@ export class LatexParser {
             //		 Something has gone wrong but all we can do now is ignore it :(
             // }
             // Process the rest of the line
-            this.parseParensForFilenames();
         }
     }
 
@@ -348,7 +355,10 @@ export class LatexParser {
 class LogText {
     private text = '';
     private lines: string[] = [];
-    private row = 0;
+    // `nextLine()` pre-increments, so the cursor has to start *before* the
+    // first line. Starting at 0 skipped `lines[0]` — the very first line of
+    // output.log — and with it any error reported on it.
+    private row = -1;
     public fileEnd = false;
     constructor(text: string) {
         this.text = text.replace(/(\r\n)|\r/g, '\n');
@@ -370,7 +380,7 @@ class LogText {
                 this.lines.push(currentLine);
             }
         }
-        this.row = 0;
+        this.row = -1;
     }
     nextLine() {
         this.row++;

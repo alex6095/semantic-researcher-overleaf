@@ -4,8 +4,24 @@ import * as https from 'https';
 import * as stream from 'stream';
 import FormData = require('form-data');
 import { v4 as uuidv4 } from 'uuid';
-import fetch from 'node-fetch';
+import fetch, { RequestInit } from 'node-fetch';
 import { FileEntity, FileType, FolderEntity, OutputFileEntity } from '../core/remoteFileSystemProvider';
+
+// On Remote SSH a network blip leaves half-open sockets in the keep-alive pool.
+// Without these, the next request inherits one and hangs until the OS TCP
+// timeout (minutes), stalling reconnects and locking the compile guard.
+const AGENT_SOCKET_TIMEOUT_MS = 60_000;
+const REQUEST_TIMEOUT_MS = 30_000;
+// Compiles and file downloads are legitimately slow, but must still be capped.
+const COMPILE_TIMEOUT_MS = 180_000;
+const DOWNLOAD_TIMEOUT_MS = 180_000;
+
+export class SessionExpiredError extends Error {
+    constructor(readonly serverUrl: string, readonly status: number) {
+        super(`${status}: The Overleaf session for ${serverUrl} is no longer valid.`);
+        this.name = 'SessionExpiredError';
+    }
+}
 
 function getSetCookie(response: any): string[] {
     const nodeHeaders = response.headers?.['set-cookie'];
@@ -226,6 +242,7 @@ export interface ResponseSchema {
     message?: string;
     userInfo?: {userId:string, userEmail:string};
     identity?: Identity;
+    sessionExpired?: boolean;
     projects?: ProjectPersist[];
     entity?: FileEntity;
     entities?: {path:string, type:string}[];
@@ -255,10 +272,61 @@ export class BaseAPI {
     private url: string;
     private agent: http.Agent | https.Agent;
     private identity?: Identity;
+    private sessionExpiryHandler?: (error: SessionExpiredError) => void;
+    // A server that answers 206 deterministically would otherwise loop forever,
+    // appending the same body until the extension host runs out of memory.
+    private static readonly maxDownloadRequests = 64;
 
     constructor(url:string) {
         this.url = url;
-        this.agent = new URL(url).protocol==='http:' ? new http.Agent({keepAlive: true}) : new https.Agent({keepAlive: true});
+        const agentOptions = {keepAlive: true, timeout: AGENT_SOCKET_TIMEOUT_MS};
+        this.agent = new URL(url).protocol==='http:' ? new http.Agent(agentOptions) : new https.Agent(agentOptions);
+    }
+
+    /**
+     * Called whenever the server answers an authenticated request by rejecting
+     * the session (login redirect, 401, rotated CSRF token). Reads keep working
+     * on an already-upgraded websocket while every mutation fails, so the owner
+     * has to be able to surface this instead of letting the project silently
+     * degrade into a one-way sync.
+     */
+    setSessionExpiryHandler(handler?: (error: SessionExpiredError) => void) {
+        this.sessionExpiryHandler = handler;
+        return this;
+    }
+
+    private detectSessionExpiry(status: number, location: string|null|undefined, body: string): SessionExpiredError|undefined {
+        if (status===302 || status===303 || status===307) {
+            // Overleaf answers an expired session by redirecting the API call
+            // to the login page instead of failing it.
+            const target = location ?? '';
+            if (target==='' || /\/login(\?|$|#)/.test(target)) {
+                return new SessionExpiredError(this.url, status);
+            }
+            return undefined;
+        }
+        if (status===401) {
+            return new SessionExpiredError(this.url, status);
+        }
+        if (status===403 && /EBADCSRFTOKEN|invalid csrf token/i.test(body)) {
+            // The CSRF token is captured once at login; a rotated session
+            // invalidates it for every mutation until the user logs in again.
+            return new SessionExpiredError(this.url, status);
+        }
+        return undefined;
+    }
+
+    private reportSessionExpiry(error: SessionExpiredError) {
+        this.sessionExpiryHandler?.(error);
+    }
+
+    private async fetchWithTimeout(url: string, init: RequestInit, timeoutMs: number) {
+        try {
+            return await fetch(url, {...init, timeout: timeoutMs});
+        } catch (error) {
+            const reason = error instanceof Error ? error.message : String(error);
+            throw new Error(`Overleaf request failed (${reason}): ${url.split('?')[0]}`);
+        }
     }
 
     private authRequest(
@@ -274,6 +342,7 @@ export class BaseAPI {
             method: options.method,
             headers: options.headers,
             agent: this.agent,
+            timeout: REQUEST_TIMEOUT_MS,
         };
         return new Promise((resolve, reject) => {
             const request = (
@@ -295,6 +364,13 @@ export class BaseAPI {
                 });
             });
             request.once('error', reject);
+            request.once('timeout', () => {
+                // Surfacing a timeout beats an inherited half-open socket that
+                // never answers: the login flow would just spin forever.
+                request.destroy(new Error(
+                    `Overleaf request timed out after ${REQUEST_TIMEOUT_MS}ms: ${route}`,
+                ));
+            });
             if (options.body!==undefined) {
                 request.write(options.body);
             }
@@ -461,20 +537,20 @@ export class BaseAPI {
         return this;
     }
 
-    protected async request(type:'GET'|'POST'|'PUT'|'DELETE', route:string, body?:FormData|object, callback?: (res?:string)=>object|undefined, extraHeaders?:object ): Promise<ResponseSchema> {
+    protected async request(type:'GET'|'POST'|'PUT'|'DELETE', route:string, body?:FormData|object, callback?: (res?:string)=>object|undefined, extraHeaders?:object, timeoutMs:number=REQUEST_TIMEOUT_MS ): Promise<ResponseSchema> {
         if (this.identity===undefined) { return Promise.reject(); }
 
         let res = undefined;
         switch(type) {
             case 'GET':
-                res = await fetch(this.url+route, {
+                res = await this.fetchWithTimeout(this.url+route, {
                     method: 'GET', redirect: 'manual', agent: this.agent,
                     headers: {
                         'Connection': 'keep-alive',
                         'Cookie': this.identity.cookies,
                         ...extraHeaders
                     }
-                });
+                }, timeoutMs);
                 break;
             case 'POST':
                 // if body is FormData, then it is a raw body
@@ -483,7 +559,7 @@ export class BaseAPI {
                     _csrf: this.identity.csrfToken,
                     ...body
                 });
-                res = await fetch(this.url+route, {
+                res = await this.fetchWithTimeout(this.url+route, {
                     method: 'POST', redirect: 'manual', agent: this.agent,
                     headers: {
                         'Connection': 'keep-alive',
@@ -492,12 +568,12 @@ export class BaseAPI {
                         ...extraHeaders
                     },
                     body: raw_body
-                });
+                }, timeoutMs);
                 break;
             case 'PUT':
                 break;
             case 'DELETE':
-                res = await fetch(this.url+route, {
+                res = await this.fetchWithTimeout(this.url+route, {
                     method: 'DELETE', redirect: 'manual', agent: this.agent,
                     headers: {
                         'Connection': 'keep-alive',
@@ -505,7 +581,7 @@ export class BaseAPI {
                         'X-Csrf-Token': this.identity.csrfToken,
                         ...extraHeaders
                     }
-                });
+                }, timeoutMs);
                 break;
         };
 
@@ -516,43 +592,107 @@ export class BaseAPI {
                 type: 'success',
                 ...response
             } as ResponseSchema;
+        } else if (!res) {
+            // 'PUT' is not implemented, so no request was ever sent.
+            return {
+                type: 'error',
+                message: `${type} ${route} is not supported.`,
+            };
         } else {
-            res = res || { status:'undefined', text:()=>'' };
+            const detail = await res.text();
+            // `redirect: 'manual'` turns an expired session into a bare 302 and
+            // a rotated CSRF token into a bare 403. Detecting them here is the
+            // only place that sees every mutation, so it is the only place that
+            // can stop the project from degrading into a silent one-way sync.
+            const expired = this.detectSessionExpiry(
+                Number(res.status),
+                res.headers.get('location'),
+                detail,
+            );
+            if (expired) {
+                this.reportSessionExpiry(expired);
+                return {
+                    type: 'error',
+                    status: Number(res.status),
+                    sessionExpired: true,
+                    message: expired.message,
+                };
+            }
             return {
                 type: 'error',
                 status: Number(res.status),
-                message: `${res.status}: `+await res.text()
+                message: `${res.status}: `+detail
             };
         }
+    }
+
+    private static parseContentRangeTotal(contentRange: string|null): number|undefined {
+        const match = contentRange?.match(/bytes\s+\d+-\d+\/(\d+)/i);
+        return match ? Number(match[1]) : undefined;
+    }
+
+    private async downloadRanged(
+        url: string,
+        headers: {[key:string]: string},
+        options: {detectExpiry: boolean, timeoutMs?: number},
+    ): Promise<Buffer> {
+        const timeoutMs = options.timeoutMs ?? DOWNLOAD_TIMEOUT_MS;
+        const content: Buffer[] = [];
+        let received = 0;
+        for (let attempt = 0; attempt<BaseAPI.maxDownloadRequests; attempt++) {
+            const res = await this.fetchWithTimeout(url, {
+                method: 'GET', redirect: 'manual', agent: this.agent,
+                // Continue where the previous partial answer stopped. Re-issuing
+                // the identical request appended the same bytes forever.
+                headers: received>0 ? {...headers, 'Range': `bytes=${received}-`} : headers,
+            }, timeoutMs);
+            if (res.status===200) {
+                // A 200 ignores the Range header and restarts the payload.
+                return await res.buffer();
+            }
+            if (res.status===206) {
+                const chunk = await res.buffer();
+                if (chunk.length===0) {
+                    throw new Error(`Overleaf download made no progress: ${url.split('?')[0]}`);
+                }
+                content.push(chunk);
+                received += chunk.length;
+                const total = BaseAPI.parseContentRangeTotal(res.headers.get('content-range'));
+                if (total!==undefined && received>=total) {
+                    return Buffer.concat(content);
+                }
+                continue;
+            }
+            if (res.status===416 && received>0) {
+                // The requested range starts past EOF: everything already arrived.
+                return Buffer.concat(content);
+            }
+            const detail = await res.text();
+            if (options.detectExpiry) {
+                const expired = this.detectSessionExpiry(res.status, res.headers.get('location'), detail);
+                if (expired) {
+                    this.reportSessionExpiry(expired);
+                    throw expired;
+                }
+            }
+            // Returning the partial content collected so far would hand back a
+            // truncated PDF or log that reads as a real (but wrong) file.
+            throw new Error(
+                `Overleaf download failed (${res.status})${detail ? `: ${detail}` : ''}`,
+            );
+        }
+        throw new Error(
+            `Overleaf download did not complete within ${BaseAPI.maxDownloadRequests} range requests: ${url.split('?')[0]}`,
+        );
     }
 
     protected async download(route:string) {
         if (this.identity===undefined) { return Promise.reject(); }
 
-        let content: Buffer[] = [];
-        while(true) {
-            const res = await fetch(this.url+route, {
-                method: 'GET', redirect: 'manual', agent: this.agent,
-                headers: {
-                    'Connection': 'keep-alive',
-                    'Cookie': this.identity.cookies,
-                }
-            });
-            if (res.status===200) {
-                content.push(await res.buffer());
-                break;
-            }
-            else if (res.status===206) {
-                content.push(await res.buffer());
-            } else {
-                const detail = await res.text();
-                throw new Error(
-                    `Overleaf download failed (${res.status})${detail ? `: ${detail}` : ''}`,
-                );
-            }
-        };
-
-        return Buffer.concat(content);
+        return this.downloadRanged(this.url+route, {
+            'Connection': 'keep-alive',
+            'Cookie': this.identity.cookies,
+        }, {detectExpiry: true});
     }
 
     async logout(identity:Identity): Promise<ResponseSchema> {
@@ -728,10 +868,12 @@ export class BaseAPI {
         };
 
         this.setIdentity(identity);
+        // A compile is legitimately slow, but a hung POST leaves the compile
+        // manager's `inCompiling` guard stuck and Ctrl+S dead for the session.
         return this.request('POST', `project/${projectId}/compile?auto_compile=true`, body, (res) => {
             const compile = JSON.parse(res!) as CompileResponseSchema;
             return {compile};
-        }, {'X-Csrf-Token': identity.csrfToken});
+        }, {'X-Csrf-Token': identity.csrfToken}, COMPILE_TIMEOUT_MS);
     }
 
     async stopCompile(identity:Identity, projectId:string) {
@@ -841,27 +983,9 @@ export class BaseAPI {
         if (includeCookies && this.identity) {
             headers['Cookie'] = this.identity.cookies;
         }
-        let content: Buffer[] = [];
-        while (true) {
-            const res = await fetch(absoluteUrl, {
-                method: 'GET', redirect: 'manual', agent: this.agent,
-                headers
-            });
-            if (res.status === 200) {
-                content.push(await res.buffer());
-                break;
-            } else if (res.status === 206) {
-                content.push(await res.buffer());
-            } else if (content.length === 0) {
-                // Surfacing the failure beats silently returning an empty
-                // buffer, which downstream code would mistake for real content
-                // (e.g. an empty output.log reads as a failed compile).
-                throw new Error(`Download failed with HTTP ${res.status} for ${absoluteUrl.split('?')[0]}`);
-            } else {
-                break;
-            }
-        }
-        return Buffer.concat(content);
+        // The CDN is cross-origin and unauthenticated, so a redirect there is
+        // not a login redirect and must not be reported as a session expiry.
+        return this.downloadRanged(absoluteUrl, headers, {detectExpiry: includeCookies});
     }
 
     async proxySyncPdf(identity:Identity, projectId:string, page:number, h:number, v:number, buildId:string) {

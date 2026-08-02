@@ -9,7 +9,12 @@ import { PdfDocument } from '../core/pdfViewEditorProvider';
 import { LatexParser, ErrorSchema } from './compileLogParser';
 import { EventBus } from '../utils/eventBus';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
-import { getActiveReplicaOriginUri, isWithinActiveReplica } from '../utils/localReplicaWorkspace';
+import {
+    getActiveReplicaOriginUri,
+    isWithinActiveReplica,
+    localUriToPath,
+    pathToLocalUri,
+} from '../utils/localReplicaWorkspace';
 import { formatUnknownError } from '../utils/errorMessage';
 import { getOutputChannel } from '../utils/outputChannel';
 
@@ -29,6 +34,37 @@ const pdfViewRecord: {
         [key: string]: { doc: PdfDocument, webviewPanel: vscode.WebviewPanel }
     }
 } = {};
+
+// The pdfWillOpenEvent handler touches only the module-level pdfViewRecord, so
+// it is registered once per process. A per-instance subscription in the
+// CompileManager constructor leaked one listener on the shared EventBus for
+// every manager constructed (test hosts construct many) with no disposal path.
+let pdfViewRecordTrackingRegistered = false;
+function registerPdfViewRecordTracking() {
+    if (pdfViewRecordTrackingRegistered) { return; }
+    pdfViewRecordTrackingRegistered = true;
+    EventBus.on('pdfWillOpenEvent', ({uri, doc, webviewPanel}) => {
+        const {identifier,pathParts} = parseUri(uri);
+        const filePath = pathParts.join('/');
+        if (pdfViewRecord[identifier]) {
+            pdfViewRecord[identifier][filePath] = {doc, webviewPanel};
+        } else {
+            pdfViewRecord[identifier] = {[filePath]:{doc, webviewPanel}};
+        }
+        // A record must not outlive its panel: `webviewPanel.webview` throws
+        // once the panel is disposed, so a closed PDF tab would otherwise
+        // break every later status broadcast and every Ctrl+Alt+J.
+        webviewPanel.onDidDispose(() => {
+            const records = pdfViewRecord[identifier];
+            if (records?.[filePath]?.webviewPanel===webviewPanel) {
+                delete records[filePath];
+                if (Object.keys(records).length===0) {
+                    delete pdfViewRecord[identifier];
+                }
+            }
+        });
+    });
+}
 
 class CompileDiagnosticProvider {
     private diagnosticCollection = vscode.languages.createDiagnosticCollection(`${ROOT_NAME}.compile`);
@@ -103,13 +139,15 @@ class CompileDiagnosticProvider {
         let hasError = false;
         const diagnosticsRecorder: { [key: string]: vscode.Diagnostic[] } = {};
         for (const log of logs.all) {
-            if (!log.file.startsWith('./')) { continue; }
-            // Count the error even when the source file cannot be opened for a
-            // diagnostic range below — a LaTeX error must fail the compile
-            // regardless of whether we can attach an editor squiggle to it.
+            // Count the error before any filtering below — a LaTeX error must
+            // fail the compile whether or not we can attach an editor squiggle
+            // to it. Errors raised inside a package (an absolute TeX Live path)
+            // or with no file attribution are still errors, and LaTeX can emit
+            // a PDF anyway, so dropping them reports a broken build as success.
             if (log.level === 'error') {
                 hasError = true;
             }
+            if (!log.file.startsWith('./')) { continue; }
             const path = this.validatePath(log.file);
             const range = await this.getRange(log, path, vfs);
             if (range === null) {
@@ -151,6 +189,10 @@ export class CompileManager {
         localUris: Map<string, vscode.Uri>;
     }>();
     private drainingPendingSavedCompiles = false;
+    // Ticket dispenser for compile ownership: status, diagnostics and the PDF
+    // are shared state, so only the newest compile may publish an outcome.
+    private compileSequence = 0;
+    private activeCompileId = 0;
 
     constructor(
         private vfsm: RemoteFileSystemProvider,
@@ -159,21 +201,14 @@ export class CompileManager {
         this.status = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Left, -1);
         this.status.command = `${ROOT_NAME}.compilerManager.settings`;
         this.diagnosticProvider = new CompileDiagnosticProvider(vfsm);
-        // listen pdf open event
-        EventBus.on('pdfWillOpenEvent', ({uri, doc, webviewPanel}) => {
-            const {identifier,pathParts} = parseUri(uri);
-            const filePath = pathParts.join('/');
-            if (pdfViewRecord[identifier]) {
-                pdfViewRecord[identifier][filePath] = {doc, webviewPanel};
-            } else {
-                pdfViewRecord[identifier] = {[filePath]:{doc, webviewPanel}};
-            }
-        });
+        registerPdfViewRecordTracking();
     }
 
     static async check(uri?: vscode.Uri) {
         const hasExplicitUri = uri!==undefined;
-        const candidate = uri ?? vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0].uri;
+        // `?.` only short-circuits on undefined: an empty workspaceFolders array
+        // still indexes [0] and dereferences `.uri` of undefined.
+        const candidate = uri ?? vscode.window.activeTextEditor?.document.uri ?? vscode.workspace.workspaceFolders?.[0]?.uri;
         if (candidate?.scheme === ROOT_NAME) {
             return candidate;
         }
@@ -206,7 +241,11 @@ export class CompileManager {
                 const records = pdfViewRecord[identifier];
                 if (records) {
                     Object.values(records).forEach((record) => {
-                        record.webviewPanel.webview.postMessage({type: 'compileStatus', status});
+                        // One dead panel must not swallow the broadcast for the
+                        // panels that are still alive.
+                        try {
+                            record.webviewPanel.webview.postMessage({type: 'compileStatus', status});
+                        } catch { /* panel already disposed; the record is dropped on dispose */ }
                     });
                 }
             } catch { /* parseUri may throw for non-overleaf URIs; ignore */ }
@@ -238,6 +277,12 @@ export class CompileManager {
                 }
                 this.status.tooltip.appendMarkdown(`\n\n*${vscode.l10n.t('Click to manage compile settings.')}*`);
                 this.status.show();
+            }, (error) => {
+                // The status bar is cosmetic; an unreachable project must not
+                // produce a detached unhandled rejection.
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [compile status] could not render status bar: ${formatUnknownError(error)}`,
+                );
             });
         } else {
             this.status.hide();
@@ -291,6 +336,10 @@ export class CompileManager {
         this.drainingPendingSavedCompiles = true;
         try {
             while (this.pendingSavedCompiles.size>0) {
+                // Another compile owns the pipeline (this one was stopped and
+                // the user started a new one). It drains the queue when it ends;
+                // draining here would only re-queue the same entry forever.
+                if (this.inCompiling) { break; }
                 const next = this.pendingSavedCompiles.entries().next().value as
                     | [string, {
                         projectUri: vscode.Uri;
@@ -330,6 +379,11 @@ export class CompileManager {
             }
             return;
         }
+        // Take ownership of the shared compile state for this run. A compile
+        // that gets stopped or superseded must never publish its status, its
+        // diagnostics or its PDF over the compile the user is now waiting for.
+        const compileId = ++this.compileSequence;
+        this.activeCompileId = compileId;
         await this.update('compiling', uri);
         getOutputChannel().appendLine(
             `${new Date().toISOString()} [compile start] force=${force} ` +
@@ -368,79 +422,175 @@ export class CompileManager {
                 return await vfs.compile(force, this.compileAsDraft, this.compileStopOnFirstError, rootDocId);
             })
             .then(async (res) => {
-                switch (res) {
-                    case undefined:
-                        getOutputChannel().appendLine(
-                            `${new Date().toISOString()} [compile skipped] no pending changes; keeping last status`,
-                        );
-                        await this.update('success', uri);
-                        break;
-                    case false:
-                        // vfs.compile already logged the rejected response details.
-                        getOutputChannel().appendLine(
-                            `${new Date().toISOString()} [compile result] failed: server rejected the compile request`,
-                        );
-                        await this.update('failed', uri);
-                        break;
-                    case true:
-                        return true;
-                    default:
-                        getOutputChannel().appendLine(
-                            `${new Date().toISOString()} [compile result] alert: not connected`,
-                        );
-                        await this.update('alert', uri);
-                        break;
-                }
-            })
-            .then(status =>
-                status ?
-                    vscode.commands.executeCommand(`${ROOT_NAME}.compileManager.compileErrorCheck`, uri)
-                    : Promise.reject()
-            )
-            .then(async (hasError) => {
-                getOutputChannel().appendLine(
-                    `${new Date().toISOString()} [compile result] ${hasError ? 'failed: LaTeX errors in output.log' : 'success'}`,
-                );
-                if (hasError) {
-                    await this.update('failed', uri);
-                } else {
-                    await this.update('success', uri);
-                }
-                // refresh pdf
-                const { identifier } = parseUri(uri);
-                pdfViewRecord[identifier] && Object.values(pdfViewRecord[identifier]).forEach(
-                    (record) => record.doc.refresh()
-                );
-            })
-            .catch(async (error) => {
-                // Either the intentional Promise.reject() flow-break (terminal
-                // update() already fired) or an actual exception mid-chain.
-                // If inCompiling is still set the chain failed before any
-                // terminal update(); surface as failed so the next compile()
-                // isn't permanently locked out by the inCompiling guard.
-                if (error!==undefined) {
-                    console.error('Compile workflow failed.', formatUnknownError(error));
+                if (!this.ownsCompile(compileId)) {
                     getOutputChannel().appendLine(
-                        `${new Date().toISOString()} [compile error] ${formatUnknownError(error)}`,
+                        `${new Date().toISOString()} [compile result] discarded: superseded by a newer compile`,
+                    );
+                    return;
+                }
+                if (res===undefined) {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [compile skipped] no pending changes; keeping last status`,
+                    );
+                    await this.update('success', uri);
+                    return;
+                }
+                if (res===false) {
+                    // vfs.compile already logged the rejected response details.
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [compile result] failed: server rejected the compile request`,
                     );
                 }
-                if (this.inCompiling) {
-                    await this.update('failed', uri);
+                await this.publishCompileResult(uri, compileId, res===false);
+            })
+            .catch(async (error) => {
+                console.error('Compile workflow failed.', formatUnknownError(error));
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [compile error] ${formatUnknownError(error)}`,
+                );
+                if (!this.ownsCompile(compileId)) { return; }
+                // A dropped connection is not a LaTeX failure. Reporting it as
+                // 'Compile Failed' sends the user hunting through their sources
+                // for an error that does not exist; `vfs.compile` never returns
+                // a distinct "not connected" value, so ask the VFS directly.
+                const disconnected = await this.isProjectDisconnected(uri);
+                if (disconnected) {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [compile result] alert: not connected`,
+                    );
                 }
+                await this.update(disconnected ? 'alert' : 'failed', uri);
             });
 
         await vscode.window.withProgress(
             {location: vscode.ProgressLocation.Window, title: vscode.l10n.t('Compiling LaTeX')},
             () => work,
         );
+        if (this.ownsCompile(compileId)) {
+            this.activeCompileId = 0;
+        }
         await this.drainPendingSavedCompiles();
+    }
+
+    private ownsCompile(compileId: number) {
+        return this.activeCompileId===compileId;
+    }
+
+    /*
+        * Publish the outcome of a finished compile: this build's diagnostics,
+        * then the PDF, then the status badge — in that order, so a green badge
+        * is never shown over an artifact that is not the one just compiled.
+    */
+    private async publishCompileResult(
+        uri: vscode.Uri,
+        compileId: number,
+        serverRejected: boolean,
+    ) {
+        // Parse the new build's output.log even when the server rejected the
+        // compile: a fatal LaTeX error (and every `stop on first error` failure)
+        // comes back as a non-success compile status, and output.log is the only
+        // place the user can see WHICH error it was. Skipping it left the
+        // Problems panel showing the previous build's diagnostics.
+        const hasError = await this.runCompileErrorCheck(uri);
+        if (!this.ownsCompile(compileId)) { return; }
+        if (serverRejected || hasError) {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [compile result] failed: ` +
+                `${serverRejected ? 'server rejected the compile request' : 'LaTeX errors in output.log'}`,
+            );
+            await this.update('failed', uri);
+            return;
+        }
+        // Refresh the PDF *before* the success badge, and let a refresh failure
+        // veto it: a green badge over a viewer still showing the previous build
+        // is exactly the "stale PDF read as current" defect.
+        const refreshError = await this.refreshPdfViews(uri);
+        if (!this.ownsCompile(compileId)) { return; }
+        if (refreshError!==undefined) {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [compile result] compiled, but the PDF could not be loaded: ${refreshError}`,
+            );
+            vscode.window.showErrorMessage(vscode.l10n.t(
+                'Compiled, but the PDF preview could not be updated: {message}',
+                {message: refreshError},
+            ));
+            await this.update('alert', uri);
+            return;
+        }
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [compile result] success`,
+        );
+        await this.update('success', uri);
+    }
+
+    /*
+        * Fetch + parse this build's output.log and publish the diagnostics.
+        * Never throws: a crash inside the log parser must not turn a compile the
+        * server reported as successful into 'Compile Failed'.
+    */
+    private async runCompileErrorCheck(uri: vscode.Uri): Promise<boolean> {
+        try {
+            const hasError = await vscode.commands.executeCommand<boolean>(
+                `${ROOT_NAME}.compileManager.compileErrorCheck`, uri,
+            );
+            return hasError===true;
+        } catch (error) {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [compile log check] failed: ${formatUnknownError(error)}`,
+            );
+            return false;
+        }
+    }
+
+    /*
+        * Reload every open PDF view of this project.
+        * @return: the first refresh failure message, or undefined when every
+        *          view now holds the build that was just compiled.
+    */
+    private async refreshPdfViews(uri: vscode.Uri): Promise<string | undefined> {
+        let records: { doc: PdfDocument, webviewPanel: vscode.WebviewPanel }[];
+        try {
+            const { identifier } = parseUri(uri);
+            records = Object.values(pdfViewRecord[identifier] ?? {});
+        } catch {
+            // parseUri may throw for non-overleaf URIs; nothing to refresh.
+            return undefined;
+        }
+        let failure: string | undefined;
+        for (const record of records) {
+            const result = await record.doc.refresh();
+            if (!result.ok && failure===undefined) {
+                failure = result.message;
+            }
+        }
+        return failure;
+    }
+
+    private async isProjectDisconnected(uri: vscode.Uri) {
+        try {
+            const vfs = await this.vfsm.prefetch(uri);
+            return vfs.connectionState==='disconnected' || vfs.connectionState==='reconnecting';
+        } catch {
+            // The project cannot even be resolved: definitely not connected.
+            return true;
+        }
     }
 
     async stopCompile() {
         const uri = await CompileManager.check();
         if (uri && this.inCompiling) {
             const vfs = await this.vfsm.prefetch(uri);
-            await vfs.stopCompile();
+            const stopped = await vfs.stopCompile();
+            if (!stopped) {
+                // The server did not accept the stop, so the compile is still
+                // running. Reporting 'failed' here would clear the inCompiling
+                // guard and let a second compile start alongside the first.
+                return;
+            }
+            // Detach the running chain from the shared state before opening the
+            // guard, so its now-irrelevant outcome cannot land on top of the
+            // next compile's status, diagnostics or PDF.
+            this.activeCompileId = 0;
             await this.update('failed', uri);
         }
     }
@@ -464,27 +614,90 @@ export class CompileManager {
         }
     }
 
+    /*
+        * Map an open document to its project-relative path. In Local Replica
+        * mode the editor holds a `file:` uri under the replica root, which
+        * `parseUri` cannot describe.
+    */
+    private async projectRelativePath(document: vscode.TextDocument): Promise<string | undefined> {
+        if (document.uri.scheme===ROOT_NAME) {
+            const { pathParts } = parseUri(document.uri);
+            return pathParts.length>0 ? pathParts.join('/') : undefined;
+        }
+        const replicaPath = await localUriToPath(document.uri);
+        return replicaPath===undefined ? undefined : replicaPath.replace(/^\/+/, '');
+    }
+
+    /*
+        * The on-disk uri of a project file, when this project is the active
+        * Local Replica. Returns undefined for pure virtual-filesystem projects.
+    */
+    private async replicaUriForProjectPath(projectUri: vscode.Uri, filePath: string) {
+        const replicaOrigin = getActiveReplicaOriginUri();
+        if (!replicaOrigin || vfsProjectKey(replicaOrigin)!==vfsProjectKey(projectUri)) {
+            return undefined;
+        }
+        return pathToLocalUri(filePath);
+    }
+
     async syncCode() {
         const uri = await CompileManager.check();
-        if (uri && vscode.window.activeTextEditor) {
-            const { identifier, pathParts } = parseUri(uri);
-            const startPoint = vscode.window.activeTextEditor.selection.start;
-            const filePath = pathParts.join('/');
-            const line = startPoint.line;
-            const column = startPoint.character;
-            this.vfsm.prefetch(uri)
-                .then((vfs) => vfs.syncCode(filePath, line, column))
-                .then((res) => {
-                    if (res) {
-                        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
-                        const webview = pdfViewRecord[identifier][pdfPath].webviewPanel.webview;
-                        // get page
-                        webview.postMessage({
-                            type: 'syncCode',
-                            content: res
-                        });
-                    }
-                });
+        const editor = vscode.window.activeTextEditor;
+        if (!uri || !editor) { return; }
+        // The SyncTeX file is the document the cursor is in, never the compile
+        // uri: in Local Replica mode the latter is the project ROOT, which has
+        // no path parts, so the request went out as `…/sync/code?file=&line=…`
+        // and forward search was broken for the whole replica mode.
+        const filePath = await this.projectRelativePath(editor.document);
+        if (filePath===undefined) {
+            vscode.window.showWarningMessage(vscode.l10n.t(
+                'Cannot locate the active file inside the Overleaf project.',
+            ));
+            return;
+        }
+        const { identifier } = parseUri(uri);
+        const pdfPath = `${OUTPUT_FOLDER_NAME}/output.pdf`;
+        const record = pdfViewRecord[identifier]?.[pdfPath];
+        if (record===undefined) {
+            // Ctrl+Alt+J is a keybinding, so this is reachable with no PDF tab
+            // open (or after one was closed). The unguarded lookup threw a
+            // detached TypeError and the command did nothing at all.
+            vscode.window.showInformationMessage(vscode.l10n.t(
+                'Open the PDF preview first to jump to its matching location.',
+            ));
+            return;
+        }
+        const startPoint = editor.selection.start;
+        // SyncTeX line numbers are 1-based, as the reverse direction confirms
+        // (`_revealSelectionInEditor` subtracts 1 from the returned line).
+        const line = startPoint.line + 1;
+        const column = startPoint.character;
+        try {
+            const vfs = await this.vfsm.prefetch(uri);
+            const res = await vfs.syncCode(filePath, line, column);
+            // The proxy hands back the SyncTeX record ARRAY (the declared
+            // response type describes the wrapper). An empty array is truthy but
+            // has nothing to jump to — a comment or a preamble line — and the
+            // viewer would index it with -1.
+            const records = Array.isArray(res) ? res : [];
+            if (records.length===0) {
+                vscode.window.showInformationMessage(vscode.l10n.t(
+                    'No PDF location is recorded for the current line.',
+                ));
+                return;
+            }
+            // get page
+            record.webviewPanel.webview.postMessage({
+                type: 'syncCode',
+                content: res
+            });
+        } catch (error) {
+            // This chain had no .catch at all, so every failure became a
+            // detached unhandled rejection and the command failed silently.
+            vscode.window.showErrorMessage(vscode.l10n.t(
+                'Could not jump to the PDF: {message}',
+                {message: formatUnknownError(error)},
+            ));
         }
     }
 
@@ -523,12 +736,17 @@ export class CompileManager {
         if (uri) {
             this.vfsm.prefetch(uri)
                 .then((vfs) => vfs.syncPdf(r.page, r.h, r.v))
-                .then((res) => {
+                .then(async (res) => {
                     if (res) {
                         const { projectName } = parseUri(uri);
                         const { file, line, column } = res;
                         const _file = file.match(/output\.[^\.]+$/) ? `${OUTPUT_FOLDER_NAME}/${file}` : file;
-                        const fileUri = uri.with({ path: `/${projectName}/${_file}` });
+                        // In Local Replica mode the user edits the files on
+                        // disk; opening the virtual overleaf:// copy would drop
+                        // the cursor into a second buffer of the same document,
+                        // detached from the one they are working in.
+                        const fileUri = await this.replicaUriForProjectPath(uri, _file)
+                            ?? uri.with({ path: `/${projectName}/${_file}` });
 
                         let viewColumnToUse: vscode.ViewColumn | undefined;
                         const existingEditor = vscode.window.visibleTextEditors.find(

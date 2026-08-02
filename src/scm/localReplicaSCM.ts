@@ -241,6 +241,14 @@ interface SyncOwnerRepairRecord {
     createdAt: string;
 }
 
+// Ownership handshakes are the last line of defence against two writers, so a
+// probe distinguishes "nobody owns this port" from "something answered but
+// never identified itself". The latter must never read as free.
+type SyncOwnerProbe =
+    | {kind: 'owner'; owner: SyncOwnerRecord}
+    | {kind: 'unrelated'}
+    | {kind: 'ambiguous'; reason: string};
+
 interface ConflictResolutionProof {
     conflictPath: string;
     remoteState: PathRevision;
@@ -311,6 +319,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     public static readonly label = vscode.l10n.t('Local Replica');
     private static readonly processSyncOwners = new Map<string, LocalReplicaSCMProvider>();
     private static syncOwnerHostIdPromise?: Promise<string>;
+    private static legacySyncOwnerHostIdPromise?: Promise<string>;
 
     public readonly iconPath: vscode.ThemeIcon = new vscode.ThemeIcon('folder-library');
 
@@ -340,6 +349,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private partialPullToastGeneration?: number;
     private syncQueues: Map<string, Promise<unknown>> = new Map();
     private locallyDivergedPaths: Set<string> = new Set();
+    // Paths the local content scan could not classify, keyed to the time of the
+    // first failure. One unreadable path (a symlinked references.bib, an EACCES
+    // file) must not stop the scan, but a path that stays unreadable is silently
+    // unsynced while the user was told a periodic scan covers them.
+    private unscannableLocalPaths: Map<string, number> = new Map();
     private syncConflicts: Map<string, string> = new Map();
     private conflictLocalDigests: Map<string, string> = new Map();
     private localReplicaSettings?: {
@@ -403,6 +417,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private static readonly watcherProbeTimeoutMs = 750;
     private static readonly watcherHealthIntervalMs = 1000;
     private static readonly fallbackScanIntervalMs = 750;
+    private static readonly unscannablePathWarnMs = 30_000;
     private static readonly shouldUseDirectLocalWatcher = () => {
         const remoteName = vscode.env.remoteName?.toLowerCase();
         return remoteName?.includes('ssh')===true || Boolean(
@@ -613,7 +628,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 'Preserving it because its owner cannot be identified safely.',
             );
         }
-        if (record.hostId!==hostId) {
+        if (
+            record.hostId!==hostId
+            && !await LocalReplicaSCMProvider.isLocalSyncOwnerHostId(record.hostId)
+        ) {
             throw new LocalReplicaOwnershipUnavailableError(
                 `Local Replica ownership repair belongs to process ${record.pid} ` +
                 `on ${record.hostname}. Cross-host stale takeover is disabled.`,
@@ -716,18 +734,24 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             ? nodePath.join(markerPath, LEGACY_SYNC_OWNER_FILE)
             : markerPath;
         const owner = await LocalReplicaSCMProvider.readOwnerRecordFile(recordPath);
-        const repairableDeadLegacyOwner = (
-            LocalReplicaSCMProvider.isLegacySyncOwnerRecord(owner)
-            && (owner as SyncOwnerRecord).hostId===hostId
-            && !LocalReplicaSCMProvider.processIsAlive((owner as SyncOwnerRecord).pid)
-        );
-        if (
-            LocalReplicaSCMProvider.isValidSyncOwnerRecord(owner)
-            || (
-                LocalReplicaSCMProvider.isLegacySyncOwnerRecord(owner)
-                && !repairableDeadLegacyOwner
-            )
-        ) {
+        // A structurally valid record used to be untouchable, which left a
+        // reused pid or an unreachable host id with no in-product recovery at
+        // all. It stays untouchable while anything still answers on its
+        // ownership port, and an unanswerable probe still counts as live.
+        const markerBlocksRepair = async (value: unknown): Promise<boolean> => {
+            if (LocalReplicaSCMProvider.isValidSyncOwnerRecord(value)) {
+                return LocalReplicaSCMProvider.recordedOwnerListenerIsLive(value);
+            }
+            if (LocalReplicaSCMProvider.isLegacySyncOwnerRecord(value)) {
+                const legacyOwner = value as SyncOwnerRecord;
+                return !(
+                    await LocalReplicaSCMProvider.isLocalSyncOwnerHostId(legacyOwner.hostId)
+                    && !LocalReplicaSCMProvider.processIsAlive(legacyOwner.pid)
+                );
+            }
+            return false;
+        };
+        if (await markerBlocksRepair(owner)) {
             throw new Error(
                 'The ownership marker may belong to a live owner and cannot be repaired manually. ' +
                 'Close or disconnect its owning VS Code window.',
@@ -737,7 +761,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const repairAction = vscode.l10n.t('Repair Ownership Marker');
         const choice = await vscode.window.showWarningMessage(
             vscode.l10n.t(
-                'Repair this incomplete or legacy Local Replica ownership marker? ' +
+                'Repair this incomplete, legacy, or abandoned Local Replica ownership marker? ' +
                 'Continue only after every VS Code window and remote host using this folder is closed.',
             ),
             {modal: true},
@@ -755,19 +779,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const confirmedOwner = await LocalReplicaSCMProvider.readOwnerRecordFile(
                 recordPath,
             );
-            if (
-                confirmed!==before
-                || LocalReplicaSCMProvider.isValidSyncOwnerRecord(confirmedOwner)
-                || (
-                    LocalReplicaSCMProvider.isLegacySyncOwnerRecord(confirmedOwner)
-                    && !(
-                        (confirmedOwner as SyncOwnerRecord).hostId===hostId
-                        && !LocalReplicaSCMProvider.processIsAlive(
-                            (confirmedOwner as SyncOwnerRecord).pid,
-                        )
-                    )
-                )
-            ) {
+            if (confirmed!==before || await markerBlocksRepair(confirmedOwner)) {
                 throw new Error(
                     'The Local Replica ownership marker changed during confirmation. ' +
                     'Repair was cancelled.',
@@ -787,19 +799,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const movedOwner = await LocalReplicaSCMProvider.readOwnerRecordFile(
                 movedRecordPath,
             );
-            if (
-                moved!==before
-                || LocalReplicaSCMProvider.isValidSyncOwnerRecord(movedOwner)
-                || (
-                    LocalReplicaSCMProvider.isLegacySyncOwnerRecord(movedOwner)
-                    && !(
-                        (movedOwner as SyncOwnerRecord).hostId===hostId
-                        && !LocalReplicaSCMProvider.processIsAlive(
-                            (movedOwner as SyncOwnerRecord).pid,
-                        )
-                    )
-                )
-            ) {
+            if (moved!==before || await markerBlocksRepair(movedOwner)) {
                 throw new Error(
                     'The Local Replica ownership marker changed during repair. ' +
                     `It was preserved at ${quarantinePath}.`,
@@ -889,24 +889,38 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
-    private isOwnerProcessAlive(
-        record: SyncOwnerRecord,
-        hostId: string,
-    ): boolean | undefined {
-        if (record.hostId!==hostId) {
-            return undefined;
-        }
-        try {
-            process.kill(record.pid, 0);
-            return true;
-        } catch (error) {
-            return this.isNodeErrorCode(error, 'ESRCH') ? false : true;
-        }
-    }
-
     private static getSyncOwnerHostId(): Promise<string> {
         if (!LocalReplicaSCMProvider.syncOwnerHostIdPromise) {
             LocalReplicaSCMProvider.syncOwnerHostIdPromise = (async () => {
+                // Only stable identity may feed this fingerprint. The systemd
+                // session scope in /proc/self/cgroup differs per SSH login and
+                // the MAC set changes the moment docker0/veth*/a VPN tap
+                // appears, so either input would leave an ungraceful shutdown
+                // with a marker under a host id this machine can never produce
+                // again — a permanently locked replica.
+                const machineId = process.platform==='linux'
+                    ? await nodeFs.readFile('/etc/machine-id', 'utf8')
+                        .then(value => value.trim())
+                        .catch(() => '')
+                    : '';
+                const identity = [
+                    process.platform,
+                    process.arch,
+                    os.hostname(),
+                    machineId,
+                ].join('\n');
+                return crypto.createHash('sha256').update(identity).digest('hex');
+            })();
+        }
+        return LocalReplicaSCMProvider.syncOwnerHostIdPromise;
+    }
+
+    // Markers written before the fingerprint dropped its unstable inputs still
+    // carry the old id. Recognising it keeps an upgrade from turning every
+    // existing marker into an unreclaimable foreign-host marker.
+    private static getLegacySyncOwnerHostId(): Promise<string> {
+        if (!LocalReplicaSCMProvider.legacySyncOwnerHostIdPromise) {
+            LocalReplicaSCMProvider.legacySyncOwnerHostIdPromise = (async () => {
                 const systemIdentityPaths = process.platform==='linux'
                     ? ['/etc/machine-id', '/proc/self/cgroup']
                     : [];
@@ -930,7 +944,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 return crypto.createHash('sha256').update(identity).digest('hex');
             })();
         }
-        return LocalReplicaSCMProvider.syncOwnerHostIdPromise;
+        return LocalReplicaSCMProvider.legacySyncOwnerHostIdPromise;
+    }
+
+    private static async isLocalSyncOwnerHostId(hostId: string): Promise<boolean> {
+        return hostId===await LocalReplicaSCMProvider.getSyncOwnerHostId()
+            || hostId===await LocalReplicaSCMProvider.getLegacySyncOwnerHostId();
     }
 
     private syncOwnerHostId(): Promise<string> {
@@ -966,38 +985,115 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         );
     }
 
-    private probeSyncOwner(port: number): Promise<SyncOwnerRecord | undefined> {
+    private static probeSyncOwner(port: number): Promise<SyncOwnerProbe> {
         return new Promise(resolve => {
             let payload = '';
             let settled = false;
+            let connected = false;
             const socket = nodeNet.createConnection({host: '127.0.0.1', port});
             socket.unref();
-            const finish = () => {
+            const finish = (
+                evidence: 'closed' | 'timeout' | 'error' | 'overflow',
+                reason?: string,
+            ) => {
                 if (settled) { return; }
                 settled = true;
                 clearTimeout(timeout);
                 socket.destroy();
-                try {
-                    const parsed = JSON.parse(payload);
-                    resolve(LocalReplicaSCMProvider.isValidSyncOwnerRecord(parsed)
-                        ? parsed
-                        : undefined);
-                } catch {
-                    resolve(undefined);
+                // Nothing accepted the connection, or the peer flooded us: an
+                // owner replies with one small record and closes, so both are
+                // decisive evidence that this port holds something else.
+                if ((evidence==='error' && !connected) || evidence==='overflow') {
+                    resolve({kind: 'unrelated'});
+                    return;
                 }
+                if (evidence==='closed') {
+                    // A complete reply is decisive either way.
+                    let parsed: unknown;
+                    try {
+                        parsed = JSON.parse(payload);
+                    } catch {
+                        resolve({kind: 'unrelated'});
+                        return;
+                    }
+                    resolve(LocalReplicaSCMProvider.isValidSyncOwnerRecord(parsed)
+                        ? {kind: 'owner', owner: parsed}
+                        : {kind: 'unrelated'});
+                    return;
+                }
+                // The peer accepted the connection but never finished the
+                // handshake. It may be an owner whose reply was lost or whose
+                // process is paused, so callers must treat it as possibly live.
+                resolve({
+                    kind: 'ambiguous',
+                    reason: reason ?? (evidence==='timeout'
+                        ? 'no ownership handshake within 500ms'
+                        : 'the ownership handshake was interrupted'),
+                });
             };
-            const timeout = setTimeout(finish, 500);
+            const timeout = setTimeout(() => finish('timeout'), 500);
             timeout.unref?.();
+            socket.once('connect', () => { connected = true; });
             socket.on('data', chunk => {
                 payload += chunk.toString('utf8');
                 if (payload.length>64*1024) {
-                    payload = '';
-                    finish();
+                    finish('overflow');
                 }
             });
-            socket.once('end', finish);
-            socket.once('error', finish);
+            socket.once('end', () => finish('closed'));
+            socket.once('error', error => finish('error', formatUnknownError(error)));
         });
+    }
+
+    private static async recordedOwnerListenerIsLive(
+        record: SyncOwnerRecord,
+    ): Promise<boolean> {
+        const probe = await LocalReplicaSCMProvider.probeSyncOwner(record.port);
+        if (probe.kind==='owner') {
+            return probe.owner.rootKey===record.rootKey;
+        }
+        // Only a port that provably answers for nobody makes a structurally
+        // valid marker safe to quarantine.
+        return probe.kind!=='unrelated';
+    }
+
+    private async recordedOwnerHoldsPort(rootKey: string, port: number): Promise<boolean> {
+        const recorded = await this.readSyncOwnerRecord().catch(() => undefined);
+        return recorded?.rootKey===rootKey && recorded.port===port;
+    }
+
+    // Decide whether a same-host marker may still belong to a live owner. The
+    // pid alone cannot answer this: a reused pid answers process.kill forever,
+    // which used to make the marker unreclaimable. An owner holds its
+    // deterministic port for as long as it owns the folder, so the port is the
+    // corroborating authority — and ambiguity always reads as "still live".
+    private async recordedOwnerIsActive(
+        record: SyncOwnerRecord,
+        ownPort: number,
+    ): Promise<boolean> {
+        if (ownPort===record.port) {
+            // This process is bound to the port the record claims, so the
+            // recording process can no longer be listening on it.
+            return false;
+        }
+        const probe = await LocalReplicaSCMProvider.probeSyncOwner(record.port);
+        if (probe.kind==='owner') {
+            return probe.owner.rootKey===record.rootKey;
+        }
+        if (probe.kind==='ambiguous') {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [sync ownership probe ambiguous] ` +
+                `${this.baseUri.toString()} port=${record.port}: ${probe.reason}`,
+            );
+            return true;
+        }
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [sync ownership marker stale] ` +
+            `${this.baseUri.toString()} pid=${record.pid} ` +
+            `pidAnswers=${LocalReplicaSCMProvider.processIsAlive(record.pid)} ` +
+            `port=${record.port} released`,
+        );
+        return false;
     }
 
     private async listenSyncOwnerServer(
@@ -1030,12 +1126,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 });
             } catch (error) {
                 if (!this.isNodeErrorCode(error, 'EADDRINUSE')) { throw error; }
-                const existingOwner = await this.probeSyncOwner(port);
-                if (existingOwner?.rootKey===owner.rootKey) {
+                const probe = await LocalReplicaSCMProvider.probeSyncOwner(port);
+                if (probe.kind==='owner' && probe.owner.rootKey===owner.rootKey) {
                     throw new LocalReplicaOwnershipUnavailableError(
                         `Local Replica folder is already active in process ` +
-                        `${existingOwner.pid} on ${existingOwner.hostname}. ` +
+                        `${probe.owner.pid} on ${probe.owner.hostname}. ` +
                         'Keep only one VS Code window connected to this Local Replica.',
+                    );
+                }
+                // A silent peer proves nothing on its own, but on the exact port
+                // this folder's marker records it is far more likely the owner
+                // than an unrelated service. Refuse rather than admit a second
+                // writer behind a lost handshake.
+                if (
+                    probe.kind==='ambiguous'
+                    && await this.recordedOwnerHoldsPort(owner.rootKey, port)
+                ) {
+                    throw new LocalReplicaOwnershipUnavailableError(
+                        `Local Replica ownership port ${port} is held by a process that did ` +
+                        `not identify itself (${probe.reason}), and this folder's ownership ` +
+                        'marker records that port. Close every VS Code window using this ' +
+                        'Local Replica, then retry.',
                     );
                 }
                 continue;
@@ -1240,13 +1351,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         'Local Replica ownership marker does not match the selected folder.',
                     );
                 }
-                if (existingOwner.hostId!==hostId) {
+                if (!await LocalReplicaSCMProvider.isLocalSyncOwnerHostId(existingOwner.hostId)) {
                     throw new LocalReplicaOwnershipUnavailableError(
                         `Local Replica folder is owned by process ${existingOwner.pid} ` +
                         `on ${existingOwner.hostname}. Cross-host stale takeover is disabled.`,
                     );
                 }
-                if (this.isOwnerProcessAlive(existingOwner, hostId)!==false) {
+                if (await this.recordedOwnerIsActive(existingOwner, owner.port)) {
                     throw new LocalReplicaOwnershipUnavailableError(
                         `Local Replica folder is already active in process ` +
                         `${existingOwner.pid} on ${existingOwner.hostname}. ` +
@@ -1423,18 +1534,29 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 'Select the folder explicitly to connect it again.',
             );
         }
+        // Acquisition can take hundreds of ms binding and probing up to 64
+        // ports, and a deactivate during that window leaves no other trace:
+        // releaseSyncOwnership() no-ops while no token is held yet. Without
+        // this fence the disposed session would still run the initial pull and
+        // startup reconcile — writing, pushing and deleting for a replica the
+        // user already switched away from.
+        const activationGeneration = this.syncGeneration;
         await this.syncOwnerReleasePromise;
         await this.acquireSyncOwnership();
+        const sessionDisposedDuringAcquisition = this.syncGeneration!==activationGeneration;
         if (
             this.removalDrainPromise
             || this.removalOwnershipHeld
+            || sessionDisposedDuringAcquisition
             || await hasReplicaRemovalTombstone(this.baseUri, this.vfs.origin)
         ) {
             await this.releaseSyncOwnershipNow();
             throw new Error(
                 this.removalDrainPromise || this.removalOwnershipHeld
                     ? 'Local Replica removal is already in progress.'
-                    : 'This Local Replica mapping was removed while activation was waiting.',
+                    : sessionDisposedDuringAcquisition
+                        ? 'This Local Replica sync session was disposed while ownership was being acquired.'
+                        : 'This Local Replica mapping was removed while activation was waiting.',
             );
         }
         const generation = ++this.syncGeneration;
@@ -1504,6 +1626,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         this.localWatcherHealthState = 'unknown';
         this.localWatcherWarningShown = false;
+        this.unscannableLocalPaths.clear();
         if (this.fallbackScanTimer) {
             clearTimeout(this.fallbackScanTimer);
             this.fallbackScanTimer = undefined;
@@ -4788,9 +4911,20 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         let operationCommitted = false;
         let operationError: unknown;
 
-        await nodeFs.writeFile(stagePath, content, {flag: 'wx'});
-        stageExists = true;
         try {
+            const stageHandle = await nodeFs.open(stagePath, 'wx');
+            stageExists = true;
+            try {
+                await stageHandle.writeFile(content);
+                // Durability parity with the operation journal. Without this,
+                // a crash between the write and the install can leave the
+                // linked-in target holding zero-length or partial bytes, which
+                // the startup reconcile reads as a local edit and force-pushes
+                // over the intact Overleaf manuscript.
+                await stageHandle.sync();
+            } finally {
+                await stageHandle.close();
+            }
             const current = await this.captureLocalPathRevision(relPath, generation);
             if (current.revision!==expectedRevision) {
                 return false;
@@ -5704,10 +5838,40 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         maybeWarnSyncFailure(relPath, new Error(
             `Local Replica conflict: ${reason}. Local and Overleaf copies were both preserved.`,
         ));
-        await this.persistSyncManifest(false, generation);
+        // Conflict durability is a correctness property: a conflict that only
+        // exists in memory stops blocking pushes after a reload, so the next
+        // local save would overwrite the Overleaf copy being held. Retry once,
+        // then tell the user rather than failing silently.
+        try {
+            await this.persistSyncManifest(false, generation);
+        } catch (error) {
+            if (!this.isSyncSessionActive(generation)) { throw error; }
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [sync conflict persist retry] ${relPath}: ` +
+                formatUnknownError(error),
+            );
+            try {
+                await this.persistSyncManifest(true, generation);
+            } catch (retryError) {
+                if (!this.isSyncSessionActive(generation)) { throw retryError; }
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [sync conflict persist failed] ${relPath}: ` +
+                    formatUnknownError(retryError),
+                );
+                maybeWarnSyncFailure(relPath, new Error(
+                    'the conflict could not be recorded on disk ' +
+                    `(${formatUnknownError(retryError)}); it will stop blocking syncs ` +
+                    'after a window reload',
+                ));
+                throw retryError;
+            }
+        }
     }
 
-    private clearSyncConflict(relPath: string) {
+    private async clearSyncConflict(
+        relPath: string,
+        generation = this.syncGeneration,
+    ) {
         let changed = false;
         this.syncConflicts.delete(relPath);
         this.conflictLocalDigests.delete(relPath);
@@ -5716,13 +5880,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             changed = true;
         }
         for (const conflictPath of [...this.syncConflicts.keys()]) {
-            if (conflictPath.startsWith(`${relPath}/`)) {
-                this.syncConflicts.delete(conflictPath);
-                this.conflictLocalDigests.delete(conflictPath);
-                if (this.syncManifest?.conflicts[conflictPath]) {
-                    delete this.syncManifest.conflicts[conflictPath];
-                    changed = true;
-                }
+            if (!conflictPath.startsWith(`${relPath}/`)) { continue; }
+            // A descendant holds its own Overleaf revision, so syncing the
+            // parent proves nothing about it. Dropping it unblocks
+            // touchesSyncConflict and the next local save would overwrite
+            // remote content that is still deliberately held.
+            if (
+                !this.isSyncSessionActive(generation)
+                || !await this.isConflictStateResolved(conflictPath, generation)
+            ) {
+                continue;
+            }
+            this.syncConflicts.delete(conflictPath);
+            this.conflictLocalDigests.delete(conflictPath);
+            if (this.syncManifest?.conflicts[conflictPath]) {
+                delete this.syncManifest.conflicts[conflictPath];
+                changed = true;
             }
         }
         if (changed) {
@@ -6093,7 +6266,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         generation = this.syncGeneration,
     ) {
         this.requireSyncSession(generation);
-        this.clearSyncConflict(relPath);
+        await this.clearSyncConflict(relPath, generation);
         const ancestorConflicts = [...this.syncConflicts.keys()]
             .filter(path => this.isPathAtOrBelow(relPath, path))
             .sort((left, right) => right.split('/').length-left.split('/').length);
@@ -6951,7 +7124,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         );
         for (const conflictPath of relevantConflicts) {
             if (await this.isConflictStateResolved(conflictPath, generation)) {
-                this.clearSyncConflict(conflictPath);
+                await this.clearSyncConflict(conflictPath, generation);
             } else {
                 const matchingTargets = [...changedTargetPaths].filter(relPath =>
                     this.isPathAtOrBelow(relPath, conflictPath)
@@ -7503,6 +7676,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             })
             .catch(error => {
                 console.error(error);
+                // applySync reports its own failures. Anything surfacing here
+                // escaped outside it — delete promotion, a VFS Unavailable
+                // during reconnect, EACCES/ELOOP — and used to vanish with no
+                // output line, no toast and nothing queued for retry, leaving a
+                // pull-side delete recoverable only by restarting the window.
+                if (this.isSyncSessionActive(generation)) {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [sync intent dropped] ${relPath}: ` +
+                        formatUnknownError(error),
+                    );
+                    this.locallyDivergedPaths.add(relPath);
+                    maybeWarnSyncFailure(relPath, error);
+                }
                 return undefined;
             })
             .finally(() => {
@@ -8533,6 +8719,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return /\.(pdf|png|jpe?g|gif|svg|webp|bmp|tiff?|eps|ps|zip|tar|gz|bz2|7z|rar|mp[34]|wav|ogg|woff2?|ttf|otf|ico)$/i.test(relPath);
     }
 
+    // Whether a push must go through the compare-and-swap replacement instead
+    // of a plain write. Overleaf `file` entities have no OT channel, so
+    // writeFileFromRemoteBaseline discards remoteBaseline for them and
+    // overwrites blindly. The entity type decides that, not the extension: a
+    // data.csv / results.json / table.xlsx uploaded as a file is exactly as
+    // unguarded as a .png. The extension heuristic remains the fallback for
+    // when the remote type cannot be resolved.
+    private async remoteEntityNeedsGuardedReplace(
+        relPath: string,
+        vfsUri: vscode.Uri,
+    ): Promise<boolean> {
+        try {
+            const {fileType} = await this.vfs._resolveUri(vfsUri);
+            if (fileType==='doc') { return false; }
+            if (fileType==='file') { return true; }
+        } catch {
+            // Fall through to the extension heuristic.
+        }
+        return this.isLikelyBinaryRelPath(relPath);
+    }
+
     private async pullRemoteFile(
         relPath: string,
         vfsUri: vscode.Uri,
@@ -8783,7 +8990,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
             if (type==='delete') {
                 const newContent = undefined;
-                const previousBaseContent = this.baseCache[relPath];
+                // The manifest fallback matters most here: a path with a
+                // manifest entry but no baseCache entry (conflict-marked media,
+                // files over the merge-baseline limit, paths blocked during
+                // startup) would otherwise look baseline-free and skip the
+                // concurrent-edit guard below entirely.
+                const previousBaseContent = this.baseCache[relPath]
+                    ?? this.manifestBaseContent(this.syncManifest?.files[relPath]);
                 const directoryDelete = this.isTrackedDirectory(relPath);
                 let targetAlreadyMissing = false;
                 let expectedLocalDeleteRevision: string | undefined;
@@ -8839,6 +9052,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         outcome = 'suppressed';
                         return;
                     }
+                    // A conflict at this path or above it means both copies are
+                    // being preserved on purpose. Applying the Overleaf delete
+                    // would destroy the preserved local copy and the
+                    // post-success cleanup would then drop the conflict record,
+                    // so hold the delete until the user resolves it.
+                    const blockingConflictPath = [...this.syncConflicts.keys()]
+                        .find(conflictPath => this.isPathAtOrBelow(relPath, conflictPath));
+                    if (blockingConflictPath!==undefined) {
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [pull delete blocked:unresolved-conflict] ` +
+                            `${relPath} (conflict=${blockingConflictPath})`,
+                        );
+                        outcome = 'blocked';
+                        errorMessage = 'unresolved sync conflict';
+                        return;
+                    }
                     if (directoryDelete) {
                         const ignoredDescendant = await this.findIgnoredDescendant(toUri, relPath, generation);
                         this.requireSyncSession(generation);
@@ -8879,6 +9108,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             errorMessage = 'concurrent remote delete and local edit';
                             return;
                         }
+                    } else if (!directoryDelete) {
+                        // The path was replicated and still exists locally, but
+                        // no baseline survives to prove the local bytes are the
+                        // ones Overleaf deleted. Deleting on that evidence can
+                        // discard local work, so the uncertainty becomes a
+                        // conflict instead of a silent winner.
+                        await this.markSyncConflict(
+                            relPath,
+                            'Overleaf deleted the file and no sync baseline is available to prove ' +
+                                'the local copy was unmodified',
+                            localDeleteState.kind==='file' ? localDeleteState.content : undefined,
+                            generation,
+                        );
+                        outcome = 'blocked';
+                        errorMessage = 'missing remote delete baseline';
+                        return;
                     }
                 }
 
@@ -9646,8 +9891,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             // silently lose the accepted edit.
                             try {
                                 const pushedContent = (
-                                    this.isLikelyBinaryRelPath(relPath)
-                                    && remoteBaselineForPush!==undefined
+                                    remoteBaselineForPush!==undefined
+                                    && await this.remoteEntityNeedsGuardedReplace(relPath, toUri)
                                 )
                                     ? await this.guardedReplaceRemoteBinary(
                                         relPath,
@@ -10479,6 +10724,28 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+    private recordUnscannableLocalPath(relPath: string, error: unknown): void {
+        const firstFailedAt = this.unscannableLocalPaths.get(relPath) ?? Date.now();
+        this.unscannableLocalPaths.set(relPath, firstFailedAt);
+        this.locallyDivergedPaths.add(relPath);
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [local scan skipped] ${relPath}: ` +
+            formatUnknownError(error),
+        );
+        if (
+            Date.now()-firstFailedAt
+            >=LocalReplicaSCMProvider.unscannablePathWarnMs
+        ) {
+            // The degraded-watcher warning promised a periodic content scan
+            // covers closed-file changes. It does not cover this path, and the
+            // user must not be left believing otherwise.
+            maybeWarnSyncFailure(relPath, new Error(
+                'the periodic local content scan cannot read this path, so its ' +
+                `changes are not reaching Overleaf: ${formatUnknownError(error)}`,
+            ));
+        }
+    }
+
     private async replayBufferedLocalEvents(
         events: Iterable<{uri: vscode.Uri; type: 'update' | 'delete'}>,
         generation: number,
@@ -10494,8 +10761,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 'replay buffered local watcher event',
             );
             if (relPath===undefined || this.matchIgnorePatterns(relPath)) { continue; }
-            const type = await this.localTargetNeedsPush(relPath, event.uri);
+            let type: 'update' | 'delete' | undefined;
+            try {
+                type = await this.localTargetNeedsPush(relPath, event.uri);
+            } catch (error) {
+                // While the watcher is degraded this loop is the only thing
+                // syncing local edits at all, so one path that refuses to be
+                // classified must be skipped, not allowed to abort the scan.
+                this.requireSyncSession(generation);
+                this.recordUnscannableLocalPath(relPath, error);
+                continue;
+            }
             this.requireSyncSession(generation);
+            this.unscannableLocalPaths.delete(relPath);
             if (type!==undefined) {
                 targets.push({relPath, uri: event.uri, type});
             }
@@ -10770,10 +11048,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private async verifyLocalWatcherHealth(generation: number): Promise<boolean> {
         this.requireSyncSession(generation);
+        // Probe inside the project tree itself. Probing only inside
+        // .semantic-researcher-overleaf/ reported a healthy watcher whenever
+        // that one directory was watched, even when files.watcherExclude hid
+        // the replica's actual content — and then the content-scan fallback
+        // never engaged. The .sr-overleaf-* prefix keeps the probe inside the
+        // protected ignore patterns so no sync path can act on it.
         const probeUri = vscode.Uri.joinPath(
             this.baseUri,
-            REPLICA_SETTINGS_DIR,
-            `watcher-probe-${generation}-${crypto.randomBytes(6).toString('hex')}.tmp`,
+            `.sr-overleaf-watcher-probe-${generation}-${crypto.randomBytes(6).toString('hex')}.tmp`,
         );
         let observed = false;
         let resolveObserved!: () => void;
@@ -10792,8 +11075,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.localWatcherProbe = probe;
 
         try {
-            await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(this.baseUri, REPLICA_SETTINGS_DIR));
-            this.requireSyncSession(generation);
             await vscode.workspace.fs.writeFile(
                 probeUri,
                 new TextEncoder().encode(`${Date.now()}\n`),

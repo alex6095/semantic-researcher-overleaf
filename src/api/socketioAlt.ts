@@ -421,4 +421,24 @@ export class SocketIOAlt {
     on<T extends keyof ListenEventsSupport>(event: T, handler: (arg: ListenEventsSupport[T]) => void): void {
         this._eventEmitter.on(event, handler);
     }
+
+    // Without real removal the callers' `removeListener?.()` / `off?.()` /
+    // `removeAllListeners?.()` silently no-op, so every reconnect stacks another
+    // copy of each handler: one `otUpdateApplied` would then be applied N times
+    // and run the local document version permanently ahead of the server.
+    removeListener<T extends keyof ListenEventsSupport>(event: T, handler: (arg: ListenEventsSupport[T]) => void): void {
+        this._eventEmitter.removeListener(event, handler);
+    }
+
+    off<T extends keyof ListenEventsSupport>(event: T, handler: (arg: ListenEventsSupport[T]) => void): void {
+        this._eventEmitter.removeListener(event, handler);
+    }
+
+    removeAllListeners(event?: keyof ListenEventsSupport): void {
+        if (event===undefined) {
+            this._eventEmitter.removeAllListeners();
+        } else {
+            this._eventEmitter.removeAllListeners(event);
+        }
+    }
 }

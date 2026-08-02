@@ -152,7 +152,13 @@ export class ClientManager {
             id = selectedUser.clientId;
         }
 
+        // The collaborator may have disconnected between building the quick
+        // pick (or issuing the command) and this point.
         const user = this.onlineUsers[id];
+        if (user === undefined) {
+            vscode.window.showWarningMessage( vscode.l10n.t('That collaborator is no longer online.') );
+            return;
+        }
         const docPath = this.vfs._resolveById(user.doc_id)?.path;
         if (docPath === undefined) { return; }
 
@@ -181,6 +187,17 @@ export class ClientManager {
     private async updatePosition(clientId:string, docId: string, row: number, column: number, details?:UpdateUserSchema) {
         if (this.disposed || clientId === this.publicId) { return; }
 
+        // Validate before touching the record: a malformed position that gets
+        // stored is later fed to `new vscode.Selection(...)` by jumpToUser.
+        if (!Number.isInteger(row) || row<0 || !Number.isInteger(column) || column<0) {
+            return;
+        }
+
+        // The record is about to be overwritten, so capture the document the
+        // collaborator was in; otherwise the "moved to another file" check
+        // below compares docId against itself and never clears the old cursor.
+        const previousDocId = this.onlineUsers[clientId]?.doc_id;
+
         // update record
         if (this.onlineUsers[clientId]===undefined) {
             if (details === undefined) { return; }
@@ -195,13 +212,9 @@ export class ClientManager {
             this.onlineUsers[clientId].last_updated_at = Date.now();
         }
 
-        if (!Number.isInteger(row) || row<0 || !Number.isInteger(column) || column<0) {
-            return;
-        }
-
         const selection = this.onlineUsers[clientId].selection;
         // remove decoration
-        const oldDoc = this.vfs._resolveById(this.onlineUsers[clientId]?.doc_id);
+        const oldDoc = previousDocId ? this.vfs._resolveById(previousDocId) : undefined;
         if (oldDoc && oldDoc.fileEntity._id !== docId && selection) {
             const oldUri = await LocalReplicaSCMProvider.pathToUri(oldDoc.path) ?? this.vfs.pathToUri(oldDoc.path);
 
@@ -373,10 +386,12 @@ export class ClientManager {
         const doc = uri && await this.vfs._resolveUri(uri);
         const docId = doc?.fileEntity?._id;
         if (!docId) { return; }
+        const lastSentPosition = this.lastSentPosition;
         if (
-            this.lastSentPosition?.docId===docId
-            && this.lastSentPosition.row===pending.row
-            && this.lastSentPosition.column===pending.column
+            lastSentPosition!==undefined
+            && lastSentPosition.docId===docId
+            && lastSentPosition.row===pending.row
+            && lastSentPosition.column===pending.column
         ) {
             return;
         }

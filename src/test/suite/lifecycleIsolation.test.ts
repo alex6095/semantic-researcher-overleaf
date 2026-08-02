@@ -3227,6 +3227,8 @@ suite('Extension host and lifecycle isolation', () => {
         internals.config = {enabled: true};
         internals.internalRestoreUntil = new Map();
         internals.resolveConfig = async () => ({enabled: true});
+        // The push path reads settings without normalizing them back to disk.
+        internals.resolveConfigSnapshot = async () => ({enabled: true});
         internals.saveClassifier = {
             getRecentSaveIntent: () => undefined,
         };
@@ -3315,6 +3317,8 @@ suite('Extension host and lifecycle isolation', () => {
         internals.config = {enabled: true};
         internals.internalRestoreUntil = new Map();
         internals.resolveConfig = async () => ({enabled: true});
+        // The push path reads settings without normalizing them back to disk.
+        internals.resolveConfigSnapshot = async () => ({enabled: true});
         internals.proposalStore = {
             ensureStorage: async () => undefined,
             migrateLegacy: async () => undefined,

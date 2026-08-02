@@ -45,6 +45,8 @@ const ACTIVE_REPLICA_ROOT_KEY = `${ROOT_NAME}.activeReplicaRoot`;
 const LEGACY_ACTIVE_REPLICA_ROOT_KEY = `${LEGACY_EXTENSION_NAMESPACE}.activeReplicaRoot`;
 const SUPPRESSED_AUTO_RESTORE_ROOT_KEY = `${ROOT_NAME}.suppressedActiveReplicaRoot`;
 const SUPPRESSED_AUTO_RESTORE_ROOTS_KEY = `${ROOT_NAME}.suppressedActiveReplicaRoots`;
+const ACTIVATED_REPLICA_ROOTS_KEY = `${ROOT_NAME}.activatedReplicaRoots`;
+const DECLINED_AUTO_DISCOVERED_ROOTS_KEY = `${ROOT_NAME}.declinedAutoDiscoveredReplicaRoots`;
 
 let extensionContext: vscode.ExtensionContext | undefined;
 let activeReplicaRoot: vscode.Uri | undefined;
@@ -321,6 +323,61 @@ async function persistSuppressedAutoRestoreRoot(
     );
 }
 
+function getPersistedReplicaRoots(key: string): Set<string> {
+    return new Set(extensionContext?.workspaceState.get<string[]>(key, []) ?? []);
+}
+
+async function addPersistedReplicaRoot(key: string, rootUri: vscode.Uri) {
+    if (!extensionContext) { return; }
+    const roots = getPersistedReplicaRoots(key);
+    if (roots.has(rootUri.toString())) { return; }
+    roots.add(rootUri.toString());
+    await extensionContext.workspaceState.update(key, [...roots]);
+}
+
+/**
+ * Attaching a replica is not a read-only action: it schedules a startup
+ * reconcile that can push and delete files on Overleaf. Restoring a root the
+ * user activated in this workspace stays automatic, but a root that is merely
+ * *discovered* (a workspace folder that happens to carry a settings marker)
+ * needs an explicit answer. The answer is remembered per root so the question
+ * is asked once instead of on every window reload.
+ */
+async function consentToAutoDiscoveredReplica(rootUri: vscode.Uri): Promise<boolean> {
+    if (getPersistedReplicaRoots(ACTIVATED_REPLICA_ROOTS_KEY).has(rootUri.toString())) {
+        return true;
+    }
+    if (getPersistedReplicaRoots(DECLINED_AUTO_DISCOVERED_ROOTS_KEY).has(rootUri.toString())) {
+        return false;
+    }
+
+    const settings = await readSettingsSnapshotFromRoot(rootUri);
+    const connect = vscode.l10n.t('Connect');
+    const keepDisconnected = vscode.l10n.t('Keep Disconnected');
+    const choice = await vscode.window.showInformationMessage(
+        vscode.l10n.t(
+            'This folder is a Local Replica of the Overleaf project "{project}". Connect it? Syncing can upload local changes to Overleaf and delete remote files that are missing locally.',
+            {
+                project: settings?.projectName
+                    || rootUri.path.split('/').filter(Boolean).at(-1)
+                    || rootUri.toString(),
+            },
+        ),
+        connect,
+        keepDisconnected,
+    );
+    if (choice===connect) {
+        // `setActiveReplicaRoot` records the root as activated for this
+        // workspace, so the next reload restores it without asking again.
+        return true;
+    }
+    if (choice===keepDisconnected) {
+        await addPersistedReplicaRoot(DECLINED_AUTO_DISCOVERED_ROOTS_KEY, rootUri);
+    }
+    // A dismissed notification is not an answer: stay disconnected, ask again.
+    return false;
+}
+
 async function discoverDirectReplicaRoots() {
     const workspaceFolders = vscode.workspace.workspaceFolders ?? [];
     const matches: vscode.Uri[] = [];
@@ -414,12 +471,20 @@ export async function initializeLocalReplicaWorkspace() {
             uri => !suppressedRoots.has(uri.toString())
         );
         if (restoreCandidates.length===1) {
-            rootUri = restoreCandidates[0];
+            const candidate = restoreCandidates[0];
+            if (await consentToAutoDiscoveredReplica(candidate)) {
+                // The consent prompt is not modal: a replica the user activated
+                // while it was open wins over this restore.
+                if (activeReplicaRoot!==undefined) { return; }
+                rootUri = candidate;
+            }
         }
     }
 
     if (rootUri) {
-        await setActiveReplicaRoot(rootUri, {ensureWorkspaceFolder: true});
+        // An unattended restore must never restructure the workspace; only the
+        // explicit "open project local replica" flow adds a workspace folder.
+        await setActiveReplicaRoot(rootUri);
     } else {
         activeReplicaRoot = undefined;
         activeReplicaSettings = undefined;
@@ -469,6 +534,9 @@ export async function setActiveReplicaRoot(
     activeReplicaSettings = settings;
     await persistActiveRoot(rootUri);
     await persistSuppressedAutoRestoreRoot(rootUri, false);
+    // Activating a root in this workspace is the consent that later lets an
+    // auto-discovery of the same folder restore it without asking again.
+    await addPersistedReplicaRoot(ACTIVATED_REPLICA_ROOTS_KEY, rootUri);
     await syncContexts(settings);
 
     if (options?.ensureWorkspaceFolder) {

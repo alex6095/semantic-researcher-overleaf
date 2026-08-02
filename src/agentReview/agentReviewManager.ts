@@ -2,7 +2,12 @@ import * as vscode from 'vscode';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { CONFIG_SECTION, REPLICA_SETTINGS_FILE, ROOT_NAME } from '../consts';
-import { getActiveReplicaRoot, isWithinActiveReplica, readReplicaSettings } from '../utils/localReplicaWorkspace';
+import {
+    getActiveReplicaRoot,
+    isWithinActiveReplica,
+    readReplicaSettings,
+    readReplicaSettingsSnapshot,
+} from '../utils/localReplicaWorkspace';
 import { AgentReviewEditorProvider } from './editorReviewProvider';
 import { AgentReviewProposalStore } from './proposalStore';
 import { SaveClassifier } from './saveClassifier';
@@ -148,7 +153,10 @@ export class AgentReviewManager implements vscode.Disposable {
         const isCurrentRoot = () =>
             this.isActivationCurrent(generation)
             && this.activeRoot?.toString()===rootUri.toString();
-        this.config = await this.resolveConfig(change.rootUri);
+        // Snapshot read: the normalizing reader rewrites settings.json, which
+        // would fire this manager's own settings watcher and invalidate the
+        // very push decision being made here.
+        this.config = await this.resolveConfigSnapshot(change.rootUri);
         if (!isCurrentRoot()) {
             return {kind: 'block', reason: 'Agent review workspace changed'};
         }
@@ -352,6 +360,12 @@ export class AgentReviewManager implements vscode.Disposable {
         return getAgentReviewConfig(settings);
     }
 
+    /** Same result as `resolveConfig`, but never writes settings.json. */
+    private async resolveConfigSnapshot(rootUri: vscode.Uri | undefined) {
+        const settings = rootUri ? await readReplicaSettingsSnapshot(rootUri) : undefined;
+        return getAgentReviewConfig(settings);
+    }
+
     private isActiveReplicaSettingsUri(uri: vscode.Uri) {
         if (!this.activeRoot || uri.scheme!=='file') {
             return false;
@@ -359,10 +373,16 @@ export class AgentReviewManager implements vscode.Disposable {
         return path.normalize(uri.fsPath)===path.join(this.activeRoot.fsPath, REPLICA_SETTINGS_FILE);
     }
 
-    private onReplicaSettingsChanged(uri: vscode.Uri) {
-        if (!this.disposed && this.isActiveReplicaSettingsUri(uri)) {
-            void this.activate(getActiveReplicaRoot());
-        }
+    private async onReplicaSettingsChanged(uri: vscode.Uri) {
+        if (this.disposed || !this.isActiveReplicaSettingsUri(uri)) { return; }
+        // Reading replica settings normalizes the file in place, so this
+        // watcher also fires for writes this manager caused itself. Bumping the
+        // activation generation for those would report every in-flight push as
+        // blocked, so re-activate only when the effective config really changed.
+        const rootUri = getActiveReplicaRoot();
+        const config = await this.resolveConfigSnapshot(rootUri);
+        if (this.disposed || config.enabled===this.config.enabled) { return; }
+        await this.activate(rootUri);
     }
 
     private startImportTimer() {
@@ -384,9 +404,9 @@ export class AgentReviewManager implements vscode.Disposable {
         const replicaSettingsWatcher = vscode.workspace.createFileSystemWatcher(`**/${REPLICA_SETTINGS_FILE}`);
         return [
             replicaSettingsWatcher,
-            replicaSettingsWatcher.onDidChange(uri => this.onReplicaSettingsChanged(uri)),
-            replicaSettingsWatcher.onDidCreate(uri => this.onReplicaSettingsChanged(uri)),
-            replicaSettingsWatcher.onDidDelete(uri => this.onReplicaSettingsChanged(uri)),
+            replicaSettingsWatcher.onDidChange(uri => void this.onReplicaSettingsChanged(uri)),
+            replicaSettingsWatcher.onDidCreate(uri => void this.onReplicaSettingsChanged(uri)),
+            replicaSettingsWatcher.onDidDelete(uri => void this.onReplicaSettingsChanged(uri)),
             ...this.saveClassifier.triggers,
             ...this.proposalStore.triggers,
             ...this.editorProvider.triggers,

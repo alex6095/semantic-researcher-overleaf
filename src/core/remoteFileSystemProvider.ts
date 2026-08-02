@@ -187,6 +187,20 @@ export class VirtualFileSystem extends vscode.Disposable {
     private disposed = false;
     private restorePersistedSCMsOnManagerCreation = true;
     private static readonly documentAppliedTimeoutMs = 5000;
+    private static readonly maxInDoubtSenderVersions = 8;
+    // Real pauses between reconnect attempts: without them a two second blip
+    // burns the whole 3-strike budget in milliseconds and pops a modal, while a
+    // failing project join hammers the server with no pause at all.
+    private static readonly reconnectBackoffMs = [1000, 2000, 4000];
+    // The last text each document was known to be synchronized with, lifted out
+    // of the entity graph before anything invalidates it. Lazily created
+    // because most sessions never need one.
+    private documentMergeBaselines?: Map<string, string>;
+    private pendingRejoinSnapshot?: {paths: Set<string>, cachedDocPaths: string[]};
+    // The outputs folder is a client-side construct, so it has to be rebuilt
+    // after a rejoin: a fresh joinProject payload never contains it.
+    private lastOutputs?: Array<OutputFileEntity>;
+    private sessionRecoveryPrompted = false;
 
     // Connection state is useful for SCM and UI layers: we don't want to trust
     // "selected" as a proxy for "live".
@@ -211,7 +225,13 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.disposed = true;
             this.root = undefined;
             this.initializing = undefined;
-            this._connectionState = 'disconnected';
+            // Drive the state machine on the way out. Assigning the state
+            // without firing left the status bar advertising "connected
+            // (changes sync live)" for a project that no longer exists.
+            if (this._connectionState!=='disconnected') {
+                this._connectionState = 'disconnected';
+                this._onDidChangeConnectionEmitter.fire('disconnected');
+            }
             // dispose all triggers of clientManager
             this.clientManagerItem?.triggers.forEach((trigger) => trigger.dispose());
             this.clientManagerItem = undefined;
@@ -227,6 +247,11 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.pendingDocumentWrites.clear();
             this.documentWriteQueues.clear();
             this.documentCollaboratorRevisions.clear();
+            // An in-doubt barrier is only ever consumed by a sender-ack from
+            // the socket that produced it, so keeping it past disposal just
+            // leaks and, on a reused entity id, steals a later write's ack.
+            this.documentInDoubtSenderVersions.clear();
+            this.documentMergeBaselines?.clear();
             // disconnect socketio
             try {
                 this.socket.dispose();
@@ -256,6 +281,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.api = res.api;
             this.socket = res.socket;
             this.sessionIdentity = res.identity;
+            this.api.setSessionExpiryHandler((error) => this.onSessionExpired(error));
         } else {
             throw new Error( vscode.l10n.t('Cannot init SocketIOAPI for {serverName}', {serverName}) );
         }
@@ -283,6 +309,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         console.log(`Reconnecting Overleaf project ${this.origin.toString()}: ${reason}`);
         this.setConnectionState('reconnecting');
         this.retryConnection = Math.max(this.retryConnection, 1);
+        this.captureRejoinState();
         this.root = undefined;
         this.initializing = this.initializingPromise;
         return this.initializing;
@@ -314,9 +341,41 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.sessionIdentity,
             );
         } catch (error) {
+            // Disposal alone is invisible: it used to leave the status bar
+            // claiming a live sync while every later read threw. Tell the user
+            // how to recover before tearing the project down.
+            this.promptSessionRecovery(vscode.l10n.t(
+                'Overleaf session for {serverName} is no longer available. Please log in again.',
+                {serverName: this.serverName},
+            ));
             this.dispose();
             throw error;
         }
+    }
+
+    private onSessionExpired(error: Error) {
+        if (this.disposed) { return; }
+        // The websocket keeps serving reads after the HTTP session dies, so
+        // without this the project silently degrades into a one-way sync:
+        // mkdir/upload/rename/remove/compile all fail forever with a generic
+        // error and no re-login is ever offered.
+        console.warn(`Overleaf session expired for ${this.origin.toString()}:`, error);
+        this.setConnectionState('disconnected');
+        this.promptSessionRecovery(vscode.l10n.t(
+            'Overleaf session expired: {serverName}. Changes can no longer be saved until you log in again.',
+            {serverName: this.serverName},
+        ));
+    }
+
+    private promptSessionRecovery(message: string) {
+        if (this.sessionRecoveryPrompted) { return; }
+        this.sessionRecoveryPrompted = true;
+        const openLogin = vscode.l10n.t('Open Login');
+        vscode.window.showErrorMessage(message, openLogin).then((choice) => {
+            if (choice===openLogin) {
+                vscode.commands.executeCommand(`workbench.view.extension.${ROOT_NAME}`);
+            }
+        }, () => undefined);
     }
 
     private setConnectionState(next: VFSConnectionState) {
@@ -406,6 +465,97 @@ export class VirtualFileSystem extends vscode.Disposable {
         return (error as {retryable?: boolean})?.retryable!==false;
     }
 
+    private async backoffBeforeRetry(): Promise<void> {
+        const backoffs = VirtualFileSystem.reconnectBackoffMs;
+        const delay = backoffs[Math.min(Math.max(this.retryConnection, 1), backoffs.length)-1];
+        await new Promise(resolve => setTimeout(resolve, delay));
+    }
+
+    /**
+     * A rejoin replaces every entity object in the project tree, so everything
+     * the write and notification paths still need has to be lifted out of it
+     * first.
+     */
+    private captureRejoinState() {
+        if (this.root===undefined) { return; }
+        const paths = new Set<string>();
+        const cachedDocPaths: string[] = [];
+        for (const {entity, path} of this.walk(() => true)) {
+            if (path==='/') { continue; }
+            paths.add(path);
+            if (entity._type!=='doc') { continue; }
+            const doc = entity as DocumentEntity;
+            if (doc.localCache!==undefined || doc.remoteCache!==undefined) {
+                cachedDocPaths.push(path);
+            }
+            this.preserveDocumentBaseline(doc);
+        }
+        this.pendingRejoinSnapshot = {paths, cachedDocPaths};
+        // An in-doubt barrier can only be consumed by a sender-ack from the
+        // socket that produced it, which can never arrive across a rejoin. A
+        // surviving barrier forces full joinDoc reconciliation on every future
+        // save of that document and steals the ack of the next write.
+        this.documentInDoubtSenderVersions.clear();
+    }
+
+    private preserveDocumentBaseline(doc: DocumentEntity) {
+        // The merge base is the last text the local side is known to have been
+        // synchronized with. Losing it makes the next write diff the freshly
+        // reloaded server text against itself: that empty patch turns the local
+        // text into a silent winner which deletes every collaborator edit made
+        // while we were away.
+        const baseline = doc.localCache ?? doc.remoteCache;
+        if (baseline===undefined) { return; }
+        const baselines = this.documentMergeBaselines ?? new Map<string, string>();
+        this.documentMergeBaselines = baselines;
+        // Keep the oldest surviving base: a newer one would let a local buffer
+        // that predates it silently revert collaborator work.
+        if (!baselines.has(doc._id)) {
+            baselines.set(doc._id, baseline);
+        }
+    }
+
+    private preservedBaselineContent(doc: DocumentEntity): Uint8Array | undefined {
+        const baseline = this.documentMergeBaselines?.get(doc._id);
+        return baseline===undefined ? undefined : new TextEncoder().encode(baseline);
+    }
+
+    private clearPreservedBaseline(docId: string) {
+        this.documentMergeBaselines?.delete(docId);
+    }
+
+    private notifyRejoinChanges() {
+        const snapshot = this.pendingRejoinSnapshot;
+        this.pendingRejoinSnapshot = undefined;
+        if (snapshot===undefined) { return; }
+
+        const currentPaths = new Set<string>();
+        this.walk(() => true).forEach(({path}) => {
+            if (path!=='/') { currentPaths.add(path); }
+        });
+        const events: vscode.FileChangeEvent[] = [];
+        for (const path of snapshot.paths) {
+            if (!currentPaths.has(path)) {
+                events.push({type: vscode.FileChangeType.Deleted, uri: this.pathToUri(path)});
+            }
+        }
+        for (const path of currentPaths) {
+            if (!snapshot.paths.has(path)) {
+                events.push({type: vscode.FileChangeType.Created, uri: this.pathToUri(path)});
+            }
+        }
+        // Every cached revision died with the old entity graph, so whatever the
+        // user may still be looking at has to be re-read from the server.
+        for (const path of snapshot.cachedDocPaths) {
+            if (currentPaths.has(path)) {
+                events.push({type: vscode.FileChangeType.Changed, uri: this.pathToUri(path)});
+            }
+        }
+        if (events.length>0) {
+            this.notify(events);
+        }
+    }
+
     private get initializingPromise(): Promise<ProjectEntity> {
         if (this.disposed) {
             throw vscode.FileSystemError.Unavailable(`Overleaf project is disposed: ${this.origin.toString()}`);
@@ -433,6 +583,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
 
         this.remoteWatch();
+        this.captureRejoinState();
         this.root = undefined;
         return this.socket.joinProject(this.projectId).then(async (project) => {
             this.requireCurrentSession();
@@ -441,14 +592,24 @@ export class VirtualFileSystem extends vscode.Disposable {
             this.requireCurrentSession();
             const settingsResponse = await this.api.getProjectSettings(identity, this.projectId);
             this.requireCurrentSession();
-            project.settings = settingsResponse.settings!;
+            if (settingsResponse.settings===undefined) {
+                // Publishing a root without settings leaves every settings
+                // reader throwing later on; failing the join keeps the retry
+                // budget and the session-expiry prompt in charge instead.
+                throw new Error(
+                    settingsResponse.message ?? 'Could not load Overleaf project settings.',
+                );
+            }
+            project.settings = settingsResponse.settings;
             this.root = project;
             this.retryConnection = 0;
             this.lastConnectionError = undefined;
+            this.restoreOutputsEntity();
+            this.notifyRejoinChanges();
             this.setConnectionState('connected');
             this.ensureActiveManagers();
             return project;
-        }).catch((err) => {
+        }).catch(async (err) => {
             if (this.disposed) {
                 this.initializing = undefined;
                 throw err;
@@ -469,6 +630,14 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.retryConnection = 0;
             } else {
                 this.retryConnection += 1;
+                // Without a pause the recursion is a hot loop: a two second
+                // outage exhausts the whole budget instantly and a repeatedly
+                // failing join hammers the server.
+                await this.backoffBeforeRetry();
+                if (this.disposed) {
+                    this.initializing = undefined;
+                    throw err;
+                }
             }
             return this.initializingPromise;
         });
@@ -505,7 +674,10 @@ export class VirtualFileSystem extends vscode.Disposable {
         // resolve file
         const [fileEntity, fileType, fileId] = (() => {
             for (const _type of Object.keys(FolderKeys)) {
-                let entity = parentFolder[ FolderKeys[_type] ]?.find((entity) => entity.name === fileName);
+                // The four entity arrays have different element types, so the
+                // union of their `find` overloads is not callable as such.
+                let entity = (parentFolder[ FolderKeys[_type] ] as Array<any>|undefined)
+                    ?.find((entity) => entity.name === fileName);
                 if (!fileName && _type==='folder') { entity = parentFolder; }
                 if (entity) {
                     return [entity, _type as FileType, entity._id];
@@ -536,7 +708,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             for (const _type of Object.keys(FolderKeys)) {
                 const key = FolderKeys[_type];
                 if (key==='folders') { continue; }
-                const entity = root[key]?.find((entity) => entity._id === entityId);
+                const entity = (root[key] as Array<any>|undefined)
+                    ?.find((entity) => entity._id === entityId);
                 if (entity) {
                     return {parentFolder: root, fileType: _type as FileType, fileEntity: entity, path:path+entity.name};
                 }
@@ -648,9 +821,12 @@ export class VirtualFileSystem extends vscode.Disposable {
             },
             onConnectionAccepted: (publicId:string) => {
                 if (!this.acceptRemoteEvent()) { return; }
-                this.retryConnection = 0;
+                // A transport handshake is not a project join. Resetting the
+                // retry budget here made a handshake that always succeeds and a
+                // join that always fails recurse forever with zero backoff, and
+                // announcing 'connected' advertised a project whose tree is
+                // still undefined. Both now wait for joinProject to succeed.
                 this.publicId = publicId;
-                this.setConnectionState('connected');
             },
             onFileCreated: (parentFolderId:string, type:FileType, entity:FileEntity) => {
                 if (!this.acceptRemoteEvent()) { return; }
@@ -887,6 +1063,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                 );
                 if (!openDocument || !openDocument.isDirty) {
                     doc.localCache = content;
+                    // Local and remote agree again, so a base preserved by an
+                    // earlier invalidation is obsolete.
+                    this.clearPreservedBaseline(doc._id);
                 }
                 doc.remoteCache = content;
                 this.isDirty = true;
@@ -895,6 +1074,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 // A sender acknowledgement without its pending write context
                 // proves that the version advanced, but not what text the
                 // server accepted. Force the next read to rejoin.
+                this.preserveDocumentBaseline(doc);
                 doc.remoteCache = undefined;
                 doc.localCache = undefined;
                 this.isDirty = true;
@@ -904,6 +1084,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }]);
             }
         } else {
+            this.preserveDocumentBaseline(doc);
             doc.remoteCache = undefined;
             doc.localCache = undefined;
             // A missed or out-of-order OT update invalidates the cache, but
@@ -958,10 +1139,28 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    private documentRefreshTargets(doc: DocumentEntity): DocumentEntity[] {
+        const live = this._resolveById(doc._id)?.fileEntity as DocumentEntity | undefined;
+        // A rejoin swaps the whole entity graph, so the caller may be holding a
+        // document that is no longer in the tree. Seed both, otherwise one of
+        // them keeps serving a pre-outage revision.
+        return live!==undefined && live!==doc ? [doc, live] : [doc];
+    }
+
     private async refreshDocumentFromServer(
         uri: vscode.Uri,
         doc: DocumentEntity,
     ): Promise<Uint8Array> {
+        // `joinDoc` is only answered by a socket that has already joined the
+        // project. Dispatching it into a socket that is still (re)joining never
+        // gets an ack, so it burns three 20s timeouts and then fails the user's
+        // save with the caches nulled.
+        if (this.initializing) {
+            await this.initializing;
+        } else if (this._connectionState==='disconnected') {
+            await this.reconnect(`join document ${uri.path}`);
+        }
+        this.requireCurrentSession();
         for (let attempt = 0; attempt<3; attempt++) {
             const collaboratorRevision = this.documentCollaboratorRevisions.get(doc._id) ?? 0;
             const response = await this.socket.joinDoc(doc._id);
@@ -976,9 +1175,11 @@ export class VirtualFileSystem extends vscode.Disposable {
                 continue;
             }
             const content = response.docLines.join('\n');
-            doc.version = response.version;
-            doc.remoteCache = content;
-            doc.localCache = content;
+            for (const target of this.documentRefreshTargets(doc)) {
+                target.version = response.version;
+                target.remoteCache = content;
+                target.localCache = content;
+            }
             this.isDirty = true;
             return new TextEncoder().encode(content);
         }
@@ -1281,8 +1482,13 @@ export class VirtualFileSystem extends vscode.Disposable {
 
         const dmp = new DiffMatchPatch();
         let mergeRes: string;
-        if (remoteBaseline!==undefined) {
-            const baselineText = decodeUtf8Text(remoteBaseline);
+        // A base preserved across cache invalidation outranks the current
+        // remote text: after a rejoin `remoteCache` is the *new* server text,
+        // and diffing it against itself would make the local text a silent
+        // winner that deletes every collaborator edit made during the outage.
+        const mergeBaseline = remoteBaseline ?? this.preservedBaselineContent(doc);
+        if (mergeBaseline!==undefined) {
+            const baselineText = decodeUtf8Text(mergeBaseline);
             if (baselineText===undefined) {
                 throw new Error(`Remote document baseline is not mergeable UTF-8 for ${uri.toString()}`);
             }
@@ -1290,7 +1496,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 mergeRes = desiredText;
             } else {
                 const merged = mergeUtf8Text(
-                    remoteBaseline,
+                    mergeBaseline,
                     content,
                     new TextEncoder().encode(doc.remoteCache),
                 );
@@ -1309,6 +1515,8 @@ export class VirtualFileSystem extends vscode.Disposable {
         let writtenContent = new TextEncoder().encode(mergeRes);
         if (mergeRes===doc.remoteCache) {
             doc.localCache = mergeRes;
+            // Local and remote are provably identical again.
+            this.clearPreservedBaseline(doc._id);
             return writtenContent;
         }
 
@@ -1348,7 +1556,11 @@ export class VirtualFileSystem extends vscode.Disposable {
                             .filter(x => x) as any;
             })(),
         };
-        this.isDirty = (update.op && update.op.length) ? true : false;
+        if (update.op && update.op.length) {
+            // Project-wide flag: an empty diff for *this* document says nothing
+            // about the others, so it must never clear it.
+            this.isDirty = true;
+        }
 
         let resolveApplied!: (version?: number) => void;
         const pending: PendingDocumentWrite = {
@@ -1407,6 +1619,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             if (canUseSubmittedResult) {
                 doc.localCache = mergeRes;
                 doc.remoteCache = mergeRes;
+                // The server accepted exactly this text, so it is the new base.
+                this.clearPreservedBaseline(doc._id);
             } else {
                 let authoritative: Uint8Array;
                 try {
@@ -1436,6 +1650,9 @@ export class VirtualFileSystem extends vscode.Disposable {
                         `Overleaf could not prove whether the document update for ${uri.path} was applied.`,
                     );
                 }
+                // The authoritative revision is proven to carry the desired
+                // change, so the caches it just seeded are the new base.
+                this.clearPreservedBaseline(doc._id);
                 writtenContent = authoritative;
             }
         } finally {
@@ -1446,6 +1663,11 @@ export class VirtualFileSystem extends vscode.Disposable {
             ) {
                 const barriers = this.documentInDoubtSenderVersions.get(doc._id) ?? [];
                 barriers.push(submittedVersion);
+                // Bounded: a barrier whose sender-ack never arrives would
+                // otherwise grow for the whole session.
+                if (barriers.length>VirtualFileSystem.maxInDoubtSenderVersions) {
+                    barriers.splice(0, barriers.length-VirtualFileSystem.maxInDoubtSenderVersions);
+                }
                 this.documentInDoubtSenderVersions.set(doc._id, barriers);
             }
             if (this.pendingDocumentWrites.get(doc._id)===pending) {
@@ -1526,6 +1748,11 @@ export class VirtualFileSystem extends vscode.Disposable {
                 await this.openFile(uri);
             }
             const effectiveBaseline = remoteBaseline
+                // A base preserved across a rejoin (or a missed OT update) must
+                // win over `remoteCache`: that cache was just reloaded from the
+                // server, so using it as the baseline collapses the merge and
+                // silently overwrites whatever changed while we were away.
+                ?? this.preservedBaselineContent(doc)
                 ?? (doc.remoteCache===undefined
                     ? undefined
                     : new TextEncoder().encode(doc.remoteCache));
@@ -1701,7 +1928,6 @@ export class VirtualFileSystem extends vscode.Disposable {
 
     async compile(force:boolean=false, draft:boolean=false, stopOnFirstError:boolean=false, rootDocId?:string) {
         if (force || (this.root && this.isDirty)) {
-            this.isDirty = false;
             let needCacheClearFirst = false;
             try{
                 await this.resolve(this.pathToUri(OUTPUT_FOLDER_NAME, "output.log"));
@@ -1744,7 +1970,25 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.compileGroup = res.compile.compileGroup;
                 this.clsiServerId = res.compile.clsiServerId;
                 this.pdfDownloadDomain = res.compile.pdfDownloadDomain;
-                this.updateOutputs(res.compile.outputFiles);
+                try {
+                    // Awaited: an unhandled rejection here used to leave this
+                    // call returning true while the caller went on to parse the
+                    // *previous* build's output.log and refresh the previous
+                    // output.pdf.
+                    await this.updateOutputs(res.compile.outputFiles);
+                } catch (error) {
+                    const message = error instanceof Error ? error.message : String(error);
+                    console.error('Compile succeeded but its outputs could not be published.', error);
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [compile outputs rejected] ${message}`,
+                    );
+                    vscode.window.showErrorMessage(message);
+                    return false;
+                }
+                // Only a compile the server actually accepted may clear the
+                // flag: clearing it up front permanently lost it whenever the
+                // request threw.
+                this.isDirty = false;
                 return true;
             } else {
                 const details = {
@@ -1780,36 +2024,59 @@ export class VirtualFileSystem extends vscode.Disposable {
     }
 
     async updateOutputs(outputs: Array<OutputFileEntity>) {
-        if (this.root) {
-            // update output buildId
-            // '/project/65dbfff719ad65b54b9eaed4/user/65094b5fa537faaba0bec01f/build/19620231e54-5372f67292889500/output/output.aux' --> 19620231e54-5372f67292889500'
-            this.outputBuildId = outputs[0].url.match(/\/build\/([^\/]+)/)?.[1];
+        if (!outputs?.length || !outputs[0]?.url) {
+            // A "successful" compile without output files cannot refresh the
+            // output folder. Silently keeping the previous build would make the
+            // log and PDF views present a stale result as if it were this one.
+            throw new Error(
+                'Overleaf reported a successful compile without any output files.',
+            );
+        }
+        // update output buildId
+        // '/project/65dbfff719ad65b54b9eaed4/user/65094b5fa537faaba0bec01f/build/19620231e54-5372f67292889500/output/output.aux' --> 19620231e54-5372f67292889500'
+        this.outputBuildId = outputs[0].url.match(/\/build\/([^\/]+)/)?.[1];
+        this.lastOutputs = outputs.map((file) => {
+            file._id = __OUTPUTS_ID;
+            file.name=file.path;
+            file.readonly=true;
+            return file;
+        });
+        this.installOutputsEntity(this.lastOutputs);
+    }
 
-            const rootFolder = this.root.rootFolder[0];
-            if (this.removeEntityById(rootFolder, 'folder', __OUTPUTS_ID)) {
-                this.notify([
-                    {type:vscode.FileChangeType.Deleted, uri:this.pathToUri(OUTPUT_FOLDER_NAME)}
-                ]);
-            }
+    private installOutputsEntity(outputs: Array<OutputFileEntity>) {
+        const rootFolder = this.root?.rootFolder[0];
+        if (!rootFolder) { return; }
 
-            this.insertEntity(rootFolder, 'folder', {
-                _id: __OUTPUTS_ID,
-                name: OUTPUT_FOLDER_NAME,
-                readonly: true,
-                docs: [], fileRefs: [], folders:[],
-                outputs: outputs.map((file) => {
-                    file._id = __OUTPUTS_ID;
-                    file.name=file.path;
-                    file.readonly=true;
-                    return file;
-                })
-            } as FolderEntity);
+        if (this.removeEntityById(rootFolder, 'folder', __OUTPUTS_ID)) {
             this.notify([
-                {type:vscode.FileChangeType.Created, uri:this.pathToUri(OUTPUT_FOLDER_NAME)},
-                ...(outputs.map((file) => {
-                    return {type:vscode.FileChangeType.Changed, uri:this.pathToUri(OUTPUT_FOLDER_NAME, file.path)};
-                }))
+                {type:vscode.FileChangeType.Deleted, uri:this.pathToUri(OUTPUT_FOLDER_NAME)}
             ]);
+        }
+
+        this.insertEntity(rootFolder, 'folder', {
+            _id: __OUTPUTS_ID,
+            name: OUTPUT_FOLDER_NAME,
+            readonly: true,
+            docs: [], fileRefs: [], folders:[],
+            outputs,
+        } as FolderEntity);
+        this.notify([
+            {type:vscode.FileChangeType.Created, uri:this.pathToUri(OUTPUT_FOLDER_NAME)},
+            ...(outputs.map((file) => {
+                return {type:vscode.FileChangeType.Changed, uri:this.pathToUri(OUTPUT_FOLDER_NAME, file.path)};
+            }))
+        ]);
+    }
+
+    private restoreOutputsEntity() {
+        // The outputs folder is a client-side construct that a fresh
+        // joinProject payload never carries. Without rebuilding it, a socket
+        // drop during a compile makes `output/output.log` unresolvable, so a
+        // successful compile is reported as "Compile Failed" and an open PDF
+        // tab can no longer resolve output.pdf.
+        if (this.lastOutputs?.length) {
+            this.installOutputsEntity(this.lastOutputs);
         }
     }
 

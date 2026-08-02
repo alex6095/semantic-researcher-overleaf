@@ -5,8 +5,25 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { CompileManager } from '../../compile/compileManager';
 import { RemoteFileSystemProvider } from '../../core/remoteFileSystemProvider';
+import { EventBus } from '../../utils/eventBus';
 
 suite('Compile save UX', () => {
+    test('constructing multiple compile managers does not accumulate EventBus listeners', () => {
+        const emitter = (EventBus as any)._eventEmitter;
+        const before = emitter.listenerCount('pdfWillOpenEvent');
+        const managers = Array.from({length: 5}, () => new CompileManager({
+            prefetch: async () => ({}),
+        } as unknown as RemoteFileSystemProvider));
+        try {
+            const after = emitter.listenerCount('pdfWillOpenEvent');
+            // One process-wide subscription tracks PDF panels; per-instance
+            // registration leaked a listener for every constructed manager.
+            assert.ok(after - before <= 1, `listener count grew from ${before} to ${after}`);
+        } finally {
+            managers.forEach(manager => manager.status.dispose());
+        }
+    });
+
     test('manual Compile leaves unsaved editor buffers untouched', async () => {
         const origin = vscode.Uri.parse(
             'semantic-researcher-overleaf://www.overleaf.com/Compile%20UX?user=user-1&project=project-1',
@@ -329,6 +346,36 @@ suite('Compile save UX', () => {
             assert.strictEqual(hasError, false);
             // The empty first download is retried once before giving up.
             assert.strictEqual(openFileCalls, 2);
+        } finally {
+            manager.status.dispose();
+        }
+    });
+
+    test('LaTeX error raised inside a package still fails the compile', async () => {
+        const origin = vscode.Uri.parse(
+            'semantic-researcher-overleaf://www.overleaf.com/Compile%20UX?user=user-1&project=project-1',
+        );
+        // The error is attributed to an absolute TeX Live path, so no editor
+        // diagnostic can be attached — but LaTeX still emitted a PDF and the
+        // document is broken, so the compile must not be reported as success.
+        const packageErrorLog = [
+            'This is pdfTeX, Version 3.141592653 (TeX Live 2025)',
+            '(/usr/local/texlive/2025/texmf-dist/tex/latex/base/article.cls',
+            '! Undefined control sequence.',
+            'l.42 \\brokenmacro',
+            ')',
+            'Output written on output.pdf (1 page, 1234 bytes).',
+        ].join('\n');
+        const fakeVfs = {
+            pathToUri: (...pathParts: string[]) => vscode.Uri.joinPath(origin, ...pathParts),
+            openFile: async () => Buffer.from(packageErrorLog),
+        };
+        const manager = new CompileManager({
+            prefetch: async () => fakeVfs,
+        } as unknown as RemoteFileSystemProvider);
+        try {
+            const hasError = await (manager as any).diagnosticProvider.updateDiagnostics(origin);
+            assert.strictEqual(hasError, true);
         } finally {
             manager.status.dispose();
         }

@@ -89,6 +89,21 @@ export class SocketIOAPI {
     private socket?: any;
     private emit: any;
     private initializedScheme?: ConnectionScheme;
+    // A torn down (or server-dropped) socket is still a live object reference,
+    // so liveness has to be tracked explicitly: otherwise `needsReinit` keeps
+    // reporting a dead transport as usable and every emit waits for an ack
+    // that can never arrive.
+    private socketDead = false;
+    private socketGeneration = 0;
+    private announcedDisconnectGeneration?: number;
+    private suppressDisconnectNotification = false;
+    // `init()` builds a brand new raw socket. Listeners registered by the VFS,
+    // collaboration and chat layers are bound to the discarded one, so they are
+    // kept here and re-armed on every new socket.
+    private socketListeners: Array<{event: string, listener: (...args:any[]) => void}> = [];
+    // The v2 `joinProjectResponse` belongs to exactly one socket; the record
+    // must never outlive it.
+    private recordGeneration?: number;
 
     constructor(private url:string,
                 private readonly api:BaseAPI,
@@ -99,9 +114,12 @@ export class SocketIOAPI {
     }
 
     init() {
-        this.disconnectSocket();
+        // This teardown *is* the reconnect: announcing it would make the VFS
+        // restart the very initialization chain that called us.
+        this.disconnectSocket({notify: false});
         this.socketErrorHandlers.clear();
         this.recordErrorHandler = undefined;
+        this.socketGeneration += 1;
         // connect
         switch(this.scheme) {
             case 'Alt':
@@ -118,6 +136,7 @@ export class SocketIOAPI {
                 break;
         }
         this.initializedScheme = this.scheme;
+        this.socketDead = false;
         // create emit
         (this.socket.emit)[require('util').promisify.custom] = (event:string, ...args:any[]) => {
             let timeout: NodeJS.Timeout;
@@ -140,7 +159,7 @@ export class SocketIOAPI {
         this.emit = require('util').promisify(this.socket.emit).bind(this.socket);
         // resume handlers
         this.initInternalHandlers();
-        // this.resumeEventHandlers(this._handlers);
+        this.resumeSocketListeners();
     }
 
     private normalizeSocketError(error:any, retryable = true): SocketConnectionError {
@@ -167,14 +186,73 @@ export class SocketIOAPI {
             || error.message==='connect_failed';
     }
 
-    private disconnectSocket(options: {removeListeners?: boolean} = {removeListeners: true}) {
+    private disconnectSocket(options: {removeListeners?: boolean, notify?: boolean} = {}) {
+        // Hold on to the transport we are tearing down: notifying the VFS can
+        // synchronously build its replacement, and the cleanup below must never
+        // touch that new socket.
+        const socket = this.socket;
+        if (!socket) { return; }
+        const generation = this.socketGeneration;
+        const notify = options.notify!==false;
+        this.socketDead = true;
+        this.suppressDisconnectNotification = !notify;
         try {
-            if (options.removeListeners!==false) {
-                this.socket?.removeAllListeners?.();
-            }
-            this.socket?.disconnect();
+            // Disconnect before removing listeners: stripping them first
+            // swallows the `disconnect` event the VFS drives its reconnect
+            // state machine from.
+            socket.disconnect();
         } catch {
             // Ignore cleanup errors from already-closing transports.
+        }
+        this.suppressDisconnectNotification = false;
+        if (notify && this.socketGeneration===generation) {
+            // The transport may vanish without ever dispatching `disconnect`
+            // (already dead, or listeners removed by an earlier teardown), so
+            // the notification cannot depend on it being polite.
+            this.notifyDisconnected();
+        }
+        if (options.removeListeners!==false) {
+            try {
+                socket.removeAllListeners?.();
+            } catch {
+                // Ignore cleanup errors from already-closing transports.
+            }
+        }
+    }
+
+    private notifyDisconnected() {
+        if (this.suppressDisconnectNotification) { return; }
+        if (this.announcedDisconnectGeneration===this.socketGeneration) { return; }
+        this.announcedDisconnectGeneration = this.socketGeneration;
+        this.socketDead = true;
+        for (const handlers of [...this._handlers]) {
+            handlers.onDisconnected?.();
+        }
+    }
+
+    private addSocketListener(event: string, listener: (...args:any[]) => void) {
+        this.socketListeners.push({event, listener});
+        this.socket?.on(event, listener);
+    }
+
+    private removeSocketListener(event: string, listener: (...args:any[]) => void) {
+        const index = this.socketListeners.findIndex(
+            registered => registered.event===event && registered.listener===listener,
+        );
+        if (index!==-1) {
+            this.socketListeners.splice(index, 1);
+        }
+        this.socket?.removeListener?.(event, listener);
+        this.socket?.off?.(event, listener);
+    }
+
+    private resumeSocketListeners() {
+        // Without this, every non-VFS handler stays bound to the socket that
+        // `init()` just discarded: collaborator cursors, join/leave and chat go
+        // silently dead for the rest of the session after any reconnect or
+        // v1->v2 fallback.
+        for (const {event, listener} of this.socketListeners) {
+            this.socket?.on(event, listener);
         }
     }
 
@@ -206,12 +284,21 @@ export class SocketIOAPI {
         this.socket.on('connect', () => {
             console.log('SocketIOAPI: connected');
         });
+        // Registered internally rather than per-handler: this is the single
+        // place the connection state machine is driven from, so it must survive
+        // socket replacement and must fire exactly once per socket.
+        this.socket.on('disconnect', () => {
+            this.notifyDisconnected();
+        });
         this.socket.on('connect_failed', () => {
             const error = this.normalizeSocketError('connect_failed');
             if (this.socketErrorHandlers.size>0) {
                 console.log('SocketIOAPI: connect_failed');
                 this.notifySocketError(error);
             }
+            // The legacy client does not reconnect on its own, so a failed
+            // handshake leaves a permanently dead socket behind.
+            this.notifyDisconnected();
         });
         this.socket.on('forceDisconnect', (message:string, delay=10) => {
             console.log('SocketIOAPI: forceDisconnect', message);
@@ -232,6 +319,7 @@ export class SocketIOAPI {
         });
 
         if (this.scheme==='v2') {
+            this.recordGeneration = this.socketGeneration;
             this.record = new Promise((resolve, reject) => {
                 const socketErrorHandler: SocketErrorHandler = (error) => {
                     this.socketErrorHandlers.delete(socketErrorHandler);
@@ -298,7 +386,8 @@ export class SocketIOAPI {
     }
 
     dispose() {
-        this.disconnectSocket();
+        // The owner is going away, so a reconnect must not be attempted.
+        this.disconnectSocket({notify: false});
     }
 
     get handlers() {
@@ -310,7 +399,7 @@ export class SocketIOAPI {
     }
 
     get needsReinit() {
-        return this.initializedScheme!==this.scheme || !this.socket;
+        return this.initializedScheme!==this.scheme || !this.socket || this.socketDead;
     }
 
     toggleAlternativeConnectionScheme(url: string, updatedRecord?: ProjectEntity) {
@@ -332,11 +421,12 @@ export class SocketIOAPI {
         this._handlers.push(handlers);
         const disposables: vscode.Disposable[] = [];
         const addSocketListener = (event: string, listener: (...args:any[]) => void) => {
-            const socket = this.socket;
-            socket.on(event, listener);
+            // Registered through the registry, not against the socket captured
+            // at registration time: `init()` replaces the socket and the
+            // listener has to follow it.
+            this.addSocketListener(event, listener);
             disposables.push(new vscode.Disposable(() => {
-                socket.removeListener?.(event, listener);
-                socket.off?.(event, listener);
+                this.removeSocketListener(event, listener);
             }));
         };
         const addEventBusListener = <T extends keyof Events>(event: T, listener: (arg: Events[T]) => void) => {
@@ -376,9 +466,9 @@ export class SocketIOAPI {
                     });
                     break;
                 case handlers.onDisconnected:
-                    addSocketListener('disconnect', () => {
-                        handler();
-                    });
+                    // Dispatched by `notifyDisconnected` over `_handlers`: a
+                    // socket listener would be silent whenever the transport is
+                    // torn down without emitting `disconnect`.
                     break;
                 case handlers.onConnectionAccepted:
                     addSocketListener('connectionAccepted', (_:any, publicId:any) => {
@@ -450,6 +540,17 @@ export class SocketIOAPI {
      * @returns {Promise}
      */
     async joinProject(project_id:string): Promise<ProjectEntity> {
+        if (this.scheme==='v2' && (
+            this.record===undefined
+            || this.recordGeneration!==this.socketGeneration
+            || this.socketDead
+        )) {
+            // The v2 branch emits nothing and just awaits the cached record, so
+            // a record left over from a superseded socket would resolve the
+            // previous session's project tree and report a dead connection as
+            // live. Fail instead and let the caller re-init the socket.
+            throw new Error('socket session superseded');
+        }
         let timeout: NodeJS.Timeout;
         const timeoutPromise: Promise<ProjectEntity> = new Promise((_, reject) => {
             timeout = setTimeout(() => {

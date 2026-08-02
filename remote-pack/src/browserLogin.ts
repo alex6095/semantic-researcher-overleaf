@@ -54,12 +54,17 @@ export class BrowserLogin {
     static async login(context:vscode.ExtensionContext, request:BrowserLoginRequest): Promise<BrowserLoginResponse> {
         this.ensureGraphicalEnvironment();
 
-        const profileUri = vscode.Uri.joinPath(context.globalStorageUri, 'browser-login', encodeURIComponent(request.serverName));
+        const profileUri = vscode.Uri.joinPath(context.globalStorageUri, 'browser-login', this.profileDirectoryName(request.serverName));
         await vscode.workspace.fs.createDirectory(profileUri);
 
         const timeoutSeconds = request.timeoutSeconds ?? 600;
         const timeoutMs = timeoutSeconds * 1000;
-        const browserPath = request.browserPath || vscode.workspace.getConfiguration('semantic-researcher-overleaf-remote-pack').get('browserPath', '');
+        // The locally configured path must win: `request.browserPath` carries
+        // the remote window's machine-scoped setting, which names a browser
+        // that does not exist on this machine and would shadow the setting the
+        // failure message below asks the user to configure.
+        const configuredBrowserPath = vscode.workspace.getConfiguration('semantic-researcher-overleaf-remote-pack').get('browserPath', '');
+        const browserPath = configuredBrowserPath || request.browserPath || '';
         const candidates = this.getBrowserCandidates(browserPath);
 
         if (candidates.length===0) {
@@ -98,18 +103,47 @@ export class BrowserLogin {
             return { cookies };
         } finally {
             await browserContext.close().catch(() => undefined);
+            // The cookies have been handed to the caller; leaving a plain
+            // Chrome profile on disk keeps a full Overleaf session readable by
+            // anything that can read the file system.
+            await this.removeBrowserProfile(profileUri);
         }
     }
 
+    private static profileDirectoryName(serverName:string) {
+        // encodeURIComponent leaves '.' untouched, so a serverName of '..'
+        // would escape the browser-login directory.
+        const sanitized = serverName.replace(/[^A-Za-z0-9._-]/g, '_').slice(0, 100);
+        return /^\.+$/.test(sanitized) || sanitized.length===0 ? `_${sanitized}` : sanitized;
+    }
+
+    private static async removeBrowserProfile(profileUri:vscode.Uri) {
+        try {
+            await vscode.workspace.fs.delete(profileUri, { recursive: true, useTrash: false });
+        } catch (error) {
+            console.warn(`Could not delete the Overleaf browser login profile ${profileUri.fsPath}:`, error);
+        }
+    }
+
+    private static projectUrl(serverUrl:string) {
+        // `new URL('project', 'https://host/overleaf')` drops the '/overleaf'
+        // prefix, which sends self-hosted users to a 404 and then times out.
+        const base = new URL(serverUrl);
+        base.search = '';
+        base.hash = '';
+        base.pathname = base.pathname.endsWith('/') ? base.pathname : `${base.pathname}/`;
+        return new URL('project', base);
+    }
+
     private static async openProjectPage(page:BrowserPage, serverUrl:string) {
-        const projectUrl = new URL('project', serverUrl).href;
+        const projectUrl = this.projectUrl(serverUrl).href;
         await page.goto(projectUrl, { waitUntil: 'domcontentloaded' });
         await page.bringToFront().catch(() => undefined);
     }
 
     private static async waitForProjectCookies(browserContext:BrowserContext, page:BrowserPage, serverUrl:string, timeoutMs:number) {
         const deadline = Date.now() + timeoutMs;
-        const projectUrl = new URL('project', serverUrl);
+        const projectUrl = this.projectUrl(serverUrl);
 
         while (Date.now()<deadline) {
             if (page.isClosed()) {

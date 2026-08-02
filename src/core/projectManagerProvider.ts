@@ -466,7 +466,12 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
 
     private isMissingRemotePackError(error:unknown) {
         const message = error instanceof Error ? error.message : String(error);
-        return message.includes(remotePackLoginCommand) || message.includes('command') || message.includes('not found');
+        // VS Code reports an unregistered command as
+        // `command '<id>' not found`. Matching the bare word "command" (or a
+        // bare "not found") turns any failure raised by the installed Remote
+        // Pack — a cancelled login, a missing browser — into a bogus
+        // "Remote Pack not installed" prompt.
+        return message.includes(remotePackLoginCommand) && /not found/i.test(message);
     }
 
     loginServer(server: ServerItem) {
