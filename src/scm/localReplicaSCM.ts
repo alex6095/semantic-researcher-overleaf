@@ -31,6 +31,7 @@ import {
     LEGACY_REPLICA_SETTINGS_FILE,
     REPLICA_SETTINGS_DIR,
     REPLICA_SETTINGS_FILE,
+    getConfiguredValue,
 } from '../consts';
 import { stringifyOverleafUri } from '../utils/overleafUri';
 import { EventBus, Events } from '../utils/eventBus';
@@ -7990,11 +7991,23 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
             // sync the files
             const total = files.length;
-            for (let i=0; i<total; i++) {
-                const [_name, relPath] = files[i];
+            // Documents dominate initial-pull latency: each text file costs one
+            // joinDoc round-trip (binaries usually skip via the manifest
+            // fingerprint), so a sequential pull costs documents x RTT. The
+            // per-file work below touches only per-path state - baseCache keys,
+            // per-path sets, and the queued manifest publisher - so a bounded
+            // worker pool changes elapsed time, not outcomes.
+            const initialPullConcurrency = Math.max(1, Math.min(
+                16,
+                getConfiguredValue<number>('localReplica.initialPullConcurrency', 6),
+            ));
+            let initialPullCancelled = false;
+            let initialPullError: unknown;
+            const pullFileAtIndex = async (index: number): Promise<void> => {
+                const [_name, relPath] = files[index];
                 const vfsUri = this.vfs.pathToUri(relPath);
-                if (cancelled()) { return false; }
-                if (pathIsBlockedByDirectory(relPath)) { continue; }
+                if (cancelled()) { initialPullCancelled = true; return; }
+                if (pathIsBlockedByDirectory(relPath)) { return; }
                 progress.report({increment: 100/total, message: relPath});
                 //
                 const manifestEntry = this.syncManifest?.files[relPath];
@@ -8010,7 +8023,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         null,
                         generation,
                     );
-                    continue;
+                    return;
                 }
                 if (preserveExistingLocalFiles && manifestEntry && !existedLocallyAtStart) {
                     let remoteChanged = true;
@@ -8025,7 +8038,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             remoteChanged = contentDigest(remoteContent)!==manifestEntry.localDigest;
                         }
                     } catch (error) {
-                        if (cancelled()) { return false; }
+                        if (cancelled()) { initialPullCancelled = true; return; }
                         this.failedInitialPulls.add(relPath);
                         await this.markSyncConflict(
                             relPath,
@@ -8033,7 +8046,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             null,
                             generation,
                         );
-                        continue;
+                        return;
                     }
                     if (remoteChanged) {
                         await this.markSyncConflict(
@@ -8045,7 +8058,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     } else {
                         startupRemoteDeletePaths.add(relPath);
                     }
-                    continue;
+                    return;
                 }
                 if (
                     !resetLocalFilesToRemote
@@ -8054,7 +8067,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     getOutputChannel().appendLine(
                         `${new Date().toISOString()} [initial pull skip] ${relPath}: manifest fingerprint unchanged`,
                     );
-                    continue;
+                    return;
                 }
                 if (preserveExistingLocalFiles && existedLocallyAtStart) {
                     const preservedContent = await this.readLocalFileInSession(relPath, generation);
@@ -8087,7 +8100,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                         generation,
                                     );
                                 }
-                                continue;
+                                return;
                             }
                             const localChanged = manifestEntry===undefined
                                 || contentDigest(preservedContent)!==manifestEntry.localDigest;
@@ -8104,7 +8117,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     preservedContent,
                                     generation,
                                 );
-                                continue;
+                                return;
                             }
                             if (localChanged) {
                                 const remoteBaseContent = await this.pullRemoteFile(relPath, vfsUri, generation);
@@ -8113,27 +8126,27 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 this.setBypassCache(relPath, preservedContent);
                                 this.clearRemoteDelete(relPath);
                                 startupPushPaths.add(relPath);
-                                continue;
+                                return;
                             }
                             if (!remoteChanged) {
                                 this.baseCache[relPath] = preservedContent;
                                 this.seenLocalEntities.add(relPath);
                                 this.setBypassCache(relPath, preservedContent);
                                 this.clearRemoteDelete(relPath);
-                                continue;
+                                return;
                             }
                         } else {
                             let remoteContent: Uint8Array;
                             try {
                                 remoteContent = await this.pullRemoteFile(relPath, vfsUri, generation);
                             } catch (error) {
-                                if (cancelled()) { return false; }
+                                if (cancelled()) { initialPullCancelled = true; return; }
                                 getOutputChannel().appendLine(
                                     `${new Date().toISOString()} [initial pull failed] ${relPath}: ${formatUnknownError(error)}`,
                                 );
                                 this.failedInitialPulls.add(relPath);
                                 this.locallyDivergedPaths.add(relPath);
-                                continue;
+                                return;
                             }
 
                             const localDigest = contentDigest(preservedContent);
@@ -8164,7 +8177,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                         latestLocal.kind==='file' ? latestLocal.content : undefined,
                                         generation,
                                     );
-                                    continue;
+                                    return;
                                 }
                                 this.setBypassCache(relPath, remoteContent, 'pull');
                                 this.baseCache[relPath] = remoteContent;
@@ -8210,7 +8223,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                             latestLocal.kind==='file' ? latestLocal.content : undefined,
                                             generation,
                                         );
-                                        continue;
+                                        return;
                                     }
                                     this.setBypassCache(relPath, mergedContent, 'pull');
                                     this.baseCache[relPath] = remoteContent;
@@ -8223,7 +8236,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     }
                                 }
                             }
-                            continue;
+                            return;
                         }
                     }
                 }
@@ -8233,7 +8246,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 try {
                     remoteContent = await this.pullRemoteFile(relPath, vfsUri, generation);
                 } catch (error) {
-                    if (cancelled()) { return false; }
+                    if (cancelled()) { initialPullCancelled = true; return; }
                     // Even after Layer 1 retries the read failed. Record the
                     // failed path so the rest of the system refuses to act on
                     // any local event for it (the delete-guard layers and the
@@ -8243,7 +8256,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         `${new Date().toISOString()} [initial pull failed] ${relPath}: ${formatUnknownError(error)}`,
                     );
                     this.failedInitialPulls.add(relPath);
-                    continue;
+                    return;
                 }
                 const latestLocalState = await this.captureLocalPathRevision(relPath, generation);
                 if (latestLocalState.revision!==localStateBeforePull.revision) {
@@ -8265,7 +8278,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             latestLocalState.kind==='file' ? latestLocalState.content : undefined,
                             generation,
                         );
-                        continue;
+                        return;
                     }
                 } else {
                     const wroteRemoteContent = await this.writeLocalFileIfRevision(
@@ -8282,7 +8295,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             concurrentLocalState.kind==='file' ? concurrentLocalState.content : undefined,
                             generation,
                         );
-                        continue;
+                        return;
                     }
                     this.setBypassCache(relPath, remoteContent);
                 }
@@ -8290,7 +8303,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 this.seenLocalEntities.add(relPath);
                 this.clearRemoteDelete(relPath);
                 await this.recordSyncManifestEntry(relPath, vfsUri, remoteContent, generation);
-            }
+            };
+            let nextFileIndex = 0;
+            await Promise.all(Array.from(
+                {length: Math.max(1, Math.min(initialPullConcurrency, total))},
+                async () => {
+                    while (!initialPullCancelled && initialPullError===undefined) {
+                        const index = nextFileIndex;
+                        nextFileIndex += 1;
+                        if (index>=total) { return; }
+                        try {
+                            await pullFileAtIndex(index);
+                        } catch (error) {
+                            if (initialPullError===undefined) { initialPullError = error; }
+                            return;
+                        }
+                    }
+                },
+            ));
+            if (initialPullError!==undefined) { throw initialPullError; }
+            if (initialPullCancelled) { return false; }
 
             if (localSnapshot) {
                 for (const relPath of localSnapshot.files) {
