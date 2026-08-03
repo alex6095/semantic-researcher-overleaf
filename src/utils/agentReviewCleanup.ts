@@ -82,7 +82,13 @@ interface StorageOutcome {
 interface Findings {
     staleInstructionFiles: string[];
     preservedWorkLocations: string[];
-    helperStillLive: boolean;
+    /**
+     * Storage roots whose helper could not be disabled. This is the one state in
+     * which the leftover instructions are NOT inert, so it has to be able to
+     * raise the alarm on its own, without waiting for some other finding to
+     * carry it.
+     */
+    liveHelperLocations: string[];
 }
 
 function errorCode(error: unknown): string {
@@ -281,9 +287,10 @@ function buildReportMessage(findings: Findings): string {
             },
         ));
     }
-    if (findings.helperStillLive) {
+    if (findings.liveHelperLocations.length>0) {
         sentences.push(vscode.l10n.t(
-            'The helper itself could not be disabled yet; that will be retried the next time this window opens.',
+            'The helper at {location} could not be disabled yet, so those instructions may still be followed; that will be retried the next time this window opens.',
+            {location: findings.liveHelperLocations.join(', ')},
         ));
     }
     return sentences.join(' ');
@@ -301,7 +308,7 @@ function showReport(findings: Findings) {
 
     // Fire and forget: activation must not wait on a notification the user may
     // never dismiss.
-    const shown = findings.helperStillLive
+    const shown = findings.liveHelperLocations.length>0
         ? vscode.window.showWarningMessage(message, ...items)
         : vscode.window.showInformationMessage(message, ...items);
     void shown.then(choice => {
@@ -316,31 +323,56 @@ function showReport(findings: Findings) {
     }, () => undefined);
 }
 
+// Record entries are namespaced because one storage root can be worth reporting
+// for two different reasons at once, and being told about its drafts must not
+// silence the warning that its helper is still live.
+const reportKeys = {
+    instructions: (filePath: string) => `instructions:${filePath}`,
+    drafts: (location: string) => `drafts:${location}`,
+    helper: (location: string) => `helper:${location}`,
+};
+
 /**
  * Reports anything the user has not already been told about.
  *
- * The stored list is re-read and unioned immediately before writing, so the
- * record only ever grows. A concurrent window can at worst cost one duplicate
- * notification; no entry can be dropped from the record and then reported again
- * on every future activation, and no entry can be lost while unreported.
+ * WHAT THE RECORD GUARANTEES. It is a de-duplication hint, not a ledger.
+ * `Memento` exposes only `get`/`update` — no compare-and-swap, no transaction,
+ * no versioned write — so two windows that both read before either writes will
+ * lose one window's additions. Re-reading immediately before the write narrows
+ * that window; nothing available here can close it.
+ *
+ * The consequence is bounded and one-directional. An entry is only ever added
+ * after its notification has already been dispatched by the window that found
+ * it, and the notification is dispatched before the record is written, so both
+ * ways this can go wrong — a lost update between windows, or a crash between the
+ * two steps — cost at most a repeated notification. Neither can produce a
+ * finding the user is never told about, which is the only failure that matters.
  */
 async function report(context: vscode.ExtensionContext, findings: Findings) {
     const alreadyReported = new Set(readStringList(context.globalState, REPORTED_KEY));
     const fresh: Findings = {
-        helperStillLive: findings.helperStillLive,
-        staleInstructionFiles: findings.staleInstructionFiles.filter(entry => !alreadyReported.has(entry)),
-        preservedWorkLocations: findings.preservedWorkLocations.filter(entry => !alreadyReported.has(entry)),
+        staleInstructionFiles: findings.staleInstructionFiles
+            .filter(entry => !alreadyReported.has(reportKeys.instructions(entry))),
+        preservedWorkLocations: findings.preservedWorkLocations
+            .filter(entry => !alreadyReported.has(reportKeys.drafts(entry))),
+        liveHelperLocations: findings.liveHelperLocations
+            .filter(entry => !alreadyReported.has(reportKeys.helper(entry))),
     };
-    const newEntries = [...fresh.staleInstructionFiles, ...fresh.preservedWorkLocations];
+    const newEntries = [
+        ...fresh.staleInstructionFiles.map(reportKeys.instructions),
+        ...fresh.preservedWorkLocations.map(reportKeys.drafts),
+        ...fresh.liveHelperLocations.map(reportKeys.helper),
+    ];
     if (newEntries.length===0) {
         return;
     }
 
+    // Severity and the helper sentence follow the *current* state, not just what
+    // is new: a still-live helper keeps the notice a warning even when the only
+    // new finding is an instruction file.
+    showReport({...fresh, liveHelperLocations: findings.liveHelperLocations});
     const merged = new Set([...readStringList(context.globalState, REPORTED_KEY), ...newEntries]);
-    // Recorded before the notification is shown, so a crash between the two
-    // cannot turn one report into a report on every future activation.
     await context.globalState.update(REPORTED_KEY, [...merged]);
-    showReport(fresh);
 }
 
 /**
@@ -370,7 +402,7 @@ export async function cleanupRemovedAgentReview(
         const findings: Findings = {
             staleInstructionFiles: [],
             preservedWorkLocations: [],
-            helperStillLive: false,
+            liveHelperLocations: [],
         };
         const newlyInspected: string[] = [];
 
@@ -400,7 +432,7 @@ export async function cleanupRemovedAgentReview(
                 findings.preservedWorkLocations.push(legacyRoot);
             }
             if (!legacy.complete) {
-                findings.helperStillLive = true;
+                findings.liveHelperLocations.push(legacyRoot);
                 complete = false;
             }
 
@@ -418,7 +450,7 @@ export async function cleanupRemovedAgentReview(
             if (result.complete) {
                 await context.globalState.update(STORAGE_CLEANUP_KEY, CLEANUP_VERSION);
             } else {
-                findings.helperStillLive = true;
+                findings.liveHelperLocations.push(globalRoot);
             }
         }
 

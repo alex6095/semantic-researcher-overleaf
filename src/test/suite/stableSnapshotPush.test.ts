@@ -1002,6 +1002,110 @@ suite('Local Replica stable-snapshot push', function () {
         assert.strictEqual(await readText(remoteMain), 'v2');
     });
 
+    test('a transiently absent tracked directory is corroborated before the folder is removed', async () => {
+        const remoteRoot = await tempDir('sr-stable-dirdel-remote-');
+        const localRoot = await tempDir('sr-stable-dirdel-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteChapter = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const remoteInner = vscode.Uri.joinPath(remoteChapter, 'inner.tex');
+        const localChapter = vscode.Uri.joinPath(localRoot, 'chapter');
+        await writeText(remoteInner, 'chapter body');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        assert.strictEqual(internals.isTrackedDirectory('/chapter'), true);
+
+        // A tool removes the folder and puts it back. A recursive remote folder
+        // delete is the most destructive operation here, so it must corroborate.
+        await fs.rm(localChapter.fsPath, {recursive: true});
+        const originalCapture = internals.captureLocalPathRevision.bind(scm);
+        let captures = 0;
+        internals.captureLocalPathRevision = async (relPath: string, generation?: number) => {
+            if (relPath==='/chapter') {
+                captures += 1;
+                if (captures===2) {
+                    await writeText(vscode.Uri.joinPath(localChapter, 'inner.tex'), 'chapter body');
+                }
+            }
+            return originalCapture(relPath, generation);
+        };
+
+        let event: Events['scmSyncCompleteEvent'];
+        try {
+            event = await internals.applySync(
+                'push',
+                'delete',
+                '/chapter',
+                localChapter,
+                remoteChapter,
+            ) as Events['scmSyncCompleteEvent'];
+        } finally {
+            internals.captureLocalPathRevision = originalCapture;
+        }
+
+        assert.strictEqual(
+            await pathExists(remoteChapter),
+            true,
+            'the Overleaf folder was removed on a single absence observation',
+        );
+        assert.strictEqual(await readText(remoteInner), 'chapter body');
+        assert.ok(captures>=2, 'the directory delete must corroborate the absence');
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(event.error, LOCAL_SNAPSHOT_UNSTABLE);
+    });
+
+    test('the degraded-watcher scan needs two consecutive absences before deleting', async () => {
+        const remoteRoot = await tempDir('sr-stable-scan-remote-');
+        const localRoot = await tempDir('sr-stable-scan-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteOld = vscode.Uri.joinPath(remoteRoot, 'old.tex');
+        const localOld = vscode.Uri.joinPath(localRoot, 'old.tex');
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'anchor');
+        await writeText(remoteOld, 'to be deleted');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        const generation = internals.syncGeneration;
+
+        await fs.rm(localOld.fsPath);
+
+        // One listing is an inference, not a kernel unlink notification.
+        const firstScan = await internals.scanLocalChangesWithoutWatcher(generation) as number;
+        assert.strictEqual(firstScan, 0, 'a single absence must not drive any sync');
+        assert.ok(hasLine('[local scan absence unconfirmed] /old.tex'));
+        assert.strictEqual(
+            await pathExists(remoteOld),
+            true,
+            'Overleaf copy was deleted on one directory listing',
+        );
+        assert.strictEqual(internals.scannerAbsentPaths.has('/old.tex'), true);
+
+        // A second, fully independent observation corroborates it, and the
+        // genuine deletion still propagates.
+        const secondScan = await internals.scanLocalChangesWithoutWatcher(generation) as number;
+        assert.strictEqual(secondScan, 1);
+        assert.strictEqual(await pathExists(remoteOld), false, 'a real deletion must still propagate');
+
+        // A path that comes back before the second scan is never proposed again.
+        const localRestored = vscode.Uri.joinPath(localRoot, 'restored.tex');
+        await writeText(localRestored, 'restored body');
+        await internals.scanLocalChangesWithoutWatcher(generation);
+        await fs.rm(localRestored.fsPath);
+        await internals.scanLocalChangesWithoutWatcher(generation);
+        assert.strictEqual(internals.scannerAbsentPaths.has('/restored.tex'), true);
+        await writeText(localRestored, 'restored body');
+        await internals.scanLocalChangesWithoutWatcher(generation);
+        assert.strictEqual(
+            internals.scannerAbsentPaths.has('/restored.tex'),
+            false,
+            'a reappearance must void the recorded absence',
+        );
+    });
+
     test('a vanish during an already-classified update defers instead of deleting the remote', async () => {
         const remoteRoot = await tempDir('sr-stable-enoent-remote-');
         const localRoot = await tempDir('sr-stable-enoent-local-');

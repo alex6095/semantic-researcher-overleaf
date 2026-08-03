@@ -111,8 +111,20 @@ function createMemento(store: Map<string, unknown>) {
     } as unknown as vscode.Memento;
 }
 
-function createContextStub(globalStoragePath: string): ContextStub {
-    const globalState = new Map<string, unknown>();
+// The record namespaces its entries, because one storage root can be worth
+// reporting for two different reasons at once.
+const reportKeys = {
+    instructions: (filePath: string) => `instructions:${filePath}`,
+    drafts: (location: string) => `drafts:${location}`,
+    helper: (location: string) => `helper:${location}`,
+};
+
+function createContextStub(
+    globalStoragePath: string,
+    // Shared between two stubs to model two windows of the same installation.
+    sharedGlobalState = new Map<string, unknown>(),
+): ContextStub {
+    const globalState = sharedGlobalState;
     const workspaceState = new Map<string, unknown>();
     return {
         context: {
@@ -425,7 +437,11 @@ suite('Agent Review removal cleanup', () => {
         }
         assert.deepStrictEqual(
             storedList(globalState, REPORTED_KEY),
-            [agentsPath, claudePath, installed.metaRoot].sort(),
+            [
+                reportKeys.instructions(agentsPath),
+                reportKeys.instructions(claudePath),
+                reportKeys.drafts(installed.metaRoot),
+            ].sort(),
         );
     });
 
@@ -700,7 +716,11 @@ suite('Agent Review removal cleanup', () => {
         // The record grew; the first folder's entry was not replaced.
         assert.deepStrictEqual(
             storedList(globalState, REPORTED_KEY),
-            [firstAgents, laterClaude, legacyMeta].sort(),
+            [
+                reportKeys.instructions(firstAgents),
+                reportKeys.instructions(laterClaude),
+                reportKeys.drafts(legacyMeta),
+            ].sort(),
         );
 
         await cleanupRemovedAgentReview(context, [
@@ -710,14 +730,17 @@ suite('Agent Review removal cleanup', () => {
         assert.strictEqual(notifications.length, 2, 'a settled workspace reported again');
     });
 
-    test('merges the report record instead of overwriting another window\'s entries', async () => {
+    test('keeps an entry written between its own read and write of the report record', async () => {
+        // This is the interleaving the pre-write re-read covers. It is NOT proof
+        // of atomicity: `Memento` has no compare-and-swap, so two windows that
+        // both read before either writes still lose one side's additions. The
+        // test below pins down what that costs.
         const workspaceRoot = await tempDir('sr-overleaf-agent-review-concurrent-');
         const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
         const agentsPath = path.join(workspaceRoot, 'AGENTS.md');
         await writeFile(agentsPath, blockAbove(USER_PROSE));
         const {context, globalState} = createContextStub(globalStoragePath);
-        // Another window records its own finding between our read and our write.
-        const foreignEntry = '/other/window/CLAUDE.md';
+        const foreignEntry = reportKeys.instructions('/other/window/CLAUDE.md');
         let reads = 0;
         const realGet = context.globalState.get.bind(context.globalState);
         (context.globalState as any).get = (key: string, defaultValue?: unknown) => {
@@ -736,9 +759,102 @@ suite('Agent Review removal cleanup', () => {
         assert.strictEqual(notifications.length, 1);
         assert.deepStrictEqual(
             storedList(globalState, REPORTED_KEY),
-            [agentsPath, foreignEntry].sort(),
-            'the other window\'s entry was lost',
+            [reportKeys.instructions(agentsPath), foreignEntry].sort(),
+            'an entry that landed before the write was discarded',
         );
+    });
+
+    test('re-reports rather than dropping a finding when a record entry is lost', async () => {
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-lost-update-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const agentsPath = path.join(workspaceRoot, 'AGENTS.md');
+        await writeFile(agentsPath, blockAbove(USER_PROSE));
+        const sharedGlobalState = new Map<string, unknown>();
+        const first = createContextStub(globalStoragePath, sharedGlobalState);
+
+        await cleanupRemovedAgentReview(first.context, [vscode.Uri.file(workspaceRoot)]);
+        assert.strictEqual(notifications.length, 1);
+        assert.ok(notifications[0].includes(agentsPath));
+
+        // A concurrent window that read the record before this write, and wrote
+        // after it, drops our entry. That is unpreventable with `Memento`, so
+        // what matters is which way the loss falls.
+        const foreignEntry = reportKeys.instructions('/other/window/AGENTS.md');
+        sharedGlobalState.set(REPORTED_KEY, [foreignEntry]);
+
+        // Another window of the same installation opens the same folder.
+        const second = createContextStub(globalStoragePath, sharedGlobalState);
+        await cleanupRemovedAgentReview(second.context, [vscode.Uri.file(workspaceRoot)]);
+
+        // The cost is a repeat, never a finding the user is never told about.
+        assert.strictEqual(notifications.length, 2, 'the finding was silently dropped');
+        assert.ok(notifications[1].includes(agentsPath));
+        assert.deepStrictEqual(
+            storedList(sharedGlobalState, REPORTED_KEY),
+            [reportKeys.instructions(agentsPath), foreignEntry].sort(),
+        );
+    });
+
+    test('tells the user even if recording that it did so then fails', async () => {
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-record-fails-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const agentsPath = path.join(workspaceRoot, 'AGENTS.md');
+        await writeFile(agentsPath, blockAbove(USER_PROSE));
+        const {context, globalState} = createContextStub(globalStoragePath);
+        // Storage that commits the write and then dies. This is the ordering
+        // that decides the question: record-then-tell would have persisted
+        // "already reported" for a notification the user never saw.
+        const realUpdate = context.globalState.update.bind(context.globalState);
+        let alreadyFailed = false;
+        (context.globalState as any).update = async (key: string, value: unknown) => {
+            await realUpdate(key, value);
+            if (key===REPORTED_KEY && !alreadyFailed) {
+                alreadyFailed = true;
+                throw new Error('storage died immediately after the write');
+            }
+        };
+
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+
+        assert.strictEqual(notifications.length, 1, 'the finding was recorded but never shown');
+        assert.ok(notifications[0].includes(agentsPath));
+        assert.deepStrictEqual(
+            storedList(globalState, REPORTED_KEY),
+            [reportKeys.instructions(agentsPath)],
+        );
+    });
+
+    test('warns about a helper it could not disable even when nothing else is new', async () => {
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-live-helper-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const metaRoot = path.join(globalStoragePath, 'agent-review');
+        // No drafts, no proposals, and no instruction files anywhere: a live
+        // helper has to be able to raise the alarm entirely on its own, since it
+        // is the one state in which the leftover instructions are not inert.
+        await installAgentReviewStorage(metaRoot, workspaceRoot, {withWork: false});
+        const helperPath = path.join(metaRoot, 'bin', 'overleaf-agent-review');
+        const {context, globalState} = createContextStub(globalStoragePath);
+        failWritesUnder(path.join(metaRoot, 'bin'));
+
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+
+        assert.strictEqual(notifications.length, 0);
+        assert.strictEqual(warnings.length, 1, 'a live helper was never reported');
+        assert.ok(warnings[0].includes(metaRoot), `the warning does not name the helper: ${warnings[0]}`);
+        assert.ok(warnings[0].includes('could not be disabled yet'));
+        assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), undefined);
+
+        // The condition persists: retried, but not announced again.
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+        assert.strictEqual(warnings.length, 1, 'the same live helper was announced twice');
+
+        (fs as any).writeFile = realFs('writeFile');
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+
+        assert.ok(!(await readFile(helperPath)).includes('Submitted successfully'), 'the retry never ran');
+        assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), 1);
+        assert.strictEqual(warnings.length, 1, 'a resolved condition was announced again');
+        assert.strictEqual(notifications.length, 0);
     });
 
     test('does nothing and says nothing when Agent Review was never installed', async () => {

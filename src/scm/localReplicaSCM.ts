@@ -415,6 +415,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // In-task backoff sleeps. They are tracked so a session change or disposal
     // wakes them immediately instead of leaving up to a second of post-disposal
     // disk I/O queued behind an untracked timer.
+    // Paths the degraded-watcher scan has already seen absent once. Its "delete"
+    // is an inference from a single directory listing, not a kernel unlink
+    // notification, so it has to be seen absent by two consecutive scans before
+    // it is allowed to claim that strength of evidence.
+    private scannerAbsentPaths: Set<string> = new Set();
     private stabilizeSleeps = new Set<{
         timer: ReturnType<typeof setTimeout>;
         wake: () => void;
@@ -1709,6 +1714,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // cleared with it below; this drops the deferral history so a new
         // session does not inherit an already-expired warn clock.
         this.localStabilizeState.clear();
+        this.scannerAbsentPaths.clear();
         for (const sleep of [...this.stabilizeSleeps]) {
             clearTimeout(sleep.timer);
             sleep.wake();
@@ -7948,6 +7954,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         for (const path of [...this.localStabilizeState.keys()]) {
             if (matches(path)) { this.clearLocalStabilizeState(path); }
         }
+        for (const path of [...this.scannerAbsentPaths]) {
+            if (matches(path)) { this.scannerAbsentPaths.delete(path); }
+        }
         for (const path of Object.keys(this.syncManifest?.files ?? {})) {
             if (matches(path)) { this.removeSyncManifestEntry(path); }
         }
@@ -9030,6 +9039,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.remoteDeleteTombstones.clear();
         this.locallyDivergedPaths.clear();
         this.localStabilizeState.clear();
+        this.scannerAbsentPaths.clear();
         this.syncConflicts.clear();
         this.conflictLocalDigests.clear();
         this.pendingLocalEvents.forEach(pending => clearTimeout(pending.timer));
@@ -9849,10 +9859,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     // awaited I/O. If a real file is back at the path, the
                     // deletion would destroy it on Overleaf, so defer and let
                     // the re-armed push classify against what is actually there.
-                    // Directories are excluded: a recursive delete legitimately
-                    // races its own descendants, and the existing post-delete
-                    // recreation check at the end of this branch covers them.
-                    if (!directoryDelete) {
+                    // Directories are included: a recursive remote folder delete
+                    // is strictly more destructive than a single file, and a
+                    // folder that a tool momentarily removed and recreated
+                    // deserves the same corroboration. When the path really is
+                    // gone the capture is a single failed stat, so covering
+                    // directories costs nothing in the common case.
+                    {
                         let currentLocalState = await this.captureLocalPathRevision(
                             relPath,
                             generation,
@@ -9879,7 +9892,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 generation,
                             );
                         }
-                        if (currentLocalState.kind==='file') {
+                        if (currentLocalState.kind!=='missing') {
                             throw new LocalReadUnstableError(
                                 relPath,
                                 'vanished-during-update',
@@ -11599,6 +11612,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
         const candidates = new Map<string, {uri: vscode.Uri; type: 'update' | 'delete'}>();
         for (const relPath of [...snapshot.directories, ...snapshot.files]) {
+            // Present again: whatever absence we had recorded is void.
+            this.scannerAbsentPaths.delete(relPath);
             candidates.set(relPath, {
                 uri: this.localUri(relPath),
                 type: 'update',
@@ -11619,6 +11634,24 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 || this.matchIgnorePatterns(relPath)
                 || this.matchIgnorePatterns(`${relPath}/`)
             ) {
+                continue;
+            }
+            // Corroborate before claiming a delete. A watcher-reported delete is
+            // the kernel telling us an unlink happened; this is only "the path
+            // was not in one listing", which an unlink/rename save in flight
+            // produces just as readily. Requiring a second consecutive scan to
+            // agree buys a fully independent observation a whole scan interval
+            // later — far stronger evidence than any in-line wait — and costs no
+            // per-path latency, so a bulk deletion of hundreds of files still
+            // propagates in one extra scan rather than serialising a recheck
+            // window per path. By the time this emits 'delete', that label is
+            // honest and downstream may treat it as an observed delete.
+            if (!this.scannerAbsentPaths.has(relPath)) {
+                this.scannerAbsentPaths.add(relPath);
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [local scan absence unconfirmed] ${relPath}: ` +
+                    'waiting for a second scan before treating it as a deletion',
+                );
                 continue;
             }
             candidates.set(relPath, {
