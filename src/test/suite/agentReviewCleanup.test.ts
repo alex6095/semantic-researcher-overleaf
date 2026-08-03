@@ -876,6 +876,42 @@ suite('Agent Review removal cleanup', () => {
         );
     });
 
+    test('notices a helper directory that only appears after activation', async function () {
+        this.timeout(40000);
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-late-bin-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const metaRoot = path.join(globalStoragePath, 'agent-review');
+        const helperPath = path.join(metaRoot, 'bin', 'overleaf-agent-review');
+        // The user has used Agent Review — the removed build writes the registry
+        // on every `ensure()` — but `bin/` is not there when this window starts.
+        await writeFile(path.join(metaRoot, 'registry.json'), JSON.stringify({replicaRoots: [workspaceRoot]}));
+        const {context} = createContextStub(globalStoragePath);
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+        assert.strictEqual(await exists(helperPath), false, 'the fixture already had a helper');
+
+        const guard = watchAgentReviewHelper(context);
+        try {
+            await guard.armed;
+
+            // A still-running pre-upgrade host installs the helper for the first
+            // time this session. `ensureHelperInstalled()` creates `bin/` with one
+            // recursive mkdir, so the directory appearing is the only signal.
+            await writeFile(helperPath, ORIGINAL_HELPER);
+
+            await waitUntil(
+                async () => (await readFile(helperPath)).includes(HELPER_STUB_MARKER),
+                25000,
+                'a helper directory that appeared after activation was never watched',
+            );
+            const status = runHelper(helperPath, 'unused-draft-id');
+            if (status!==undefined) {
+                assert.notStrictEqual(status, 0, 'the late-installed helper still accepts submissions');
+            }
+        } finally {
+            guard.dispose();
+        }
+    });
+
     test('arms no watcher when the helper directory does not exist', async () => {
         const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-nowatch-'), 'globalStorage');
         const {context} = createContextStub(globalStoragePath);
@@ -889,6 +925,39 @@ suite('Agent Review removal cleanup', () => {
         assert.strictEqual(await exists(globalStoragePath), false, 'watching created global storage');
         assert.strictEqual(notifications.length, 0);
         assert.strictEqual(warnings.length, 0);
+    });
+
+    test('watches nothing at all when Agent Review storage was never created', async function () {
+        this.timeout(20000);
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-nostorage-'), 'globalStorage');
+        const metaRoot = path.join(globalStoragePath, 'agent-review');
+        const helperPath = path.join(metaRoot, 'bin', 'overleaf-agent-review');
+        const {context} = createContextStub(globalStoragePath);
+
+        const guard = watchAgentReviewHelper(context);
+        try {
+            await guard.armed;
+            // Nothing above `agent-review/` may ever be watched, so a helper that
+            // materialises out of nowhere is deliberately NOT caught here: this
+            // pins the documented residual rather than leaving it to drift.
+            await writeFile(helperPath, ORIGINAL_HELPER);
+            await delay(1500);
+            assert.strictEqual(
+                await readFile(helperPath),
+                ORIGINAL_HELPER,
+                'a watcher was armed on a directory tree that did not exist',
+            );
+
+            // The existing triggers are what recover this case.
+            await guard.rearm();
+            await cleanupRemovedAgentReview(context, []);
+            assert.ok(
+                (await readFile(helperPath)).includes(HELPER_STUB_MARKER),
+                'the activation-time path never recovered the late storage',
+            );
+        } finally {
+            guard.dispose();
+        }
     });
 
     test('does not rewrite a helper that is already ours', async () => {

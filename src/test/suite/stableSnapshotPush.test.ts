@@ -503,6 +503,70 @@ suite('Local Replica stable-snapshot push', function () {
         assert.ok(hasLine('[push update blocked:remote-delete-restored]'));
     });
 
+    test('the pull delete refuses when identity could not be acquired for a live target', async () => {
+        const remoteRoot = await tempDir('sr-stable-idfail-remote-');
+        const localRoot = await tempDir('sr-stable-idfail-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
+        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
+        await writeText(remoteSample, 'shared bytes');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        const originalIno = (await fs.lstat(localSample.fsPath)).ino;
+
+        await vscode.workspace.fs.delete(remoteSample);
+        const replacement = vscode.Uri.joinPath(localRoot, 'replacement.tmp');
+        await writeText(replacement, 'shared bytes');
+
+        // The identity lstat fails transiently — EACCES, an atomic-replace gap,
+        // anything. captureLocalPathIdentity cannot distinguish those from "no
+        // such file", so it yields undefined for a path that demonstrably exists.
+        const originalIdentity = internals.captureLocalPathIdentity.bind(scm);
+        internals.captureLocalPathIdentity = async (fsPath: string) => {
+            if (fsPath===localSample.fsPath) { return undefined; }
+            return originalIdentity(fsPath);
+        };
+        // ... and the user atomically installs a byte-identical replacement on a
+        // new inode, which only identity can tell apart from the original.
+        const originalCapture = internals.captureLocalPathRevision.bind(scm);
+        let recreated = false;
+        internals.captureLocalPathRevision = async (relPath: string, generation?: number) => {
+            const revision = await originalCapture(relPath, generation);
+            if (relPath==='/sample.tex' && !recreated) {
+                recreated = true;
+                await fs.rename(replacement.fsPath, localSample.fsPath);
+            }
+            return revision;
+        };
+
+        let event: Events['scmSyncCompleteEvent'];
+        try {
+            event = await internals.applySync(
+                'pull',
+                'delete',
+                '/sample.tex',
+                remoteSample,
+                localSample,
+            ) as Events['scmSyncCompleteEvent'];
+        } finally {
+            internals.captureLocalPathRevision = originalCapture;
+            internals.captureLocalPathIdentity = originalIdentity;
+        }
+
+        assert.strictEqual(recreated, true);
+        assert.strictEqual(
+            await pathExists(localSample),
+            true,
+            'an unacquirable identity was accepted as permission for a digest-only delete',
+        );
+        assert.notStrictEqual((await fs.lstat(localSample.fsPath)).ino, originalIno);
+        assert.strictEqual(await readText(localSample), 'shared bytes');
+        assert.strictEqual(event.outcome, 'blocked');
+    });
+
     test('the ordinary pull delete refuses a same-byte recreate on a new inode', async () => {
         const remoteRoot = await tempDir('sr-stable-pulldel-remote-');
         const localRoot = await tempDir('sr-stable-pulldel-local-');

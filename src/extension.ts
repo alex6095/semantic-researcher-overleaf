@@ -28,6 +28,7 @@ export async function activate(context: vscode.ExtensionContext) {
     // never get a draft submission accepted by a build that no longer reads
     // drafts. Read-only towards the workspace, self-guarding and non-throwing.
     await cleanupRemovedAgentReview(context);
+    const agentReviewHelperWatch = watchAgentReviewHelper(context);
     context.subscriptions.push(
         // A folder added mid-session brings its own leftovers, and its own
         // legacy helper. Waiting for the next window reload would leave both
@@ -35,6 +36,9 @@ export async function activate(context: vscode.ExtensionContext) {
         vscode.workspace.onDidChangeWorkspaceFolders(event => {
             if (event.added.length>0) {
                 void cleanupRemovedAgentReview(context);
+                // Cheap and idempotent: covers global storage that was
+                // unreachable when the window started.
+                void agentReviewHelperWatch.rearm();
             }
         }),
         // Checking on activation cannot cover the interval after the last check:
@@ -42,7 +46,7 @@ export async function activate(context: vscode.ExtensionContext) {
         // whenever it activates a Local Replica. This keeps it disabled for as
         // long as this window lives, and arms nothing unless the directory it
         // guards already exists.
-        watchAgentReviewHelper(context),
+        agentReviewHelperWatch,
     );
 
     // Register: [core] RemoteFileSystemProvider

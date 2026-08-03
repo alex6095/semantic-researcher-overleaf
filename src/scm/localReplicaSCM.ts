@@ -500,6 +500,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // outlast that, and it must stay short because a watcher that mislabels a
     // genuine deletion as a change pays this delay before the delete propagates.
     private static readonly localVanishRecheckDelays = [25, 100, 250];
+    // Deliberately separate from localVanishRecheckDelays[0] even though the two
+    // currently agree: this one is the single probe taken immediately before a
+    // destructive push-delete, and tuning the classification window must not
+    // silently move it.
+    private static readonly localDeleteCorroborationMs = 25;
     private static readonly shouldUseDirectLocalWatcher = () => {
         const remoteName = vscode.env.remoteName?.toLowerCase();
         return remoteName?.includes('ssh')===true || Boolean(
@@ -4043,6 +4048,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             // authorized this delete was last observed several network round
             // trips ago, so it is confirmed once more here; a path that has
             // returned in the meantime un-stages the entity and defers instead.
+            //
+            // Residue, stated at its true size: this narrows the window, it does
+            // not close it. deleteExpectedStaging() below is an awaited REMOTE
+            // round trip, so a replacement landing while that call is in flight
+            // still loses the entity — a network-latency window of tens to
+            // hundreds of milliseconds, not microseconds. Closing it would need a
+            // server-side conditional delete ("delete this entity only if the
+            // client still asserts X"), which the VFS does not offer; nothing
+            // achievable on this side of the wire removes it.
             if (confirmLocalStillAbsent!==undefined && !await confirmLocalStillAbsent()) {
                 await restoreChangedStaging(
                     `the local path for ${relPath} reappeared before its Overleaf entity was destroyed`,
@@ -5238,15 +5252,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return written;
     }
 
-    // `expectedIdentity`, when supplied, narrows the compare-and-swap from "the
-    // bytes still hash the same" to "this is still the same file object". A
-    // same-byte atomic recreate is a different inode with a fresh mtime and is a
-    // legitimate user action, so a digest-only comparison would delete it.
+    // `expectedIdentity` narrows the compare-and-swap from "the bytes still hash
+    // the same" to "this is still the same file object". A same-byte atomic
+    // recreate is a different inode with a fresh mtime and is a legitimate user
+    // action, so a digest-only comparison would delete it.
+    //
+    // 'unavailable' is distinct from undefined and load-bearing. undefined means
+    // the caller imposes no identity requirement; 'unavailable' means it wanted
+    // one and could not get it. Collapsing the second into the first is how
+    // "could not determine" turns into "nothing to worry about", so a live target
+    // whose identity is 'unavailable' is refused rather than compared by digest.
     private async atomicDeleteLocalPathIfRevision(
         relPath: string,
         expectedRevision: string,
         generation = this.syncGeneration,
-        expectedIdentity?: LocalReadIdentity,
+        expectedIdentity?: LocalReadIdentity | 'unavailable',
     ): Promise<boolean> {
         this.requireSyncSession(generation);
         const targetPath = this.localUri(relPath).fsPath;
@@ -5263,9 +5283,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (current.revision!==expectedRevision) {
             return false;
         }
+        // The target demonstrably exists at this point, so an identity that was
+        // wanted but could not be read is a refusal, not a licence to compare
+        // bytes alone. The caller turns the refusal into a conflict.
         if (
-            expectedIdentity!==undefined
-            && !await this.localPathIdentityMatches(targetPath, expectedIdentity, true)
+            expectedIdentity==='unavailable'
+            || (
+                expectedIdentity!==undefined
+                && !await this.localPathIdentityMatches(targetPath, expectedIdentity, true)
+            )
         ) {
             return false;
         }
@@ -5307,6 +5333,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             );
             // Authoritative check: whatever the rename captured is now pinned
             // under a private name, so this observation cannot be raced.
+            // 'unavailable' cannot reach here: it is refused above, before
+            // anything is staged, whenever the target exists.
             const movedIdentityMatches = expectedIdentity===undefined
                 || await this.localPathIdentityMatches(
                     quarantinePath,
@@ -9694,7 +9722,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 const directoryDelete = this.isTrackedDirectory(relPath);
                 let targetAlreadyMissing = false;
                 let expectedLocalDeleteRevision: string | undefined;
-                let expectedLocalDeleteIdentity: LocalReadIdentity | undefined;
+                let expectedLocalDeleteIdentity: LocalReadIdentity | 'unavailable' | undefined;
                 let expectedRemoteDeleteRevision: string | undefined;
                 let localDeleteState: PathRevision | undefined;
                 let remoteDeleteState: PathRevision | undefined;
@@ -9714,13 +9742,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     // replaced between the two observations the identity is the
                     // older file's, so the checks below refuse; taking it
                     // afterwards would instead bless the replacement.
-                    expectedLocalDeleteIdentity = await this.captureLocalPathIdentity(
+                    const capturedDeleteIdentity = await this.captureLocalPathIdentity(
                         this.localUri(relPath).fsPath,
                     );
                     localDeleteState = await this.captureLocalPathRevision(relPath, generation);
                     const localExists = localDeleteState.kind!=='missing';
                     expectedLocalDeleteRevision = localDeleteState.revision;
-                    if (!localExists) { expectedLocalDeleteIdentity = undefined; }
+                    // A live path whose identity could not be read is 'unavailable',
+                    // never undefined: undefined would read as "no identity needed".
+                    expectedLocalDeleteIdentity = localExists
+                        ? capturedDeleteIdentity ?? 'unavailable'
+                        : undefined;
                     const everReplicated = relPath in this.baseCache
                         || this.syncManifest?.files[relPath]!==undefined
                         || this.syncManifest?.directories[relPath]!==undefined;
@@ -9982,7 +10014,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         // that much later.
                         if (currentLocalState.kind==='missing') {
                             await this.sleepForStabilization(
-                                LocalReplicaSCMProvider.localVanishRecheckDelays[0],
+                                LocalReplicaSCMProvider.localDeleteCorroborationMs,
                             );
                             this.requireSyncSession(generation);
                             currentLocalState = await this.captureLocalPathRevision(
@@ -10041,11 +10073,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     }
                 } else if (action==='pull') {
                     const latestLocal = await this.captureLocalPathRevision(relPath, generation);
-                    const localIdentityUnchanged = expectedLocalDeleteIdentity===undefined
-                        || await this.localPathIdentityMatches(
-                            this.localUri(relPath).fsPath,
-                            expectedLocalDeleteIdentity,
-                            true,
+                    // Same fail-closed rule: a path that is present but whose
+                    // identity could not be acquired counts as changed, never as
+                    // unchanged.
+                    const localIdentityUnchanged = latestLocal.kind==='missing'
+                        || (
+                            expectedLocalDeleteIdentity!==undefined
+                            && expectedLocalDeleteIdentity!=='unavailable'
+                            && await this.localPathIdentityMatches(
+                                this.localUri(relPath).fsPath,
+                                expectedLocalDeleteIdentity,
+                                true,
+                            )
                         );
                     if (
                         expectedLocalDeleteRevision!==undefined

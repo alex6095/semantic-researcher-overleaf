@@ -105,6 +105,11 @@ interface StorageOutcome {
 export interface AgentReviewHelperWatch {
     dispose(): void;
     /**
+     * Re-attempts arming. A no-op once watching, so the existing triggers can
+     * call it freely if global storage was unreachable at activation.
+     */
+    rearm(): Promise<void>;
+    /**
      * Resolves once the watcher is armed, or has decided there is nothing to
      * arm. Nothing in production waits on this; it exists so a test can drive
      * the watcher instead of sleeping and hoping.
@@ -503,8 +508,12 @@ async function report(context: vscode.ExtensionContext, findings: Findings) {
  * to resurrect; should it appear later, the next activation catches it.
  */
 export function watchAgentReviewHelper(context: vscode.ExtensionContext): AgentReviewHelperWatch {
+    // Watches `bin/` once it exists. Until then a second watcher sits on the
+    // parent so the directory appearing is itself an event.
     let watcher: nodeFs.FSWatcher | undefined;
+    let parentWatcher: nodeFs.FSWatcher | undefined;
     let timer: NodeJS.Timeout | undefined;
+    let armTimer: NodeJS.Timeout | undefined;
     let disposed = false;
     let cooldownUntil = 0;
     // A check is in flight. Coalesced, never dropped: see `react`.
@@ -517,17 +526,27 @@ export function watchAgentReviewHelper(context: vscode.ExtensionContext): AgentR
 
     const retryDelay = () => Math.min(HELPER_RETRY_BASE_MS*(2**(failures-1)), HELPER_RETRY_MAX_MS);
 
+    const closeWatcher = (handle: nodeFs.FSWatcher | undefined) => {
+        try {
+            handle?.close();
+        } catch {
+            // Already closed, or the handle died with the directory.
+        }
+    };
+
     const stop = () => {
         if (timer) {
             clearTimeout(timer);
             timer = undefined;
         }
-        try {
-            watcher?.close();
-        } catch {
-            // Already closed, or the handle died with the directory.
+        if (armTimer) {
+            clearTimeout(armTimer);
+            armTimer = undefined;
         }
+        closeWatcher(watcher);
         watcher = undefined;
+        closeWatcher(parentWatcher);
+        parentWatcher = undefined;
     };
 
     const scheduleIn = (metaRoot: string, delayMs: number) => {
@@ -613,40 +632,92 @@ export function watchAgentReviewHelper(context: vscode.ExtensionContext): AgentR
         }
     };
 
-    const armed = (async () => {
+    const scheduleArm = () => {
+        if (disposed || armTimer) {
+            return;
+        }
+        armTimer = setTimeout(() => {
+            armTimer = undefined;
+            void arm();
+        }, HELPER_WATCH_DEBOUNCE_MS);
+        armTimer.unref?.();
+    };
+
+    /**
+     * Watches `bin/` if it is there, and otherwise watches the parent so that
+     * `bin/` appearing is itself an event.
+     *
+     * The removed `ensureHelperInstalled()` creates `agent-review/bin` with a
+     * single recursive `mkdir`, so a helper installed for the first time this
+     * session shows up as one event on `agent-review/` — which only exists if
+     * the user has used the feature, since the same build writes `registry.json`
+     * beside it on every `ensure()`. Nothing above `agent-review/` is ever
+     * watched: a user who never had the feature has neither directory, probes
+     * two paths that do not exist, and arms nothing at all.
+     *
+     * Idempotent and cheap to re-run, so the existing triggers can call it again
+     * if storage was unreachable earlier.
+     */
+    const arm = async (): Promise<void> => {
         try {
-            const metaRoot = path.join(context.globalStorageUri.fsPath, AGENT_REVIEW_DIR);
-            const binRoot = path.join(metaRoot, 'bin');
-            if (await probe(binRoot)!=='present' || disposed) {
+            if (disposed || watcher) {
                 return;
             }
-            // `persistent: false` so this can never hold the host process open.
-            watcher = nodeFs.watch(binRoot, {persistent: false}, () => {
-                scheduleIn(metaRoot, HELPER_WATCH_DEBOUNCE_MS);
-            });
-            watcher.on('error', error => {
-                // Watch limits, an unmounted path, a deleted directory: give up
-                // quietly. The activation-time check still covers this window.
-                console.warn(`Agent Review helper watch stopped for ${binRoot}:`, error);
-                stop();
+            const metaRoot = path.join(context.globalStorageUri.fsPath, AGENT_REVIEW_DIR);
+            const binRoot = path.join(metaRoot, 'bin');
+
+            if (await probe(binRoot)==='present') {
+                if (disposed || watcher) {
+                    return;
+                }
+                // `persistent: false` so this can never hold the host process open.
+                watcher = nodeFs.watch(binRoot, {persistent: false}, () => {
+                    scheduleIn(metaRoot, HELPER_WATCH_DEBOUNCE_MS);
+                });
+                watcher.on('error', error => {
+                    // Watch limits, an unmounted path, a deleted directory: give
+                    // up quietly. The activation-time check still covers this.
+                    console.warn(`Agent Review helper watch stopped for ${binRoot}:`, error);
+                    stop();
+                });
+                // The parent was only ever a stand-in for this.
+                closeWatcher(parentWatcher);
+                parentWatcher = undefined;
+                if (disposed) {
+                    stop();
+                    return;
+                }
+                // Production arms this *after* the activation-time cleanup, and a
+                // watcher only reports what happens once it exists. A helper
+                // reinstalled in between — or written between the probe above and
+                // this line — produced no event for anyone, so the gap is closed
+                // by looking rather than by assuming it was empty.
+                await react(metaRoot);
+                return;
+            }
+
+            if (parentWatcher || await probe(metaRoot)!=='present' || disposed) {
+                return;
+            }
+            parentWatcher = nodeFs.watch(metaRoot, {persistent: false}, () => scheduleArm());
+            parentWatcher.on('error', error => {
+                console.warn(`Agent Review helper watch stopped for ${metaRoot}:`, error);
+                closeWatcher(parentWatcher);
+                parentWatcher = undefined;
             });
             if (disposed) {
                 stop();
-                return;
             }
-            // Production arms this *after* the activation-time cleanup, and a
-            // watcher only reports what happens once it exists. A pre-upgrade
-            // window that reinstalled the helper in between produced no event for
-            // anyone, so the gap is closed by looking rather than by assuming it
-            // was empty.
-            await react(metaRoot);
         } catch (error) {
             console.warn('Could not watch the Agent Review helper directory:', error);
         }
-    })();
+    };
+
+    const armed = arm();
 
     return {
         armed,
+        rearm: arm,
         dispose: () => {
             disposed = true;
             stop();
