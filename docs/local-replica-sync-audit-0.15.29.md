@@ -1,5 +1,8 @@
 # Local Replica Sync Audit and Review Handoff (0.15.29)
 
+> Note: the Agent Review feature described in this historical audit was removed in a later release. Entries mentioning it are retained as a record of the 0.15.29 review.
+
+
 ## Status
 
 This document describes the 0.15.29 Local Replica work before release. It is

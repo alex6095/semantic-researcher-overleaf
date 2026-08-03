@@ -14,13 +14,13 @@ import {
     parseUri,
     vfsProjectKey,
 } from '../core/remoteFileSystemProvider';
-import { normalizeReplicaPath } from '../agentReview/types';
 import {
     getActiveReplicaRoot,
     hasReplicaRemovalTombstone,
     isLocalReplicaMetadataUri,
     localUriToPath,
     normalizeLocalReplicaRelPath,
+    normalizeReplicaPath,
     pathToLocalUri,
     readReplicaSettings,
     readReplicaSettingsSnapshot,
@@ -37,7 +37,7 @@ import { stringifyOverleafUri } from '../utils/overleafUri';
 import { EventBus, Events } from '../utils/eventBus';
 import { formatUnknownError } from '../utils/errorMessage';
 import { getOutputChannel } from '../utils/outputChannel';
-import { PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS, getAgentReviewManager } from '../agentReview';
+import { PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS } from './replicaIgnorePatterns';
 import { decodeUtf8Text, mergeUtf8Text } from '../utils/threeWayMerge';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
@@ -292,8 +292,7 @@ function definedInitializationOptions(options?: InitializeLocalReplicaOptions): 
 // implementation went through TextDecoder which mangles arbitrary byte
 // sequences into U+FFFD and was lossy for binaries (different PDFs could
 // collapse to the same 32-bit hash, defeating echo suppression for media
-// files). sha1 over raw bytes is collision-safe and matches the form
-// already used by proposalStore for content addressing.
+// files). sha1 over raw bytes is collision-safe.
 function contentDigest(content?: Uint8Array): string {
     if (content===undefined) { return DELETE_DIGEST; }
     return crypto.createHash('sha1').update(content).digest('hex');
@@ -3120,6 +3119,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             );
             this.requireSyncSession(generation);
             const storedSettings = JSON.parse(new TextDecoder().decode(content));
+            // `enableAgentReview` is dead metadata from a removed feature.
+            // Ignoring it before the comparison keeps replicas written by older
+            // builds from being rewritten on every load.
             const {enableAgentReview: _legacyEnableAgentReview, ...storedWithoutLegacyAgentReview} = storedSettings;
             this.localReplicaSettings = {
                 ...canonicalSettings,
@@ -9274,19 +9276,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     }
                 }
                 if (action==='push') {
-                    const decision = await getAgentReviewManager()?.beforeLocalReplicaPush({
-                        rootUri: this.baseUri,
-                        localUri: fromUri,
-                        relPath,
-                        type,
-                        content: newContent,
-                    });
+                    // Re-check after the awaited remote revision capture above:
+                    // a session swap there must abort before we mutate Overleaf.
                     this.requireSyncSession(generation);
-                    if (decision?.kind==='block') {
-                        outcome = 'blocked';
-                        errorMessage = 'blocked by agent review';
-                        return;
-                    }
                 }
                 if (action==='push' && !targetAlreadyMissing) {
                     try {
@@ -9387,26 +9379,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
                 await this.persistSyncManifest(false, generation);
                 this.requireSyncSession(generation);
-                if (action==='push') {
-                    await getAgentReviewManager()?.afterLocalReplicaPush({
-                        rootUri: this.baseUri,
-                        localUri: fromUri,
+                if (
+                    action==='push'
+                    && (localRecreatedDuringPushDelete || pendingLocalChangeDuringPushDelete)
+                ) {
+                    this.locallyDivergedPaths.add(relPath);
+                    this.queueForcedPush(
                         relPath,
-                        type,
-                        content: newContent,
-                    });
-                    this.requireSyncSession(generation);
-                    if (
-                        localRecreatedDuringPushDelete
-                        || pendingLocalChangeDuringPushDelete
-                    ) {
-                        this.locallyDivergedPaths.add(relPath);
-                        this.queueForcedPush(
-                            relPath,
-                            'local-change-during-remote-delete',
-                            localRecreatedDuringPushDelete ? 'update' : 'delete',
-                        );
-                    }
+                        'local-change-during-remote-delete',
+                        localRecreatedDuringPushDelete ? 'update' : 'delete',
+                    );
                 }
             } else {
                 // Layer 4b — refuse a push-update for a path whose initial
@@ -9704,11 +9686,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         // cache already suppresses this case via its sha1
                         // digest, but doing the explicit byte compare here
                         // (a) keeps the optimisation honest if the bypass
-                        // cache is ever evicted/cleared, (b) lets us avoid
-                        // the agentReview hooks entirely when nothing
-                        // changed, and (c) emits a forensic [pull noop] log
-                        // line that makes "VFS is noisy but content is
-                        // stable" diagnosable.
+                        // cache is ever evicted/cleared, and (b) emits a
+                        // forensic [pull noop] log line that makes "VFS is
+                        // noisy but content is stable" diagnosable.
                         let forcePullWrite = false;
                         if (action==='pull') {
                             const existing = this.baseCache[relPath]
@@ -9804,20 +9784,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                         return;
                                     }
 
-                                    const mergedPushChange = {
-                                        rootUri: this.baseUri,
-                                        localUri: toUri,
-                                        relPath,
-                                        type,
-                                        content: mergedContent,
-                                    };
-                                    const decision = await getAgentReviewManager()?.beforeLocalReplicaPush(mergedPushChange);
+                                    // Re-check after the awaited local revision
+                                    // capture above before pushing the merge.
                                     this.requireSyncSession(generation);
-                                    if (decision?.kind==='block') {
-                                        outcome = 'blocked';
-                                        errorMessage = 'merged update blocked by agent review';
-                                        return;
-                                    }
                                     try {
                                         mergedContent = await this.pushWithRetry(
                                             relPath,
@@ -9826,7 +9795,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                             generation,
                                             newContent,
                                         );
-                                        mergedPushChange.content = mergedContent;
                                     } catch (error) {
                                         if (
                                             !(error instanceof RemoteDocumentMergeConflictError)
@@ -9870,7 +9838,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     this.locallyDivergedPaths.delete(relPath);
                                     await this.recordSyncManifestEntry(relPath, fromUri, mergedContent, generation);
                                     await this.persistSyncManifest(false, generation);
-                                    await getAgentReviewManager()?.afterLocalReplicaPush(mergedPushChange);
                                     this.requireSyncSession(generation);
                                     getOutputChannel().appendLine(
                                         `${new Date().toISOString()} [pull merged] ${relPath}: concurrent non-overlapping edits`,
@@ -9902,23 +9869,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 return;
                             }
                         }
-                        const pushChange = action==='push' ? {
-                            rootUri: this.baseUri,
-                            localUri: fromUri,
-                            relPath,
-                            type,
-                            content: newContent,
-                        } : undefined;
                         if (action==='push') {
-                            const decision = await getAgentReviewManager()?.beforeLocalReplicaPush(pushChange!);
+                            // Guard the remote write below: the branches above
+                            // await disk and network I/O that can outlive the
+                            // sync session.
                             this.requireSyncSession(generation);
-                            if (decision?.kind==='block') {
-                                outcome = 'blocked';
-                                errorMessage = 'blocked by agent review';
-                                return;
-                            }
-                        }
-                        if (action==='push') {
                             // Push with bounded retry so a transient socket blip doesn't
                             // silently lose the accepted edit.
                             try {
@@ -9944,7 +9899,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 if (!bytesEqual(pushedContent, newContent)) {
                                     newContent = pushedContent;
                                     writeMergedContentBackToLocal = true;
-                                    pushChange!.content = newContent;
                                 }
                             } catch (error) {
                                 if (
@@ -10027,9 +9981,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     `${new Date().toISOString()} [push cache refresh skipped] ${relPath}: ${formatUnknownError(cacheError)}`,
                                 );
                             }
-                        }
-                        if (action==='push') {
-                            await getAgentReviewManager()?.afterLocalReplicaPush(pushChange!);
                             this.requireSyncSession(generation);
                         }
                     } catch (error) {
@@ -10043,14 +9994,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         if (action==='push' && this.isSyncSessionActive(generation)) {
                             this.locallyDivergedPaths.add(relPath);
                             maybeWarnSyncFailure(relPath, error);
-                            await getAgentReviewManager()?.afterLocalReplicaPushFailed({
-                                rootUri: this.baseUri,
-                                localUri: fromUri,
-                                relPath,
-                                type,
-                                content: await this.readConfinedLocalFile(relPath, fromUri)
-                                    .catch(() => undefined),
-                            });
                         }
                         console.error(error);
                         outcome = 'error';
@@ -10071,16 +10014,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (action==='push' && this.isSyncSessionActive(generation)) {
                 this.locallyDivergedPaths.add(relPath);
                 maybeWarnSyncFailure(relPath, error);
-                await getAgentReviewManager()?.afterLocalReplicaPushFailed({
-                    rootUri: this.baseUri,
-                    localUri: fromUri,
-                    relPath,
-                    type,
-                    content: type==='update'
-                        ? await this.readConfinedLocalFile(relPath, fromUri)
-                            .catch(() => undefined)
-                        : undefined,
-                });
             }
             console.error(error);
             outcome = 'error';

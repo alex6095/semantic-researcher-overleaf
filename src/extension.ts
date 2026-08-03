@@ -13,7 +13,6 @@ import {
     onDidChangeActiveReplicaRoot,
 } from './utils/localReplicaWorkspace';
 import { migrateLegacyNamespace } from './utils/namespaceMigration';
-import { initializeAgentReviewManager } from './agentReview';
 
 type ActiveReplicaSyncTarget = {
     key: string,
@@ -112,9 +111,6 @@ export async function activate(context: vscode.ExtensionContext) {
     const langIntellisenseProvider = new LangIntellisenseProvider(context, remoteFileSystemProvider);
     context.subscriptions.push( ...langIntellisenseProvider.triggers );
 
-    // Register: [agent review] Local Replica agent proposal workflow
-    const agentReviewManager = initializeAgentReviewManager(context);
-
     let activeReplicaSyncPromise: Promise<void> | undefined;
     let activeReplicaSyncKey: string | undefined;
     let queuedActiveReplicaSyncKey: string | undefined;
@@ -198,7 +194,6 @@ export async function activate(context: vscode.ExtensionContext) {
 
     context.subscriptions.push(
         onDidChangeActiveReplicaRoot(() => {
-            void agentReviewManager.activate(getActiveReplicaRoot());
             if (initializingLocalReplicaWorkspace) {
                 scheduleActiveReplicaProjectSync(1500);
             } else {
@@ -214,11 +209,9 @@ export async function activate(context: vscode.ExtensionContext) {
         }),
     );
 
-    void initializeLocalReplicaWorkspace().then(async () => {
+    void initializeLocalReplicaWorkspace().then(() => {
         if (extensionDisposed) { return; }
         initializingLocalReplicaWorkspace = false;
-        await agentReviewManager.activate(getActiveReplicaRoot());
-        if (extensionDisposed) { return; }
         scheduleActiveReplicaProjectSync(1500);
     }).catch(error => {
         initializingLocalReplicaWorkspace = false;
@@ -233,5 +226,4 @@ export function deactivate() {
     vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activateCompile`, false);
     vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activeReplicaEditor`, false);
     vscode.commands.executeCommand('setContext', `${ROOT_NAME}.activeReplicaCompileEditor`, false);
-    vscode.commands.executeCommand('setContext', `${ROOT_NAME}.agentReviewActive`, false);
 }

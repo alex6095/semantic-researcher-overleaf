@@ -368,7 +368,7 @@ The project-related metadata for local replica are located in `.semantic-researc
     "projectName": "example-project",
 }
 ```
-Most of the items are immutable, except for `enableCompileNPreview`, which is used to enable/disable the compile and preview feature in local folder. Agent Review is controlled by the VS Code setting `semantic-researcher-overleaf.agentReview.enabled`; older per-replica `enableAgentReview` metadata is ignored and removed during settings normalization.
+Most of the items are immutable, except for `enableCompileNPreview`, which is used to enable/disable the compile and preview feature in local folder. Older per-replica `enableAgentReview` metadata is ignored and removed during settings normalization.
 
 ### Invisible Mode
 > [!WARNING]
@@ -433,7 +433,6 @@ The project-irrelevant configurations of the extension can be found in the VS Co
     ```
 - **PDF Viewer: Default Scroll Mode**: This configuration controls the default scroll mode for the PDF viewer when there is no saved viewer state for the PDF. Allowed values are `vertical`, `horizontal`, `wrapped`, and `page`. The default value is `vertical`.
 - **PDF Viewer: Default Spread Mode**: This configuration controls the default spread mode for the PDF viewer when there is no saved viewer state for the PDF. Allowed values are `none`, `odd`, and `even`. The default value is `none`.
-- **Agent Review**: Local Replica workspaces can guide Codex and Claude edits through a review flow without changing the normal `codex` or `claude` executable path. When enabled, the extension writes managed Agent Review blocks to the workspace `AGENTS.md` and `CLAUDE.md`, plus a global-storage `overleaf-agent-review` helper. Agents use that helper to create draft copies and submit proposals. Submitted drafts open in a VS Code diff viewer with Accept, Decline, Previous Change, and Next Change actions on the proposed side. Accepting a change applies it to the source file and saves it so the normal Local Replica sync path can push the accepted change to Overleaf. Agent Review is off by default and can be enabled with `semantic-researcher-overleaf.agentReview.enabled`; disabling it removes the managed instructions and allows direct edits.
 - **Formatter: Line break**: The formatter will restrict line length as 80 characters in default. Toggle the following option will disable this feature.
 
     ![alt text](assets/screenshot-formatter-linebreak.png)

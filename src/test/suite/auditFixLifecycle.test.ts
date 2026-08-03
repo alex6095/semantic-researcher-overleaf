@@ -3,7 +3,6 @@ import * as fs from 'fs/promises';
 import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { AgentReviewManager } from '../../agentReview/agentReviewManager';
 import { ClientManager } from '../../collaboration/clientManager';
 import { REPLICA_SETTINGS_DIR, REPLICA_SETTINGS_FILE, STATE_SERVERS_KEY } from '../../consts';
 import { VirtualFileSystem } from '../../core/remoteFileSystemProvider';
@@ -653,38 +652,14 @@ suite('Audited Local Replica fix lifecycle', () => {
         assert.match(warned, /no longer online/);
     });
 
-    // -------------------------------------------------------- agent review
+    // ------------------------------------------------ replica settings compat
 
-    test('ignores a settings normalization write instead of blocking in-flight pushes', async () => {
-        const localRoot = await tempDir('sr-overleaf-audit-agent-settings-');
-        tempRoots.push(localRoot);
-        const manager = Object.create(AgentReviewManager.prototype) as AgentReviewManager;
-        const internals = manager as any;
-        internals.disposed = false;
-        internals.activationGeneration = 4;
-        internals.activeRoot = localRoot;
-        internals.config = {enabled: false};
-        internals.isActiveReplicaSettingsUri = () => true;
-        let activations = 0;
-        internals.activate = async () => {
-            activations += 1;
-        };
-
-        internals.resolveConfigSnapshot = async () => ({enabled: false});
-        await internals.onReplicaSettingsChanged(settingsUri(localRoot));
-        assert.strictEqual(activations, 0);
-        assert.strictEqual(internals.activationGeneration, 4);
-
-        internals.resolveConfigSnapshot = async () => ({enabled: true});
-        await internals.onReplicaSettingsChanged(settingsUri(localRoot));
-        assert.strictEqual(activations, 1);
-    });
-
-    test('does not rewrite replica settings while deciding a Local Replica push', async () => {
-        const remoteRoot = await tempDir('sr-overleaf-audit-agent-push-remote-');
-        const localRoot = await tempDir('sr-overleaf-audit-agent-push-local-');
+    test('normalizes replica settings carrying removed-feature keys without looping', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-audit-settings-remote-');
+        const localRoot = await tempDir('sr-overleaf-audit-settings-local-');
         tempRoots.push(remoteRoot, localRoot);
-        // Deliberately un-normalized: the normalizing reader would rewrite it.
+        // Deliberately un-normalized, and carrying the legacy `enableAgentReview`
+        // key that older builds wrote into replica folders.
         const rawSettings = JSON.stringify({
             uri: remoteRoot.toString(),
             serverName: 'test-server',
@@ -694,26 +669,19 @@ suite('Audited Local Replica fix lifecycle', () => {
         });
         await writeText(settingsUri(localRoot), rawSettings);
 
-        const manager = Object.create(AgentReviewManager.prototype) as AgentReviewManager;
-        const internals = manager as any;
-        internals.disposed = false;
-        internals.activationGeneration = 1;
-        internals.activationQueue = Promise.resolve();
-        internals.activeRoot = localRoot;
-        internals.config = {enabled: false};
-        internals.internalRestoreUntil = new Map();
-        internals.saveClassifier = {getRecentSaveIntent: () => undefined};
-        internals.workspaceInstructionManager = {latestOpenDraft: async () => undefined};
-
-        await manager.beforeLocalReplicaPush({
-            rootUri: localRoot,
-            localUri: vscode.Uri.joinPath(localRoot, 'main.tex'),
-            relPath: '/main.tex',
-            type: 'update',
-            content: Buffer.from('agent edit'),
-        });
-
+        // The snapshot reader answers without ever touching the file.
+        const snapshot = await localReplicaWorkspace.readReplicaSettingsSnapshot(localRoot);
+        assert.strictEqual(snapshot?.enableCompileNPreview, true);
+        assert.strictEqual(snapshot?.enableAgentReview, undefined);
         assert.strictEqual(await readText(settingsUri(localRoot)), rawSettings);
+
+        // The normalizing reader may rewrite once, but must then be stable:
+        // a settings file that keeps changing is the rewrite loop this guards.
+        await localReplicaWorkspace.readReplicaSettings(localRoot);
+        const normalized = await readText(settingsUri(localRoot));
+        assert.ok(!normalized.includes('enableAgentReview'));
+        await localReplicaWorkspace.readReplicaSettings(localRoot);
+        assert.strictEqual(await readText(settingsUri(localRoot)), normalized);
     });
 
     // ------------------------------------------------- packaging assertions

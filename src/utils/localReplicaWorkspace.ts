@@ -18,7 +18,10 @@ export interface LocalReplicaSettings {
     uri: string,
     serverName: string,
     enableCompileNPreview: boolean,
-    /** Legacy; stripped on normalization. Use agentReview.enabled instead. */
+    /**
+     * Dead metadata from a removed feature. Declared so normalization can keep
+     * stripping it from replicas written by older builds; never written back.
+     */
     enableAgentReview?: boolean,
     projectName: string,
 }
@@ -219,6 +222,17 @@ export function normalizeLocalReplicaRelPath(relPath: string): string | undefine
     }
 
     return `/${parts.join('/')}`;
+}
+
+/**
+ * Rewrites a replica-relative path into the leading-slash POSIX form used as
+ * the key for baselines, manifests and bypass caches. Unlike
+ * `normalizeLocalReplicaRelPath` this never rejects a path: it is a key
+ * normalizer for paths that have already been validated.
+ */
+export function normalizeReplicaPath(relPath: string): string {
+    const normalized = relPath.replace(/\\/g, '/');
+    return normalized.startsWith('/') ? normalized : `/${normalized}`;
 }
 
 async function syncContexts(settings?: LocalReplicaSettings) {
