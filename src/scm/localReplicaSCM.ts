@@ -401,6 +401,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         firstUnstableAt: number;
         attempts: number;
     }> = new Map();
+    // In-task backoff sleeps. They are tracked so a session change or disposal
+    // wakes them immediately instead of leaving up to a second of post-disposal
+    // disk I/O queued behind an untracked timer.
+    private stabilizeSleeps = new Set<{
+        timer: ReturnType<typeof setTimeout>;
+        wake: () => void;
+    }>();
     private syncConflicts: Map<string, string> = new Map();
     private conflictLocalDigests: Map<string, string> = new Map();
     private localReplicaSettings?: {
@@ -472,6 +479,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private static readonly localReadStabilizeDelays = [100, 250, 500, 1000];
     private static readonly localReadStabilizeWarnMs = 30_000;
     private static readonly localReadStabilizeRearmMs = 750;
+    // How long a watcher-observed update may keep looking for a path that has
+    // momentarily vanished before the absence is accepted as a real deletion.
+    // An atomic rename replacement closes in microseconds; this only has to
+    // outlast that, and it must stay short because a watcher that mislabels a
+    // genuine deletion as a change pays this delay before the delete propagates.
+    private static readonly localVanishRecheckDelays = [25, 100, 250];
     private static readonly shouldUseDirectLocalWatcher = () => {
         const remoteName = vscode.env.remoteName?.toLowerCase();
         return remoteName?.includes('ssh')===true || Boolean(
@@ -1685,6 +1698,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // cleared with it below; this drops the deferral history so a new
         // session does not inherit an already-expired warn clock.
         this.localStabilizeState.clear();
+        for (const sleep of [...this.stabilizeSleeps]) {
+            clearTimeout(sleep.timer);
+            sleep.wake();
+        }
+        this.stabilizeSleeps.clear();
         if (this.fallbackScanTimer) {
             clearTimeout(this.fallbackScanTimer);
             this.fallbackScanTimer = undefined;
@@ -6775,6 +6793,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     `Local Replica read target changed while bytes were read: ${uri.fsPath}`,
                 );
             }
+            // Independent witness. Every field compared above can be identical
+            // across a rewrite that landed inside one coarse filesystem timestamp
+            // tick, so metadata alone cannot prove the read saw a single
+            // revision. The byte count catches the common truncate-then-write
+            // shape, where the reader can observe the file while it is short.
+            // It does NOT catch a same-length in-place overwrite — nothing
+            // metadata-based can — which is why recordSyncManifestEntry still
+            // re-reads and byte-compares after every push.
+            if (content.length!==Number(descriptorStatAfter.size)) {
+                throw new LocalReadUnstableError(
+                    relPath,
+                    'descriptor-changed',
+                    `Local Replica read returned ${content.length} bytes for a ` +
+                    `${descriptorStatAfter.size}-byte revision: ${uri.fsPath}`,
+                );
+            }
             return {
                 content,
                 stat: {
@@ -6793,8 +6827,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // middle of someone else's write is the normal case for a compiling project,
     // so it is deferred silently here rather than reported. Exhausting the delays
     // rethrows the typed error, and the caller re-arms the path: the guarantee is
-    // to retry indefinitely and upload the first coherent completed revision
-    // observed, not that a file being rewritten forever must eventually upload.
+    // to retry indefinitely and upload the first revision observed to be settled,
+    // not that a file being rewritten forever must eventually upload. "Settled"
+    // is what the descriptor guard can witness — identity, size, timestamps and
+    // byte count — which a same-length in-place overwrite inside one coarse
+    // timestamp tick can still slip past; recordSyncManifestEntry's post-push
+    // re-read is the backstop that turns such a slip into a re-drive.
     private async readStableConfinedLocalFile(
         relPath: string,
         uri: vscode.Uri = this.localUri(relPath),
@@ -6819,9 +6857,32 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     `${new Date().toISOString()} [local read deferred:${error.reason}] ${relPath} ` +
                     `(attempt ${attempt+1}/${delays.length+1})`,
                 );
-                await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+                await this.sleepForStabilization(delays[attempt]);
+                // Re-check on the way out of the sleep, not only on the way in:
+                // disposal during the backoff must not be followed by another
+                // round of disk I/O against a torn-down replica.
+                if (!this.isSyncSessionActive(generation)) {
+                    throw error;
+                }
             }
         }
+    }
+
+    // A backoff sleep that a session teardown can cut short. stopSyncInputs wakes
+    // every outstanding sleeper so the loop above re-checks and bails instead of
+    // holding shutdown for the remainder of its delay.
+    private sleepForStabilization(ms: number): Promise<void> {
+        return new Promise<void>(resolve => {
+            let entry!: {timer: ReturnType<typeof setTimeout>; wake: () => void};
+            entry = {
+                timer: setTimeout(() => {
+                    this.stabilizeSleeps.delete(entry);
+                    resolve();
+                }, ms),
+                wake: resolve,
+            };
+            this.stabilizeSleeps.add(entry);
+        });
     }
 
     // An atomic temp-file replacement (latexmk, an editor's write-temp+rename)
@@ -6886,33 +6947,58 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             .then(snapshot => snapshot.content);
     }
 
-    private async localTargetNeedsPush(relPath: string, localUri: vscode.Uri): Promise<'update' | 'delete' | undefined> {
-        try {
-            const stat = await this.statConfinedLocalUri(
-                localUri,
-                `classification of ${relPath}`,
-            );
-            if (stat.type===vscode.FileType.Directory) {
-                return this.syncManifest?.directories[relPath] ? undefined : 'update';
+    // `observedType` is what the local watcher actually reported. A Change or
+    // Create event for a path that is momentarily gone is an atomic replacement
+    // caught mid-flight, not a user deletion, so a single ENOENT observation is
+    // not enough evidence to propagate a destructive remote delete. Watchers do
+    // however mislabel real deletions as changes, so the extra evidence is
+    // bounded: once the path has been continuously absent across the recheck
+    // window it is treated as a genuine delete.
+    private async localTargetNeedsPush(
+        relPath: string,
+        localUri: vscode.Uri,
+        observedType?: 'update' | 'delete',
+    ): Promise<'update' | 'delete' | undefined> {
+        const recheckDelays = LocalReplicaSCMProvider.localVanishRecheckDelays;
+        for (let attempt = 0; ; attempt++) {
+            try {
+                const stat = await this.statConfinedLocalUri(
+                    localUri,
+                    `classification of ${relPath}`,
+                );
+                if (stat.type===vscode.FileType.Directory) {
+                    return this.syncManifest?.directories[relPath] ? undefined : 'update';
+                }
+                if (stat.type!==vscode.FileType.File) {
+                    return undefined;
+                }
+                const content = await this.readLocalFile(localUri);
+                return this.isContentKnownSynced(relPath, content) ? undefined : 'update';
+            } catch (error) {
+                if (!LocalReplicaSCMProvider.isFileNotFoundError(error)) {
+                    throw error;
+                }
+                if (
+                    !this.syncManifest?.files[relPath]
+                    && !this.syncManifest?.directories[relPath]
+                    && !(relPath in this.baseCache)
+                    && !this.seenLocalEntities.has(relPath)
+                ) {
+                    return undefined;
+                }
+                if (
+                    observedType!=='update'
+                    || attempt>=recheckDelays.length
+                    || !this.isSyncSessionActive()
+                ) {
+                    return 'delete';
+                }
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [classification recheck:vanished-during-update] ${relPath} ` +
+                    `(attempt ${attempt+1}/${recheckDelays.length})`,
+                );
+                await this.sleepForStabilization(recheckDelays[attempt]);
             }
-            if (stat.type!==vscode.FileType.File) {
-                return undefined;
-            }
-            const content = await this.readLocalFile(localUri);
-            return this.isContentKnownSynced(relPath, content) ? undefined : 'update';
-        } catch (error) {
-            if (!LocalReplicaSCMProvider.isFileNotFoundError(error)) {
-                throw error;
-            }
-            if (
-                this.syncManifest?.files[relPath]
-                || this.syncManifest?.directories[relPath]
-                || relPath in this.baseCache
-                || this.seenLocalEntities.has(relPath)
-            ) {
-                return 'delete';
-            }
-            return undefined;
         }
     }
 
@@ -7212,7 +7298,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (pending) {
             clearTimeout(pending.timer);
             this.pendingLocalEvents.delete(relPath);
-            const currentType = await this.localTargetNeedsPush(relPath, pending.latestUri);
+            const currentType = await this.localTargetNeedsPush(
+                relPath,
+                pending.latestUri,
+                pending.latestType,
+            );
             this.requireSyncSession(generation);
             if (currentType===undefined) { return; }
             const vfsUri = this.vfs.pathToUri(relPath);
@@ -7269,9 +7359,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const classifyCompileTarget = async (
             relPath: string,
             localUri: vscode.Uri,
+            observedType?: 'update' | 'delete',
         ): Promise<'update' | 'delete' | 'unstable' | undefined> => {
             try {
-                return await this.localTargetNeedsPush(relPath, localUri);
+                return await this.localTargetNeedsPush(relPath, localUri, observedType);
             } catch (error) {
                 if (!LocalReplicaSCMProvider.isLocalReadUnstable(error)) { throw error; }
                 this.recordUnstableCompileTarget(relPath, localUri, result, generation);
@@ -7355,7 +7446,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (this.pendingLocalEvents.get(relPath)!==pending) { continue; }
             clearTimeout(pending.timer);
             this.pendingLocalEvents.delete(relPath);
-            const currentType = await classifyCompileTarget(relPath, pending.latestUri);
+            const currentType = await classifyCompileTarget(
+                relPath,
+                pending.latestUri,
+                pending.latestType,
+            );
             this.requireSyncSession(generation);
             if (currentType==='unstable') { continue; }
             if (currentType===undefined) {
@@ -9137,7 +9232,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private scheduleLocalPushRetry(
         relPath: string,
         localUri: vscode.Uri,
-        reason: 'unstable-read' | 'local-advanced-during-push',
+        reason:
+            | 'unstable-read'
+            | 'local-advanced-during-push'
+            | 'local-advanced-before-echo-delete',
         generation: number,
         observedType: 'update' | 'delete' = 'update',
     ): void {
@@ -9290,7 +9388,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             async () => {
                 let type: 'update' | 'delete' | undefined;
                 try {
-                    type = await this.localTargetNeedsPush(relPath, localUri);
+                    type = await this.localTargetNeedsPush(relPath, localUri, observedType);
                     this.requireSyncSession(generation);
                 } catch (error) {
                     this.retainLocalPushIntentAfterClassificationFailure(
@@ -9944,19 +10042,48 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 && tombstone.staleLocalMtime!==undefined
                                 && normalizeMtimeMs(readStat.mtime)<=tombstone.staleLocalMtime+REMOTE_DELETE_MTIME_SLOP_MS;
                             if (staleLocalBytes) {
+                                this.requireSyncSession(generation);
+                                // Seeded before the delete so the watcher echo of
+                                // our own removal is suppressed; the terminal
+                                // 'blocked' path below restores the snapshot taken
+                                // at entry if the delete turns out to be refused.
+                                this.setBypassCache(relPath, undefined);
+                                // The delete must remove the exact revision that
+                                // authorized it. Between the read above and this
+                                // point an editor can land a legitimate new
+                                // revision, and an unconditional delete would
+                                // destroy it — the remote delete has already
+                                // cleared this path's manifest and baseline
+                                // provenance, so no later watcher event is
+                                // obliged to bring it back.
+                                const removedStaleRevision = await this.runSessionIO(
+                                    generation,
+                                    () => this.atomicDeleteLocalPathIfRevision(
+                                        relPath,
+                                        contentDigest(newContent),
+                                        generation,
+                                    ),
+                                );
+                                if (!removedStaleRevision) {
+                                    getOutputChannel().appendLine(
+                                        `${new Date().toISOString()} [push update deferred:echo-delete-superseded] ` +
+                                        `${relPath}: the local file advanced past the revision that matched the ` +
+                                        'remote-delete tombstone, so it was not removed',
+                                    );
+                                    this.scheduleLocalPushRetry(
+                                        relPath,
+                                        fromUri,
+                                        'local-advanced-before-echo-delete',
+                                        generation,
+                                        type,
+                                    );
+                                    outcome = 'blocked';
+                                    errorMessage = 'local file advanced before the remote-delete echo could be applied';
+                                    return;
+                                }
                                 getOutputChannel().appendLine(
                                     `${new Date().toISOString()} [push update suppressed:remote-delete-echo] ${relPath}`,
                                 );
-                                this.setBypassCache(relPath, undefined);
-                                try {
-                                    this.requireSyncSession(generation);
-                                    await this.runSessionIO(
-                                        generation,
-                                        () => vscode.workspace.fs.delete(fromUri, {recursive:false}),
-                                    );
-                                } catch {
-                                    // The stale local file may already be gone.
-                                }
                                 outcome = 'suppressed';
                                 return;
                             }
@@ -10720,6 +10847,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         () => this.localTargetNeedsPush(
                             targetRelPath,
                             targetLocalUri,
+                            observedType,
                         ),
                         {
                             delays:
@@ -10730,6 +10858,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     : await this.localTargetNeedsPush(
                         targetRelPath,
                         targetLocalUri,
+                        observedType,
                     );
                 this.removalAcceptedSyncErrors.delete(targetRelPath);
                 return currentType;
@@ -11212,7 +11341,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (relPath===undefined || this.matchIgnorePatterns(relPath)) { continue; }
             let type: 'update' | 'delete' | undefined;
             try {
-                type = await this.localTargetNeedsPush(relPath, event.uri);
+                type = await this.localTargetNeedsPush(relPath, event.uri, event.type);
             } catch (error) {
                 // While the watcher is degraded this loop is the only thing
                 // syncing local edits at all, so one path that refuses to be

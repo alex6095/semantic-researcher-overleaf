@@ -13,6 +13,7 @@ import {
     onDidChangeActiveReplicaRoot,
 } from './utils/localReplicaWorkspace';
 import { migrateLegacyNamespace } from './utils/namespaceMigration';
+import { cleanupRemovedAgentReview } from './utils/agentReviewCleanup';
 
 type ActiveReplicaSyncTarget = {
     key: string,
@@ -22,6 +23,11 @@ type ActiveReplicaSyncTarget = {
 
 export async function activate(context: vscode.ExtensionContext) {
     await migrateLegacyNamespace(context);
+    // Upgrade cleanup for the removed Agent Review feature. It runs before
+    // anything else touches the workspace so a coding agent can never pick up
+    // the stale "edit a draft copy instead" instructions from a build that no
+    // longer reads drafts. Self-guarding and non-throwing.
+    await cleanupRemovedAgentReview(context);
 
     // Register: [core] RemoteFileSystemProvider
     const remoteFileSystemProvider = new RemoteFileSystemProvider(context);

@@ -41,13 +41,18 @@ class FakeVirtualFileSystem {
     public readonly onDidChangeConnection = this.connectionEmitter.event;
     private readonly persists = new Map<string, PersistRecord>();
     // Every byte that reaches Overleaf goes through writeFileFromRemoteBaseline
-    // (guardedReplaceRemoteBinary and pushWithRetry both end here), so this is
-    // what proves duplicate uploads absent rather than merely unobserved, and
-    // what lets a test check the provenance of the bytes themselves.
-    public readonly uploadedDigests: string[] = [];
+    // (guardedReplaceRemoteBinary and pushWithRetry both end here). Entries are
+    // appended only once the bytes have actually landed, and they carry the
+    // target path and a monotonic sequence number so a test can check causal
+    // provenance rather than mere set membership.
+    public readonly uploads: Array<{seq: number; relPath: string; digest: string}> = [];
+
+    public get uploadedDigests() {
+        return this.uploads.map(upload => upload.digest);
+    }
 
     public get uploadCount() {
-        return this.uploadedDigests.length;
+        return this.uploads.length;
     }
 
     constructor(
@@ -88,10 +93,10 @@ class FakeVirtualFileSystem {
         _remoteBaseline?: Uint8Array,
         expectedRemoteMissing = false,
     ) {
-        this.uploadedDigests.push(sha1Bytes(content));
         if (expectedRemoteMissing && await pathExists(uri)) {
             const remoteContent = await vscode.workspace.fs.readFile(uri);
             if (Buffer.compare(Buffer.from(remoteContent), Buffer.from(content))===0) {
+                this.recordUpload(uri, content);
                 return content;
             }
             throw new RemoteDocumentMergeConflictError(
@@ -99,7 +104,17 @@ class FakeVirtualFileSystem {
             );
         }
         await vscode.workspace.fs.writeFile(uri, content);
+        this.recordUpload(uri, content);
         return content;
+    }
+
+    private recordUpload(uri: vscode.Uri, content: Uint8Array) {
+        const relative = path.relative(this.remoteRoot.fsPath, uri.fsPath).split(path.sep).join('/');
+        this.uploads.push({
+            seq: nextObservationSeq(),
+            relPath: '/' + relative.split('/').filter(Boolean).join('/'),
+            digest: sha1Bytes(content),
+        });
     }
 
     async createDirectoryIfMissing(uri: vscode.Uri) {
@@ -175,6 +190,14 @@ function sha1(content: string) {
 
 function sha1Bytes(content: Uint8Array) {
     return crypto.createHash('sha1').update(Buffer.from(content)).digest('hex');
+}
+
+// One monotonic clock shared by every observation the provenance test records,
+// so "this read happened before that upload" is a fact rather than an inference.
+let observationSeq = 0;
+function nextObservationSeq() {
+    observationSeq += 1;
+    return observationSeq;
 }
 
 async function waitUntil(predicate: () => boolean, timeoutMs = 4000) {
@@ -421,6 +444,134 @@ suite('Local Replica stable-snapshot push', function () {
         internals.readOpenedLocalFile = originalRead;
     });
 
+    test('P0: the tombstone echo delete removes only the revision that authorized it', async () => {
+        const remoteRoot = await tempDir('sr-stable-echo-cas-remote-');
+        const localRoot = await tempDir('sr-stable-echo-cas-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
+        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
+        await writeText(remoteSample, 'tombstoned bytes');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+
+        await vscode.workspace.fs.delete(remoteSample);
+        await internals.applySync('pull', 'delete', '/sample.tex', remoteSample, localSample);
+        const tombstone = internals.remoteDeleteTombstones.get('/sample.tex');
+        assert.ok(tombstone);
+
+        // Revision A is a genuine tombstone echo: same bytes, mtime inside the
+        // window. It authorizes the suppression delete.
+        await writeText(localSample, 'tombstoned bytes');
+        const staleTime = new Date(tombstone.staleLocalMtime);
+        await fs.utimes(localSample.fsPath, staleTime, staleTime);
+
+        // Revision B lands after the authorization and before the delete: a real
+        // edit the user would lose if the delete were revision-unconditional.
+        const originalStableRead = internals.readStableConfinedLocalFile.bind(scm);
+        let replaced = false;
+        internals.readStableConfinedLocalFile = async (
+            relPath: string,
+            uri?: vscode.Uri,
+            generation?: number,
+        ) => {
+            const snapshot = await originalStableRead(relPath, uri, generation);
+            if (relPath==='/sample.tex' && !replaced) {
+                replaced = true;
+                await writeText(localSample, 'legitimate revision B');
+            }
+            return snapshot;
+        };
+
+        let event: Events['scmSyncCompleteEvent'];
+        try {
+            event = await internals.applySync(
+                'push',
+                'update',
+                '/sample.tex',
+                localSample,
+                remoteSample,
+            ) as Events['scmSyncCompleteEvent'];
+        } finally {
+            internals.readStableConfinedLocalFile = originalStableRead;
+        }
+
+        assert.strictEqual(replaced, true, 'revision B must have landed before the delete');
+        assert.strictEqual(await pathExists(localSample), true, 'revision B was deleted');
+        assert.strictEqual(await readText(localSample), 'legitimate revision B');
+        assert.ok(hasLine('[push update deferred:echo-delete-superseded]'));
+        assert.ok(
+            !hasLine('[push update suppressed:remote-delete-echo]'),
+            'a refused delete must not be reported as a completed suppression',
+        );
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(internals.locallyDivergedPaths.has('/sample.tex'), true);
+
+        // And the deferral converges: B is not stranded by the cleared provenance.
+        const retry = await waitForSyncComplete(localRoot, '/sample.tex', 'push', 'update');
+        assert.strictEqual(retry.outcome, 'success');
+        assert.strictEqual(await readText(remoteSample), 'legitimate revision B');
+        assert.strictEqual(await readText(localSample), 'legitimate revision B');
+        assert.strictEqual(vfs.uploadCount, 1);
+    });
+
+    test('a short read is refused even when every metadata field matches', async () => {
+        const remoteRoot = await tempDir('sr-stable-shortread-remote-');
+        const localRoot = await tempDir('sr-stable-shortread-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'complete revision bytes');
+
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+
+        // The file is never touched, so dev/ino/size/mtime/ctime are all
+        // identical before and after — exactly the state a same-length rewrite
+        // inside one coarse timestamp tick leaves behind. Only the byte count
+        // betrays that the reader saw a partial file.
+        const originalRead = internals.readOpenedLocalFile.bind(scm);
+        let shortened = false;
+        internals.readOpenedLocalFile = async (handle: fs.FileHandle) => {
+            const content = await originalRead(handle);
+            if (!shortened) {
+                shortened = true;
+                return content.subarray(0, content.length-4);
+            }
+            return content;
+        };
+
+        try {
+            let captured: unknown;
+            await assert.rejects(
+                () => internals.readConfinedLocalFileSnapshot('/main.tex'),
+                (error: unknown) => {
+                    captured = error;
+                    return /bytes for a .*-byte revision/.test(String((error as Error).message));
+                },
+            );
+            assert.strictEqual(captured instanceof LocalReadUnstableError, true);
+            assert.strictEqual((captured as LocalReadUnstableError).reason, 'descriptor-changed');
+
+            // And the stabilizing wrapper recovers on the next attempt.
+            shortened = false;
+            const snapshot = await internals.readStableConfinedLocalFile('/main.tex') as {
+                content: Uint8Array;
+                stat: vscode.FileStat;
+            };
+            assert.strictEqual(
+                Buffer.from(snapshot.content).toString('utf-8'),
+                'complete revision bytes',
+            );
+            assert.strictEqual(snapshot.content.length, snapshot.stat.size);
+            assert.ok(hasLine('[local read deferred:descriptor-changed]'));
+        } finally {
+            internals.readOpenedLocalFile = originalRead;
+        }
+    });
+
     test('read metadata is derived from the descriptor that produced the bytes', async () => {
         const remoteRoot = await tempDir('sr-stable-token-remote-');
         const localRoot = await tempDir('sr-stable-token-local-');
@@ -575,6 +726,89 @@ suite('Local Replica stable-snapshot push', function () {
 
     // ---------------------------------------------- transient disappearance ----
 
+    test('classification does not turn a watcher update into a delete on one missing observation', async () => {
+        const remoteRoot = await tempDir('sr-stable-classify-enoent-remote-');
+        const localRoot = await tempDir('sr-stable-classify-enoent-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'v1');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+
+        const pathEvents: Events['scmSyncCompleteEvent'][] = [];
+        const subscription = EventBus.on('scmSyncCompleteEvent', pushEvent => {
+            if (pushEvent.relPath==='/main.tex' && pushEvent.direction==='push') {
+                pathEvents.push(pushEvent);
+            }
+        });
+
+        // The unlink half of an atomic replacement has landed; the rename half
+        // has not. The watcher reported a change, not a delete.
+        await fs.rm(localMain.fsPath);
+        const originalStat = internals.statConfinedLocalUri.bind(scm);
+        let classificationStats = 0;
+        internals.statConfinedLocalUri = async (uri: vscode.Uri, operation: string) => {
+            if (
+                uri.fsPath===localMain.fsPath
+                && operation.startsWith('classification of')
+            ) {
+                classificationStats += 1;
+                // The replacement lands while the classifier is still looking.
+                if (classificationStats===2) { await writeText(localMain, 'v2'); }
+            }
+            return originalStat(uri, operation);
+        };
+
+        try {
+            const event = await internals.enqueueLocalPendingEvent(
+                '/main.tex',
+                {latestType: 'update', latestUri: localMain},
+                internals.syncGeneration,
+            ) as Events['scmSyncCompleteEvent'];
+
+            assert.ok(classificationStats>=2, 'the classifier must look more than once');
+            assert.ok(hasLine('[classification recheck:vanished-during-update]'));
+            assert.strictEqual(event.type, 'update');
+            assert.strictEqual(event.outcome, 'success');
+            assert.strictEqual(await pathExists(remoteMain), true, 'Overleaf copy was deleted');
+            assert.strictEqual(await readText(remoteMain), 'v2');
+            assert.deepStrictEqual(
+                pathEvents.filter(pushEvent => pushEvent.type==='delete'),
+                [],
+                'no delete may be propagated for a replacement in flight',
+            );
+
+            // The window is bounded, so a genuinely deleted file that the watcher
+            // mislabelled as a change still propagates its delete.
+            await fs.rm(localMain.fsPath);
+            const beforeMislabelled = classificationStats;
+            assert.strictEqual(
+                await internals.localTargetNeedsPush('/main.tex', localMain, 'update'),
+                'delete',
+            );
+            assert.strictEqual(
+                classificationStats-beforeMislabelled,
+                4,
+                'the recheck window must be bounded, not unbounded',
+            );
+
+            // A watcher-reported delete is direct evidence and spends no window.
+            const beforeObservedDelete = classificationStats;
+            assert.strictEqual(
+                await internals.localTargetNeedsPush('/main.tex', localMain, 'delete'),
+                'delete',
+            );
+            assert.strictEqual(classificationStats-beforeObservedDelete, 1);
+        } finally {
+            internals.statConfinedLocalUri = originalStat;
+            subscription.dispose();
+        }
+    });
+
     test('a vanish during an already-classified update defers instead of deleting the remote', async () => {
         const remoteRoot = await tempDir('sr-stable-enoent-remote-');
         const localRoot = await tempDir('sr-stable-enoent-local-');
@@ -724,13 +958,71 @@ suite('Local Replica stable-snapshot push', function () {
 
     // The container run of the previous test exposed the real boundary of the
     // descriptor guard: it proves the bytes were not torn, not that the file
-    // stopped moving afterwards. A read can legitimately return a complete
-    // revision that is superseded microseconds later, and on a filesystem whose
-    // timestamps are coarse enough the guard cannot see that. What must hold
-    // regardless is that nothing invents bytes: every payload that reaches
-    // Overleaf is a revision some confined read actually returned, and the
-    // manifest re-verification keeps re-driving until the settled revision lands.
-    test('every uploaded byte came from a coherent confined read, and the settled revision converges', async () => {
+    // stopped moving afterwards. A read can legitimately return a revision that
+    // is superseded microseconds later, and on a filesystem whose timestamps are
+    // coarse enough the guard cannot see that.
+    //
+    // The guarantee that must hold regardless is narrower than "every payload was
+    // returned by a confined read", which is false: the auto-merge writers push
+    // diff3 output that no read produced. The true guarantee is that a payload is
+    // either (a) causally traceable to an earlier confined read OF THE SAME PATH
+    // that returned exactly those bytes, or (b) the output of an auto-merge whose
+    // local side was such a read. Nothing is cached, replayed from a buffer, or
+    // fabricated from nothing.
+    //
+    // Instrumentation notes, both of which the previous version of this test got
+    // wrong: uploads are recorded only after the bytes land, and every
+    // observation carries a path and a sequence number, so a later read cannot
+    // retroactively legitimise an earlier upload.
+    function installProvenanceProbes(scm: LocalReplicaSCMProvider) {
+        const internals = scm as any;
+        const reads: Array<{seq: number; relPath: string; digest: string}> = [];
+        const mergeProducts = new Set<string>();
+        const originalSnapshotRead = internals.readConfinedLocalFileSnapshot.bind(scm);
+        internals.readConfinedLocalFileSnapshot = async (relPath: string, uri?: vscode.Uri) => {
+            const snapshot = await originalSnapshotRead(relPath, uri);
+            reads.push({
+                seq: nextObservationSeq(),
+                relPath,
+                digest: sha1Bytes(snapshot.content),
+            });
+            return snapshot;
+        };
+        const originalMerge = internals.mergeTextContents.bind(scm);
+        internals.mergeTextContents = (...args: unknown[]) => {
+            const merged = originalMerge(...args);
+            if (merged!==undefined) { mergeProducts.add(sha1Bytes(merged)); }
+            return merged;
+        };
+        return {
+            reads,
+            mergeProducts,
+            restore() {
+                internals.readConfinedLocalFileSnapshot = originalSnapshotRead;
+                internals.mergeTextContents = originalMerge;
+            },
+        };
+    }
+
+    function assertUploadProvenance(
+        vfs: FakeVirtualFileSystem,
+        probes: {reads: Array<{seq: number; relPath: string; digest: string}>; mergeProducts: Set<string>},
+    ) {
+        for (const upload of vfs.uploads) {
+            const causallyRead = probes.reads.some(read =>
+                read.seq<upload.seq
+                && read.relPath===upload.relPath
+                && read.digest===upload.digest
+            );
+            assert.ok(
+                causallyRead || probes.mergeProducts.has(upload.digest),
+                `upload #${upload.seq} of ${upload.relPath} carried bytes that no earlier `
+                + 'confined read of that path returned and that no auto-merge produced',
+            );
+        }
+    }
+
+    test('uploads are causally traceable to an earlier confined read of the same path', async () => {
         const remoteRoot = await tempDir('sr-stable-provenance-remote-');
         const localRoot = await tempDir('sr-stable-provenance-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -742,19 +1034,11 @@ suite('Local Replica stable-snapshot push', function () {
         const scm = createSCM(remoteRoot, localRoot, vfs);
         await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
         const internals = scm as any;
+        const probes = installProvenanceProbes(scm);
 
-        // Record what every coherent read actually returned.
-        const coherentReads = new Set<string>();
-        const originalSnapshotRead = internals.readConfinedLocalFileSnapshot.bind(scm);
-        internals.readConfinedLocalFileSnapshot = async (relPath: string, uri?: vscode.Uri) => {
-            const snapshot = await originalSnapshotRead(relPath, uri);
-            coherentReads.add(sha1Bytes(snapshot.content));
-            return snapshot;
-        };
-
-        // Model the guard's blind spot exactly: the read returned a complete,
-        // untorn revision, and the writer moved the file on immediately after,
-        // with no metadata difference left for the guard to observe.
+        // Model the guard's blind spot exactly: the read returned an untorn
+        // revision, and the writer moved the file on immediately after, with no
+        // metadata difference left for the guard to observe.
         const originalStableRead = internals.readStableConfinedLocalFile.bind(scm);
         let supersededCount = 0;
         internals.readStableConfinedLocalFile = async (
@@ -792,19 +1076,71 @@ suite('Local Replica stable-snapshot push', function () {
             );
         } finally {
             internals.readStableConfinedLocalFile = originalStableRead;
-            internals.readConfinedLocalFileSnapshot = originalSnapshotRead;
+            probes.restore();
         }
 
         assert.strictEqual(supersededCount, 2, 'the blind spot must have been exercised');
-        assert.ok(vfs.uploadedDigests.length>=2, 'the scenario must actually upload');
-        for (const digest of vfs.uploadedDigests) {
-            assert.ok(
-                coherentReads.has(digest),
-                'an upload carried bytes no confined read ever returned',
-            );
-        }
+        assert.ok(vfs.uploads.length>=2, 'the scenario must actually upload');
+        assert.strictEqual(probes.mergeProducts.size, 0, 'this scenario must not auto-merge');
+        assertUploadProvenance(vfs, probes);
         assert.strictEqual(await readText(remoteMain), 'settled revision 3');
         assert.strictEqual(await readText(localMain), 'settled revision 3');
+    });
+
+    test('the push-side auto-merge writer uploads merge output built from a confined read', async () => {
+        const remoteRoot = await tempDir('sr-stable-merge-remote-');
+        const localRoot = await tempDir('sr-stable-merge-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'line1\nline2\nline3\n');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        const probes = installProvenanceProbes(scm);
+
+        // Non-overlapping concurrent edits: the push path three-way merges and
+        // uploads bytes that exist nowhere on disk.
+        await writeText(localMain, 'LOCAL\nline2\nline3\n');
+        await writeText(remoteMain, 'line1\nline2\nREMOTE\n');
+
+        let event: Events['scmSyncCompleteEvent'];
+        try {
+            event = await internals.applySync(
+                'push',
+                'update',
+                '/main.tex',
+                localMain,
+                remoteMain,
+            ) as Events['scmSyncCompleteEvent'];
+        } finally {
+            probes.restore();
+        }
+
+        assert.strictEqual(event.outcome, 'success');
+        assert.strictEqual(await readText(remoteMain), 'LOCAL\nline2\nREMOTE\n');
+        assert.strictEqual(await readText(localMain), 'LOCAL\nline2\nREMOTE\n');
+        assert.strictEqual(vfs.uploads.length, 1);
+
+        const merged = sha1Bytes(Buffer.from('LOCAL\nline2\nREMOTE\n', 'utf-8'));
+        assert.ok(probes.mergeProducts.has(merged), 'the upload must be recorded as merge output');
+        // The exception is real: these bytes were never returned by any read.
+        assert.strictEqual(
+            probes.reads.some(read => read.digest===merged && read.seq<vfs.uploads[0].seq),
+            false,
+            'the merge product is deliberately not a previously-read revision',
+        );
+        // The merge input was, though, which is the part that must stay true.
+        assert.ok(
+            probes.reads.some(read =>
+                read.relPath==='/main.tex'
+                && read.digest===sha1Bytes(Buffer.from('LOCAL\nline2\nline3\n', 'utf-8'))
+            ),
+            'the local side of the merge must come from a confined read',
+        );
+        assertUploadProvenance(vfs, probes);
     });
 
     test('the post-push compile reclassification blocks instead of escaping', async () => {
@@ -1128,6 +1464,56 @@ suite('Local Replica stable-snapshot push', function () {
             assert.deepStrictEqual(pushEvents, [], 'a cancelled retry must never fire');
         } finally {
             subscription.dispose();
+        }
+    });
+
+    test('a session teardown wakes an in-flight stabilization sleep instead of holding it', async () => {
+        const remoteRoot = await tempDir('sr-stable-sleep-remote-');
+        const localRoot = await tempDir('sr-stable-sleep-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'baseline bytes');
+
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        // Long enough that finishing the delay would be unmistakable.
+        (LocalReplicaSCMProvider as any).localReadStabilizeDelays = [10_000];
+
+        const originalRead = internals.readOpenedLocalFile.bind(scm);
+        let reads = 0;
+        internals.readOpenedLocalFile = async (handle: fs.FileHandle) => {
+            const content = await originalRead(handle);
+            reads += 1;
+            await rewriteInPlace(localMain, `baseline bytes${'!'.repeat(reads)}`);
+            return content;
+        };
+
+        try {
+            const pending = internals.readStableConfinedLocalFile('/main.tex') as Promise<unknown>;
+            await waitUntil(() => internals.stabilizeSleeps.size===1);
+            const startedAt = Date.now();
+
+            // Exactly the order deactivateSyncSession uses.
+            internals.stopSyncInputs();
+            internals.syncSessionActive = false;
+
+            let captured: unknown;
+            await assert.rejects(
+                () => pending,
+                (error: unknown) => {
+                    captured = error;
+                    return true;
+                },
+            );
+            const elapsed = Date.now()-startedAt;
+
+            assert.strictEqual(captured instanceof LocalReadUnstableError, true);
+            assert.ok(elapsed<2_000, `the sleep held for ${elapsed}ms instead of being woken`);
+            assert.strictEqual(internals.stabilizeSleeps.size, 0);
+            assert.strictEqual(reads, 1, 'no further disk read may follow a teardown');
+        } finally {
+            internals.readOpenedLocalFile = originalRead;
         }
     });
 
