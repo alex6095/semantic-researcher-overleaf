@@ -499,6 +499,10 @@ export function watchAgentReviewHelper(context: vscode.ExtensionContext): AgentR
     let timer: NodeJS.Timeout | undefined;
     let disposed = false;
     let cooldownUntil = 0;
+    // A check is in flight. Coalesced, never dropped: see `react`.
+    let running = false;
+    // Something changed that no check has looked at yet.
+    let pending = false;
 
     const stop = () => {
         if (timer) {
@@ -513,28 +517,7 @@ export function watchAgentReviewHelper(context: vscode.ExtensionContext): AgentR
         watcher = undefined;
     };
 
-    const react = async (metaRoot: string) => {
-        // Disposal is re-checked here as well as at scheduling time: the debounce
-        // may have elapsed after the extension shut down. An attempt already in
-        // flight is allowed to finish — its only effect is making the helper
-        // ours, which is harmless at any time.
-        if (disposed || Date.now()<cooldownUntil) {
-            return;
-        }
-        try {
-            const {attempted} = await ensureHelperNeutralized(metaRoot);
-            if (attempted) {
-                // Our own staged write, chmod and rename are about to fire this
-                // very watcher. Ignoring events for a moment keeps a replacement
-                // — including one that fails and retries — from feeding itself.
-                cooldownUntil = Date.now() + HELPER_WATCH_COOLDOWN_MS;
-            }
-        } catch (error) {
-            console.warn('Agent Review helper watch could not re-check the helper:', error);
-        }
-    };
-
-    const schedule = (metaRoot: string) => {
+    const scheduleIn = (metaRoot: string, delayMs: number) => {
         if (disposed) {
             return;
         }
@@ -544,7 +527,57 @@ export function watchAgentReviewHelper(context: vscode.ExtensionContext): AgentR
         timer = setTimeout(() => {
             timer = undefined;
             void react(metaRoot);
-        }, HELPER_WATCH_DEBOUNCE_MS);
+        }, delayMs);
+    };
+
+    /**
+     * Re-checks the helper, deferring rather than dropping.
+     *
+     * The cooldown and the in-flight flag both rate-limit the *work*; neither
+     * may discard the *knowledge* that something changed. A second pre-upgrade
+     * window reinstalling the helper while we are cooling down is exactly the
+     * case that matters, and silently returning here would leave that accepting
+     * helper live indefinitely.
+     */
+    const react = async (metaRoot: string) => {
+        // Disposal is re-checked here as well as at scheduling time: the debounce
+        // may have elapsed after the extension shut down. An attempt already in
+        // flight is allowed to finish — its only effect is making the helper
+        // ours, which is harmless at any time.
+        if (disposed) {
+            return;
+        }
+        if (running) {
+            pending = true;
+            return;
+        }
+        const cooldownRemaining = cooldownUntil-Date.now();
+        if (cooldownRemaining>0) {
+            pending = true;
+            scheduleIn(metaRoot, cooldownRemaining);
+            return;
+        }
+
+        running = true;
+        pending = false;
+        try {
+            const {attempted} = await ensureHelperNeutralized(metaRoot);
+            if (attempted) {
+                // Our own staged write, chmod and rename are about to fire this
+                // very watcher. Holding off briefly keeps a replacement — including
+                // one that fails and retries — from feeding itself.
+                cooldownUntil = Date.now()+HELPER_WATCH_COOLDOWN_MS;
+            }
+        } catch (error) {
+            console.warn('Agent Review helper watch could not re-check the helper:', error);
+        } finally {
+            running = false;
+            if (pending && !disposed) {
+                // Something changed while that check was running. Run again, after
+                // the cooldown if one is now in force.
+                scheduleIn(metaRoot, Math.max(HELPER_WATCH_DEBOUNCE_MS, cooldownUntil-Date.now()));
+            }
+        }
     };
 
     const armed = (async () => {
@@ -555,7 +588,9 @@ export function watchAgentReviewHelper(context: vscode.ExtensionContext): AgentR
                 return;
             }
             // `persistent: false` so this can never hold the host process open.
-            watcher = nodeFs.watch(binRoot, {persistent: false}, () => schedule(metaRoot));
+            watcher = nodeFs.watch(binRoot, {persistent: false}, () => {
+                scheduleIn(metaRoot, HELPER_WATCH_DEBOUNCE_MS);
+            });
             watcher.on('error', error => {
                 // Watch limits, an unmounted path, a deleted directory: give up
                 // quietly. The activation-time check still covers this window.
@@ -564,7 +599,14 @@ export function watchAgentReviewHelper(context: vscode.ExtensionContext): AgentR
             });
             if (disposed) {
                 stop();
+                return;
             }
+            // Production arms this *after* the activation-time cleanup, and a
+            // watcher only reports what happens once it exists. A pre-upgrade
+            // window that reinstalled the helper in between produced no event for
+            // anyone, so the gap is closed by looking rather than by assuming it
+            // was empty.
+            await react(metaRoot);
         } catch (error) {
             console.warn('Could not watch the Agent Review helper directory:', error);
         }

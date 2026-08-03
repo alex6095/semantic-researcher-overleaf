@@ -18,10 +18,12 @@ import { getOutputChannel } from '../../utils/outputChannel';
 import * as localReplicaWorkspace from '../../utils/localReplicaWorkspace';
 import { setActiveReplicaRoot } from '../../utils/localReplicaWorkspace';
 
-// Mirrors REMOTE_DELETE_MTIME_SLOP_MS in localReplicaSCM.ts, which is module
-// private. The P0 regression depends on the exact predicate, so the test states
-// the window it is reasoning about rather than inferring it.
-const REMOTE_DELETE_MTIME_SLOP_MS = 2_000;
+// The forward tolerance the remote-delete echo predicate used to allow. It is no
+// longer in the product — a restored copy carries the deleted revision's
+// timestamp, so the comparison is "not newer than" — but the tests still state it
+// because it is exactly the window in which a user's own re-creation used to be
+// mistaken for the deleted revision and destroyed.
+const FORMER_REMOTE_DELETE_MTIME_SLOP_MS = 2_000;
 
 // contentDigest(undefined) in localReplicaSCM.ts. Stated here because the module
 // keeps it private and the bypass-seed assertion needs the exact value.
@@ -418,11 +420,11 @@ suite('Local Replica stable-snapshot push', function () {
         // metadata plus the FRESH bytes: mtime inside the window, digest equal.
         // Pairing them is what deleted the local file.
         assert.ok(
-            preReadStat.mtimeMs<=tombstone.staleLocalMtime+REMOTE_DELETE_MTIME_SLOP_MS,
+            preReadStat.mtimeMs<=tombstone.staleLocalMtime,
             'the pre-read mtime must satisfy the remote-delete echo window',
         );
         assert.ok(
-            restoredTime.getTime()>tombstone.staleLocalMtime+REMOTE_DELETE_MTIME_SLOP_MS,
+            restoredTime.getTime()>tombstone.staleLocalMtime,
             'the revision actually read must fall outside the echo window',
         );
 
@@ -604,6 +606,71 @@ suite('Local Replica stable-snapshot push', function () {
         ) as Events['scmSyncCompleteEvent'];
         assert.strictEqual(echo.outcome, 'suppressed');
         assert.strictEqual(vfs.uploadCount, 0);
+    });
+
+    test('P0: a same-byte re-creation moments after the delete is not mistaken for the echo', async () => {
+        const remoteRoot = await tempDir('sr-stable-echo-window-remote-');
+        const localRoot = await tempDir('sr-stable-echo-window-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
+        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
+        await writeText(remoteSample, 'shared bytes');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+
+        await vscode.workspace.fs.delete(remoteSample);
+        await internals.applySync('pull', 'delete', '/sample.tex', remoteSample, localSample);
+        assert.strictEqual(await pathExists(localSample), false);
+        const tombstone = internals.remoteDeleteTombstones.get('/sample.tex');
+        assert.ok(tombstone);
+
+        // The user immediately re-creates the file by hand with the same content.
+        // Its timestamp is the moment of creation, so it is NEWER than the
+        // revision we removed — but only just, which is what the old forward
+        // tolerance swallowed.
+        await writeText(localSample, 'shared bytes');
+        // Half a second later, not one millisecond: fs.utimes takes a Date through
+        // a double-precision seconds value, and near the current epoch that is
+        // only accurate to ~120ns, so a sub-millisecond offset intermittently
+        // truncates back onto the deleted revision's own timestamp.
+        const recreatedTime = new Date(tombstone.staleLocalMtime+500);
+        await fs.utimes(localSample.fsPath, recreatedTime, recreatedTime);
+
+        // State the counterfactual explicitly, against what actually landed on
+        // disk rather than what was asked for: this file satisfies both halves of
+        // the old predicate, so the old code deleted it.
+        const recreatedMtimeMs = (await fs.stat(localSample.fsPath)).mtimeMs;
+        assert.strictEqual(sha1('shared bytes'), tombstone.digest);
+        assert.ok(
+            recreatedMtimeMs>tombstone.staleLocalMtime,
+            'the re-creation must actually be newer than the deleted revision',
+        );
+        assert.ok(
+            recreatedMtimeMs<=tombstone.staleLocalMtime+FORMER_REMOTE_DELETE_MTIME_SLOP_MS,
+            'the re-creation must land inside the tolerance that used to swallow it',
+        );
+
+        const event = await internals.applySync(
+            'push',
+            'update',
+            '/sample.tex',
+            localSample,
+            remoteSample,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(
+            await pathExists(localSample),
+            true,
+            'a hand re-creation was destroyed as if it were the deleted revision',
+        );
+        assert.strictEqual(await readText(localSample), 'shared bytes');
+        assert.ok(!hasLine('[push update suppressed:remote-delete-echo]'));
+        assert.strictEqual(event.outcome, 'success');
+        assert.strictEqual(await readText(remoteSample), 'shared bytes');
+        assert.strictEqual(vfs.uploadCount, 1);
     });
 
     test('P0: the tombstone echo delete refuses a same-byte recreate on a new inode', async () => {

@@ -42,7 +42,6 @@ import { decodeUtf8Text, mergeUtf8Text } from '../utils/threeWayMerge';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 const ECHO_WINDOW_MS = 500;
-const REMOTE_DELETE_MTIME_SLOP_MS = 2_000;
 const SYNC_MANIFEST_FILE = `${REPLICA_SETTINGS_DIR}/sync-manifest.json`;
 const SYNC_OWNER_FILE = 'sync-owner.json';
 const SYNC_OWNER_REPAIR_FILE = 'sync-owner.repair.json';
@@ -10210,10 +10209,38 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             // digest below it. Pairing fresh bytes with the older
                             // pre-read stat classifies a legitimately recreated
                             // file as a tombstone echo and deletes it locally.
+                            //
+                            // A tombstone carries an mtime only when we ourselves
+                            // deleted a local file with that mtime, so by the time
+                            // this runs the revision it describes is gone from the
+                            // path. The original cannot walk back on its own: a
+                            // later event for a missing path classifies as a
+                            // delete, and a push that finds it missing defers. So
+                            // the only thing this branch has to recognise is a
+                            // RESTORED COPY of the deleted revision — from the OS
+                            // trash, from our own operation guard, from a backup
+                            // tool — and every one of those carries the deleted
+                            // revision's timestamp forward with it.
+                            //
+                            // Hence the comparison is not "close to" but "not
+                            // newer than". A user re-creating the file gets the
+                            // moment of creation, which is necessarily later than
+                            // the revision we removed; any forward tolerance here
+                            // is precisely the window in which that user's own
+                            // work is mistaken for the copy we deleted, and is
+                            // then destroyed. There is no corresponding need for
+                            // tolerance in the other direction: an older timestamp
+                            // is even stronger evidence of a restore.
+                            //
+                            // Residue, stated rather than implied: a restore that
+                            // does NOT preserve the original timestamp is
+                            // indistinguishable from a fresh creation. That case
+                            // resolves as a new decision and is pushed to
+                            // Overleaf, which is the recoverable direction.
                             const staleLocalBytes = tombstone!==undefined
                                 && tombstone.digest===contentDigest(newContent)
                                 && tombstone.staleLocalMtime!==undefined
-                                && normalizeMtimeMs(readStat.mtime)<=tombstone.staleLocalMtime+REMOTE_DELETE_MTIME_SLOP_MS;
+                                && normalizeMtimeMs(readStat.mtime)<=tombstone.staleLocalMtime;
                             if (staleLocalBytes) {
                                 this.requireSyncSession(generation);
                                 // Seeded before the delete so the watcher echo of
