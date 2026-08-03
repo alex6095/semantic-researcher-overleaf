@@ -49,6 +49,13 @@ const SYNC_OWNER_REPAIR_FILE = 'sync-owner.repair.json';
 const LEGACY_SYNC_OWNER_DIRECTORY = 'sync-owner';
 const LEGACY_SYNC_OWNER_FILE = 'owner.json';
 
+// Reported instead of the raw internal read error whenever a push is deferred
+// because the local bytes would not hold still. It reaches the user through the
+// compile barrier, so it has to read as a state of the file rather than as a
+// defect in the extension.
+export const LOCAL_SNAPSHOT_UNSTABLE =
+    'local file is still being written; no consistent snapshot available';
+
 export function matchesLocalReplicaIgnorePattern(path: string, pattern: string): boolean {
     return picomatch.isMatch(path, pattern, {dot: true});
 }
@@ -282,6 +289,38 @@ class LocalReplicaFolderSelectionRejectedError extends Error {}
 class ConcurrentReplicaChangeError extends Error {}
 export class LocalReplicaOwnershipUnavailableError extends Error {}
 
+export type LocalReadUnstableReason =
+    // The bytes moved under the open descriptor (latexmk rewriting in place).
+    | 'descriptor-changed'
+    // The path was replaced between the identity snapshot and open().
+    | 'reopened-different-inode'
+    // dev/ino under the path no longer match the descriptor we read.
+    | 'path-identity-changed'
+    // The path vanished after classification already concluded 'update' — an
+    // atomic temp-file replacement, not evidence of a user deletion.
+    | 'vanished-during-update';
+
+// A local read that observed a writer mid-flight. This is a normal condition,
+// not a failure: the only correct response is to defer and look again. It is a
+// distinct type so the handling layers can tell it apart from the security
+// refusals (symlink, path escape, non-regular file) that share the same read
+// primitive and must stay loud.
+export class LocalReadUnstableError extends Error {
+    // withRetry short-circuits on retryable===false. Without this its generic
+    // backoff would multiply on top of the in-task stabilization loop, turning
+    // one deferral into sixteen full re-reads of the same large file.
+    public readonly retryable = false;
+
+    constructor(
+        public readonly relPath: string,
+        public readonly reason: LocalReadUnstableReason,
+        message: string,
+    ) {
+        super(message);
+        this.name = 'LocalReadUnstableError';
+    }
+}
+
 function definedInitializationOptions(options?: InitializeLocalReplicaOptions): InitializeLocalReplicaOptions {
     return Object.fromEntries(
         Object.entries(options ?? {}).filter(([_key, value]) => value!==undefined),
@@ -354,6 +393,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // file) must not stop the scan, but a path that stays unreadable is silently
     // unsynced while the user was told a periodic scan covers them.
     private unscannableLocalPaths: Map<string, number> = new Map();
+    // Back-pressure state for paths whose local bytes will not hold still. A
+    // single mid-write read is normal and silent; this is what lets us tell the
+    // user after ~30s that the file has never once been coherent, without
+    // resetting that clock on every individual deferral.
+    private localStabilizeState: Map<string, {
+        firstUnstableAt: number;
+        attempts: number;
+    }> = new Map();
     private syncConflicts: Map<string, string> = new Map();
     private conflictLocalDigests: Map<string, string> = new Map();
     private localReplicaSettings?: {
@@ -418,6 +465,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private static readonly watcherHealthIntervalMs = 1000;
     private static readonly fallbackScanIntervalMs = 750;
     private static readonly unscannablePathWarnMs = 30_000;
+    // In-task backoff for a read that caught a writer mid-flight. It must stay
+    // an in-task loop: re-entering enqueueSync for the same path from inside its
+    // own queued task self-deadlocks. The total (~1.85s) is the ceiling on how
+    // long one push holds its path's queue slot.
+    private static readonly localReadStabilizeDelays = [100, 250, 500, 1000];
+    private static readonly localReadStabilizeWarnMs = 30_000;
+    private static readonly localReadStabilizeRearmMs = 750;
     private static readonly shouldUseDirectLocalWatcher = () => {
         const remoteName = vscode.env.remoteName?.toLowerCase();
         return remoteName?.includes('ssh')===true || Boolean(
@@ -1627,6 +1681,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.localWatcherHealthState = 'unknown';
         this.localWatcherWarningShown = false;
         this.unscannableLocalPaths.clear();
+        // The re-arm timers themselves live in pendingLocalEvents and are
+        // cleared with it below; this drops the deferral history so a new
+        // session does not inherit an already-expired warn clock.
+        this.localStabilizeState.clear();
         if (this.fallbackScanTimer) {
             clearTimeout(this.fallbackScanTimer);
             this.fallbackScanTimer = undefined;
@@ -1872,6 +1930,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return code==='FileNotFound'
             || code==='ENOENT'
             || /EntryNotFound|FileNotFound|ENOENT|not found/i.test(message);
+    }
+
+    private static isLocalReadUnstable(error: unknown): error is LocalReadUnstableError {
+        return error instanceof LocalReadUnstableError;
     }
 
     private static isSyncStatType(
@@ -6310,6 +6372,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             || Object.keys(this.syncManifest?.directories ?? {}).some(path => path.startsWith(`${relPath}/`));
     }
 
+    // A compile target whose local bytes will not hold still. It blocks the
+    // compile (running it would publish a stale remote copy) with the clear
+    // sentinel rather than a raw internal read error, and re-arms the path so
+    // the block resolves itself once the writer finishes.
+    private recordUnstableCompileTarget(
+        relPath: string,
+        localUri: vscode.Uri,
+        result: LocalReplicaPrecompileFlushResult,
+        generation: number,
+    ): void {
+        result.blockedCount += 1;
+        result.failures.push(`${relPath}: ${LOCAL_SNAPSHOT_UNSTABLE}`);
+        this.scheduleLocalPushRetry(relPath, localUri, 'unstable-read', generation);
+    }
+
     private async runPrecompilePush(
         relPath: string,
         localUri: vscode.Uri,
@@ -6324,12 +6401,24 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const vfsUri = this.vfs.pathToUri(relPath);
         const queuedBehindExistingSync = this.syncQueues.has(relPath);
         let alreadySynced = false;
+        // enqueueSync's catch-all consumes anything escaping the task and
+        // resolves to undefined, so an unstable read in the reclassification
+        // below has to be reported out of band or it would surface as the
+        // misleading "no sync completion event" with nothing scheduled.
+        let unstableSnapshot = false;
         const event = await this.enqueueSync(
             relPath,
             async () => {
                 let currentType = type;
                 if (type==='delete' || queuedBehindExistingSync) {
-                    const reclassifiedType = await this.localTargetNeedsPush(relPath, localUri);
+                    let reclassifiedType: 'update' | 'delete' | undefined;
+                    try {
+                        reclassifiedType = await this.localTargetNeedsPush(relPath, localUri);
+                    } catch (error) {
+                        if (!LocalReplicaSCMProvider.isLocalReadUnstable(error)) { throw error; }
+                        unstableSnapshot = true;
+                        return undefined;
+                    }
                     this.requireSyncSession(generation);
                     if (reclassifiedType===undefined) {
                         alreadySynced = true;
@@ -6351,6 +6440,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         );
         this.requireSyncSession(generation);
 
+        if (unstableSnapshot) {
+            this.recordUnstableCompileTarget(relPath, localUri, result, generation);
+            return;
+        }
         if (alreadySynced) {
             this.locallyDivergedPaths.delete(relPath);
             getOutputChannel().appendLine(
@@ -6366,7 +6459,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
         switch (event.outcome) {
             case 'success': {
-                const remainingChange = await this.localTargetNeedsPush(relPath, localUri);
+                let remainingChange: 'update' | 'delete' | undefined;
+                try {
+                    remainingChange = await this.localTargetNeedsPush(relPath, localUri);
+                } catch (error) {
+                    if (!LocalReplicaSCMProvider.isLocalReadUnstable(error)) { throw error; }
+                    // The upload itself landed; what we cannot prove is that the
+                    // local file has stopped moving since. Block rather than let
+                    // the compile run against a copy that may already be behind.
+                    this.recordUnstableCompileTarget(relPath, localUri, result, generation);
+                    break;
+                }
                 this.requireSyncSession(generation);
                 if (remainingChange===undefined) {
                     this.locallyDivergedPaths.delete(relPath);
@@ -6550,9 +6653,23 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         relPath: string,
         uri: vscode.Uri = this.localUri(relPath),
     ): Promise<Uint8Array> {
+        return (await this.readConfinedLocalFileSnapshot(relPath, uri)).content;
+    }
+
+    // Same read, but it also hands back the metadata of the revision the bytes
+    // actually came from. On the descriptor path that metadata is taken from the
+    // fd whose pre/post stats were just proven identical, never from a later
+    // path lstat: an atomic replace between the read and such an lstat would
+    // otherwise pair one revision's bytes with another revision's mtime, and the
+    // remote-delete echo check decides whether to erase the local file from
+    // exactly that pairing.
+    private async readConfinedLocalFileSnapshot(
+        relPath: string,
+        uri: vscode.Uri = this.localUri(relPath),
+    ): Promise<{content: Uint8Array; stat: vscode.FileStat}> {
         if (uri.scheme!=='file' || this.baseUri.scheme!=='file') {
-            await this.statConfinedLocalUri(uri, `read of ${relPath}`);
-            return vscode.workspace.fs.readFile(uri);
+            const stat = await this.statConfinedLocalUri(uri, `read of ${relPath}`);
+            return {content: await vscode.workspace.fs.readFile(uri), stat};
         }
 
         const before = await this.captureLocalPathIdentitySnapshot(
@@ -6571,7 +6688,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 String(descriptorStat.dev)!==before.finalStat.dev
                 || String(descriptorStat.ino)!==before.finalStat.ino
             ) {
-                throw new Error(
+                throw new LocalReadUnstableError(
+                    relPath,
+                    'reopened-different-inode',
                     `Local Replica read target changed while it was opened: ${uri.fsPath}`,
                 );
             }
@@ -6601,12 +6720,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     `read of ${relPath}`,
                 );
                 const pathStat = await nodeFs.lstat(uri.fsPath, {bigint: true});
+                // A symlink appearing at the path is a security refusal and stays
+                // a plain, immediate error. A plain dev/ino move is just a writer
+                // replacing the file, which retrying resolves.
+                if (pathStat.isSymbolicLink()) {
+                    throw new Error(
+                        `Local Replica read refuses symbolic links: ${uri.fsPath}`,
+                    );
+                }
                 if (
-                    pathStat.isSymbolicLink()
-                    || String(pathStat.dev)!==String(descriptorStat.dev)
+                    String(pathStat.dev)!==String(descriptorStat.dev)
                     || String(pathStat.ino)!==String(descriptorStat.ino)
                 ) {
-                    throw new Error(
+                    throw new LocalReadUnstableError(
+                        relPath,
+                        'path-identity-changed',
                         `Local Replica read path changed during confinement validation: ${uri.fsPath}`,
                     );
                 }
@@ -6615,6 +6743,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     `read of ${relPath}`,
                 );
             } else {
+                // captureLocalPathIdentitySnapshot has already refused symlinks
+                // and escapes on its own, so anything left here is identity drift.
                 const after = await this.captureLocalPathIdentitySnapshot(
                     uri,
                     `read of ${relPath}`,
@@ -6624,7 +6754,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     || after.finalStat.dev!==String(descriptorStat.dev)
                     || after.finalStat.ino!==String(descriptorStat.ino)
                 ) {
-                    throw new Error(
+                    throw new LocalReadUnstableError(
+                        relPath,
+                        'path-identity-changed',
                         `Local Replica read path changed during confinement validation: ${uri.fsPath}`,
                     );
                 }
@@ -6637,16 +6769,112 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 || descriptorStatAfter.mtimeNs!==descriptorStat.mtimeNs
                 || descriptorStatAfter.ctimeNs!==descriptorStat.ctimeNs
             ) {
-                throw new Error(
+                throw new LocalReadUnstableError(
+                    relPath,
+                    'descriptor-changed',
                     `Local Replica read target changed while bytes were read: ${uri.fsPath}`,
                 );
             }
-            return content;
+            return {
+                content,
+                stat: {
+                    type: vscode.FileType.File,
+                    ctime: Number(descriptorStatAfter.ctimeMs),
+                    mtime: Number(descriptorStatAfter.mtimeMs),
+                    size: Number(descriptorStatAfter.size),
+                },
+            };
         } finally {
             await handle.close();
         }
     }
 
+    // Bounded in-task backoff around the confined read. A read that lands in the
+    // middle of someone else's write is the normal case for a compiling project,
+    // so it is deferred silently here rather than reported. Exhausting the delays
+    // rethrows the typed error, and the caller re-arms the path: the guarantee is
+    // to retry indefinitely and upload the first coherent completed revision
+    // observed, not that a file being rewritten forever must eventually upload.
+    private async readStableConfinedLocalFile(
+        relPath: string,
+        uri: vscode.Uri = this.localUri(relPath),
+        generation = this.syncGeneration,
+    ): Promise<{content: Uint8Array; stat: vscode.FileStat}> {
+        const delays = LocalReplicaSCMProvider.localReadStabilizeDelays;
+        for (let attempt = 0; ; attempt++) {
+            try {
+                // Callers re-check the session immediately after this returns, so
+                // the generation is only used to stop burning the backoff budget
+                // on a session that is already gone.
+                return await this.readConfinedLocalFileSnapshot(relPath, uri);
+            } catch (error) {
+                if (
+                    !LocalReplicaSCMProvider.isLocalReadUnstable(error)
+                    || attempt>=delays.length
+                    || !this.isSyncSessionActive(generation)
+                ) {
+                    throw error;
+                }
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [local read deferred:${error.reason}] ${relPath} ` +
+                    `(attempt ${attempt+1}/${delays.length+1})`,
+                );
+                await new Promise(resolve => setTimeout(resolve, delays[attempt]));
+            }
+        }
+    }
+
+    // An atomic temp-file replacement (latexmk, an editor's write-temp+rename)
+    // can make the path vanish for microseconds. Classification already
+    // concluded this path is an update, so ENOENT here is the weakest possible
+    // evidence for a destructive remote delete: defer and let the re-armed push
+    // re-classify against whatever is on disk once the writer is done.
+    private asVanishedDuringUpdate(
+        relPath: string,
+        type: 'update' | 'delete',
+        error: unknown,
+    ): unknown {
+        if (type!=='update' || !LocalReplicaSCMProvider.isFileNotFoundError(error)) {
+            return error;
+        }
+        return new LocalReadUnstableError(
+            relPath,
+            'vanished-during-update',
+            `Local Replica push target vanished while an update was being applied: ${relPath}`,
+        );
+    }
+
+    private async statPushSourceOrDeferVanished(
+        relPath: string,
+        fromUri: vscode.Uri,
+        type: 'update' | 'delete',
+    ): Promise<vscode.FileStat> {
+        try {
+            return await this.statConfinedLocalUri(
+                fromUri,
+                `push classification of ${relPath}`,
+            );
+        } catch (error) {
+            throw this.asVanishedDuringUpdate(relPath, type, error);
+        }
+    }
+
+    private async readPushSourceOrDeferVanished(
+        relPath: string,
+        fromUri: vscode.Uri,
+        type: 'update' | 'delete',
+        generation: number,
+    ): Promise<{content: Uint8Array; stat: vscode.FileStat}> {
+        try {
+            return await this.readStableConfinedLocalFile(relPath, fromUri, generation);
+        } catch (error) {
+            throw this.asVanishedDuringUpdate(relPath, type, error);
+        }
+    }
+
+    // Classification and the precompile source scan both read through here, so
+    // stabilizing at this one seam is what makes a mid-write file defer instead
+    // of being reported as a classification failure or a scan failure.
     private readLocalFile(uri: vscode.Uri): Thenable<Uint8Array> {
         const relPath = this.relPathFromLocalFileUri(uri, 'read local file');
         if (relPath===undefined) {
@@ -6654,7 +6882,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 `Local Replica read is outside the selected folder: ${uri.toString()}`,
             ));
         }
-        return this.readConfinedLocalFile(relPath, uri);
+        return this.readStableConfinedLocalFile(relPath, uri)
+            .then(snapshot => snapshot.content);
     }
 
     private async localTargetNeedsPush(relPath: string, localUri: vscode.Uri): Promise<'update' | 'delete' | undefined> {
@@ -6946,6 +7175,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (!this.isSyncSessionActive(generation)) {
                     throw error;
                 }
+                if (LocalReplicaSCMProvider.isLocalReadUnstable(error)) {
+                    // Counted as blocked rather than failed on purpose: the scan
+                    // itself is complete (relPath is already in localFilePaths,
+                    // so delete synthesis cannot mistake it for missing) and
+                    // [compile barrier scan incomplete] must stay reserved for a
+                    // genuinely truncated enumeration.
+                    this.recordUnstableCompileTarget(relPath, uri, result, generation);
+                    continue;
+                }
                 result.failedCount += 1;
                 result.failures.push(`${relPath}: ${formatUnknownError(error)}`);
                 continue;
@@ -7021,11 +7259,30 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const forcedTargets = new Map<string, vscode.Uri>();
         const forcedDeleteTargets = new Map<string, vscode.Uri>();
         const explicitTargets = new Set<string>();
+        // These classifications used to escape flushBeforeCompile entirely, so a
+        // mid-write file aborted the barrier before [compile barrier end] was
+        // logged and surfaced a raw internal read error. Security refusals still
+        // propagate untouched.
+        // 'unstable' is distinct from undefined: undefined means the path is
+        // provably in sync, while unstable means we could not tell — and the
+        // caller must not then clear the path's divergence.
+        const classifyCompileTarget = async (
+            relPath: string,
+            localUri: vscode.Uri,
+        ): Promise<'update' | 'delete' | 'unstable' | undefined> => {
+            try {
+                return await this.localTargetNeedsPush(relPath, localUri);
+            } catch (error) {
+                if (!LocalReplicaSCMProvider.isLocalReadUnstable(error)) { throw error; }
+                this.recordUnstableCompileTarget(relPath, localUri, result, generation);
+                return 'unstable';
+            }
+        };
         for (const localUri of localUris) {
             const relPath = this.relPathFromLocalFileUri(localUri, 'precompile saved document flush');
             if (relPath===undefined || this.matchIgnorePatterns(relPath)) { continue; }
             explicitTargets.add(relPath);
-            const type = await this.localTargetNeedsPush(relPath, localUri);
+            const type = await classifyCompileTarget(relPath, localUri);
             this.requireSyncSession(generation);
             if (type==='update') {
                 forcedTargets.set(relPath, localUri);
@@ -7039,7 +7296,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         for (const relPath of divergedPaths) {
             if (this.matchIgnorePatterns(relPath)) { continue; }
             const localUri = this.localUri(relPath);
-            const type = await this.localTargetNeedsPush(relPath, localUri);
+            const type = await classifyCompileTarget(relPath, localUri);
             this.requireSyncSession(generation);
             if (type==='update') {
                 forcedTargets.set(relPath, localUri);
@@ -7098,8 +7355,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (this.pendingLocalEvents.get(relPath)!==pending) { continue; }
             clearTimeout(pending.timer);
             this.pendingLocalEvents.delete(relPath);
-            const currentType = await this.localTargetNeedsPush(relPath, pending.latestUri);
+            const currentType = await classifyCompileTarget(relPath, pending.latestUri);
             this.requireSyncSession(generation);
+            if (currentType==='unstable') { continue; }
             if (currentType===undefined) {
                 this.locallyDivergedPaths.delete(relPath);
                 continue;
@@ -7510,6 +7768,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         for (const path of [...this.locallyDivergedPaths]) {
             if (matches(path)) { this.locallyDivergedPaths.delete(path); }
         }
+        for (const path of [...this.localStabilizeState.keys()]) {
+            if (matches(path)) { this.clearLocalStabilizeState(path); }
+        }
         for (const path of Object.keys(this.syncManifest?.files ?? {})) {
             if (matches(path)) { this.removeSyncManifestEntry(path); }
         }
@@ -7690,7 +7951,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         formatUnknownError(error),
                     );
                     this.locallyDivergedPaths.add(relPath);
-                    maybeWarnSyncFailure(relPath, error);
+                    // A deferred read has already been re-armed by whoever threw
+                    // it; toasting here would turn a normal mid-write read into
+                    // a user-visible sync failure.
+                    if (!LocalReplicaSCMProvider.isLocalReadUnstable(error)) {
+                        maybeWarnSyncFailure(relPath, error);
+                    }
                 }
                 return undefined;
             })
@@ -8586,6 +8852,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.seenLocalEntities.clear();
         this.remoteDeleteTombstones.clear();
         this.locallyDivergedPaths.clear();
+        this.localStabilizeState.clear();
         this.syncConflicts.clear();
         this.conflictLocalDigests.clear();
         this.pendingLocalEvents.forEach(pending => clearTimeout(pending.timer));
@@ -8815,6 +9082,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         generation: number,
     ): void {
         if (!this.isSyncSessionActive(generation)) { return; }
+        // A writer holding the file is not a classification failure. It gets the
+        // silent deferral path instead: no toast, no outcome:'error' event, and
+        // the same single re-arm through pendingLocalEvents.
+        if (LocalReplicaSCMProvider.isLocalReadUnstable(error)) {
+            this.scheduleLocalPushRetry(
+                relPath,
+                localUri,
+                'unstable-read',
+                generation,
+                observedType,
+            );
+            return;
+        }
         const errorMessage = formatUnknownError(error);
         this.locallyDivergedPaths.add(relPath);
         getOutputChannel().appendLine(
@@ -8848,6 +9128,110 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             latestType: observedType,
             latestUri: localUri,
         });
+    }
+
+    // The single re-arm point for a push that could not obtain (or could not
+    // keep) a coherent local snapshot. Everything that detects the condition
+    // funnels through here so watcher events and retries share one
+    // pendingLocalEvents entry and cannot fan out into duplicate uploads.
+    private scheduleLocalPushRetry(
+        relPath: string,
+        localUri: vscode.Uri,
+        reason: 'unstable-read' | 'local-advanced-during-push',
+        generation: number,
+        observedType: 'update' | 'delete' = 'update',
+    ): void {
+        if (!this.isSyncSessionActive(generation)) { return; }
+        // Stay visibly dirty: the compile barrier and the degraded-watcher scan
+        // both read this set, and neither may believe the path is settled.
+        this.locallyDivergedPaths.add(relPath);
+        const state = this.localStabilizeState.get(relPath)
+            ?? {firstUnstableAt: Date.now(), attempts: 0};
+        state.attempts += 1;
+        const unstableForMs = Date.now()-state.firstUnstableAt;
+        if (unstableForMs>=LocalReplicaSCMProvider.localReadStabilizeWarnMs) {
+            // Same policy as recordUnscannableLocalPath: individual deferrals are
+            // normal and silent, but a file that has not been coherent once in
+            // half a minute is not reaching Overleaf and the user must not be
+            // left believing it is. firstUnstableAt is deliberately not reset —
+            // retries continue after the warning, and maybeWarnSyncFailure
+            // already rate-limits to one toast per (path × message) per 60s.
+            maybeWarnSyncFailure(relPath, new Error(
+                'this file is being rewritten continuously, so a consistent '
+                + 'snapshot could not be sent to Overleaf yet; retrying',
+            ));
+        }
+        this.localStabilizeState.set(relPath, state);
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [push deferred:${reason}] ${relPath} ` +
+            `(attempt=${state.attempts}, unstableFor=${unstableForMs}ms)`,
+        );
+
+        const existing = this.pendingLocalEvents.get(relPath);
+        if (existing) {
+            clearTimeout(existing.timer);
+        }
+        // Restart the coalescing window rather than inheriting an exhausted
+        // firstEventAt: computeDebounceDelay would otherwise return 0 and the
+        // re-arm would fire immediately, spinning on a file that is still busy.
+        const firstEventAt = Date.now();
+        const timer = setTimeout(() => {
+            if (!this.isSyncSessionActive(generation)) { return; }
+            const pending = this.pendingLocalEvents.get(relPath);
+            if (!pending || pending.timer!==timer) { return; }
+            this.pendingLocalEvents.delete(relPath);
+            // Deliberately syncToVFS and not queueForcedPush: the
+            // enqueueLocalPendingEvent classification behind it clears
+            // locallyDivergedPaths when the path turns out to be synced after
+            // all, so a file that settles back to the pushed bytes stops being
+            // reported as diverged. queueForcedPush leaves it set.
+            void this.syncToVFS(pending.latestUri, pending.latestType);
+        }, LocalReplicaSCMProvider.localReadStabilizeRearmMs);
+        this.pendingLocalEvents.set(relPath, {
+            timer,
+            firstEventAt,
+            latestType: observedType,
+            latestUri: localUri,
+        });
+    }
+
+    private clearLocalStabilizeState(relPath: string): void {
+        this.localStabilizeState.delete(relPath);
+    }
+
+    // Consume recordSyncManifestEntry's stability verdict instead of discarding
+    // it. `false` means the local file moved while the remote operation was in
+    // flight, so the delivered bytes are already a past revision: the push
+    // succeeded, but it is not the last one this path needs.
+    private async recordPushManifestEntry(
+        relPath: string,
+        vfsUri: vscode.Uri,
+        localUri: vscode.Uri,
+        content: Uint8Array,
+        generation: number,
+    ): Promise<void> {
+        const stable = await this.recordSyncManifestEntry(
+            relPath,
+            vfsUri,
+            content,
+            generation,
+        );
+        if (stable) {
+            this.clearLocalStabilizeState(relPath);
+            return;
+        }
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [push intermediate] ${relPath}: ` +
+            `${content.length} bytes delivered; local advanced while the sync was in flight`,
+        );
+        // The outcome stays 'success' — the bytes that landed on Overleaf are a
+        // legitimate revision. What is missing is the next one.
+        this.scheduleLocalPushRetry(
+            relPath,
+            localUri,
+            'local-advanced-during-push',
+            generation,
+        );
     }
 
     private retainRemotePullIntentAfterClassificationFailure(
@@ -9279,6 +9663,29 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     // Re-check after the awaited remote revision capture above:
                     // a session swap there must abort before we mutate Overleaf.
                     this.requireSyncSession(generation);
+                    // Stronger evidence before a destructive delete. The ENOENT
+                    // that produced this classification can be an atomic
+                    // temp-file replacement, and everything since then has been
+                    // awaited I/O. If a real file is back at the path, the
+                    // deletion would destroy it on Overleaf, so defer and let
+                    // the re-armed push classify against what is actually there.
+                    // Directories are excluded: a recursive delete legitimately
+                    // races its own descendants, and the existing post-delete
+                    // recreation check at the end of this branch covers them.
+                    if (!directoryDelete) {
+                        const currentLocalState = await this.captureLocalPathRevision(
+                            relPath,
+                            generation,
+                        );
+                        if (currentLocalState.kind==='file') {
+                            throw new LocalReadUnstableError(
+                                relPath,
+                                'vanished-during-update',
+                                'Local Replica delete target reappeared before the '
+                                + `Overleaf copy was removed: ${relPath}`,
+                            );
+                        }
+                    }
                 }
                 if (action==='push' && !targetAlreadyMissing) {
                     try {
@@ -9414,10 +9821,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     return;
                 }
                 const stat = action==='push'
-                    ? await this.statConfinedLocalUri(
-                        fromUri,
-                        `push classification of ${relPath}`,
-                    )
+                    ? await this.statPushSourceOrDeferVanished(relPath, fromUri, type)
                     : await vscode.workspace.fs.stat(fromUri);
                 this.requireSyncSession(generation);
                 const isRemotePull = action==='pull';
@@ -9501,10 +9905,24 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         // Pull reads go through the retrying helper since
                         // transient binary failures are the trigger for the
                         // whole cascade we are guarding against. Push reads
-                        // are local-disk and need no retry.
-                        let newContent = action==='pull'
-                            ? await this.pullRemoteFile(relPath, fromUri, generation)
-                            : await this.readConfinedLocalFile(relPath, fromUri);
+                        // defer and re-read while a writer holds the file, and
+                        // hand back the metadata of the revision they actually
+                        // returned — `stat` above was taken before the deferrals
+                        // and may describe an earlier revision entirely.
+                        let newContent: Uint8Array;
+                        let readStat = stat;
+                        if (action==='pull') {
+                            newContent = await this.pullRemoteFile(relPath, fromUri, generation);
+                        } else {
+                            const snapshot = await this.readPushSourceOrDeferVanished(
+                                relPath,
+                                fromUri,
+                                type,
+                                generation,
+                            );
+                            newContent = snapshot.content;
+                            readStat = snapshot.stat;
+                        }
                         this.requireSyncSession(generation);
                         if (action==='pull') {
                             authoritativePullCompleted = true;
@@ -9517,10 +9935,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             : undefined;
                         if (action==='push') {
                             const tombstone = this.remoteDeleteTombstones.get(relPath);
+                            // The mtime MUST come from the same observation as the
+                            // digest below it. Pairing fresh bytes with the older
+                            // pre-read stat classifies a legitimately recreated
+                            // file as a tombstone echo and deletes it locally.
                             const staleLocalBytes = tombstone!==undefined
                                 && tombstone.digest===contentDigest(newContent)
                                 && tombstone.staleLocalMtime!==undefined
-                                && normalizeMtimeMs(stat.mtime)<=tombstone.staleLocalMtime+REMOTE_DELETE_MTIME_SLOP_MS;
+                                && normalizeMtimeMs(readStat.mtime)<=tombstone.staleLocalMtime+REMOTE_DELETE_MTIME_SLOP_MS;
                             if (staleLocalBytes) {
                                 getOutputChannel().appendLine(
                                     `${new Date().toISOString()} [push update suppressed:remote-delete-echo] ${relPath}`,
@@ -9574,7 +9996,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     this.seenLocalEntities.add(relPath);
                                     this.clearRemoteDelete(relPath);
                                     this.locallyDivergedPaths.delete(relPath);
-                                    await this.recordSyncManifestEntry(relPath, toUri, newContent, generation);
+                                    await this.recordPushManifestEntry(
+                                        relPath,
+                                        toUri,
+                                        fromUri,
+                                        newContent,
+                                        generation,
+                                    );
                                     await this.persistSyncManifest(false, generation);
                                     this.requireSyncSession(generation);
                                     getOutputChannel().appendLine(
@@ -9607,7 +10035,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     this.baseCache[relPath] = remoteContent;
                                     this.seenLocalEntities.add(relPath);
                                     this.locallyDivergedPaths.delete(relPath);
-                                    await this.recordSyncManifestEntry(relPath, toUri, remoteContent, generation);
+                                    await this.recordPushManifestEntry(
+                                        relPath,
+                                        toUri,
+                                        fromUri,
+                                        remoteContent,
+                                        generation,
+                                    );
                                     await this.persistSyncManifest(false, generation);
                                     getOutputChannel().appendLine(
                                         `${new Date().toISOString()} [push converted-to-pull] ${relPath}: remote changed, local remained at baseline`,
@@ -9645,9 +10079,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                         this.seenLocalEntities.add(relPath);
                                         this.clearRemoteDelete(relPath);
                                         this.locallyDivergedPaths.delete(relPath);
-                                        await this.recordSyncManifestEntry(
+                                        await this.recordPushManifestEntry(
                                             relPath,
                                             toUri,
+                                            fromUri,
                                             newContent,
                                             generation,
                                         );
@@ -9966,12 +10401,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         this.seenLocalEntities.add(relPath);
                         this.clearRemoteDelete(relPath);
                         this.locallyDivergedPaths.delete(relPath);
-                        await this.recordSyncManifestEntry(
-                            relPath,
-                            action==='push' ? toUri : fromUri,
-                            newContent,
-                            generation,
-                        );
+                        if (action==='push') {
+                            await this.recordPushManifestEntry(
+                                relPath,
+                                toUri,
+                                fromUri,
+                                newContent,
+                                generation,
+                            );
+                        } else {
+                            await this.recordSyncManifestEntry(
+                                relPath,
+                                fromUri,
+                                newContent,
+                                generation,
+                            );
+                        }
                         await this.persistSyncManifest(false, generation);
                         if (action==='push') {
                             try {
@@ -9984,6 +10429,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             this.requireSyncSession(generation);
                         }
                     } catch (error) {
+                        // A writer holding the local file is not a failure: no
+                        // toast, no outcome:'error' event, no raw internal string
+                        // in the compile barrier — just a deferral and one re-arm.
+                        if (
+                            action==='push'
+                            && LocalReplicaSCMProvider.isLocalReadUnstable(error)
+                        ) {
+                            this.scheduleLocalPushRetry(
+                                relPath,
+                                fromUri,
+                                'unstable-read',
+                                generation,
+                                type,
+                            );
+                            // 'blocked', not 'error', so runPrecompilePush counts
+                            // it as a compile blocker rather than a sync failure.
+                            outcome = 'blocked';
+                            errorMessage = LOCAL_SNAPSHOT_UNSTABLE;
+                            return;
+                        }
                         // Previously this swallowed every error silently, so an accepted
                         // change could land on disk yet never reach Overleaf. Now we
                         // log to the shared output channel and surface one toast per
@@ -10008,16 +10473,31 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
             })();
         } catch (error) {
-            getOutputChannel().appendLine(
-                `${new Date().toISOString()} [${action} ${type}] ${relPath}: ${formatUnknownError(error)}`,
-            );
-            if (action==='push' && this.isSyncSessionActive(generation)) {
-                this.locallyDivergedPaths.add(relPath);
-                maybeWarnSyncFailure(relPath, error);
+            // No `return` here: everything below — status restoration and the
+            // single terminal scmSyncCompleteEvent this function is declared to
+            // resolve with — still has to run.
+            if (action==='push' && LocalReplicaSCMProvider.isLocalReadUnstable(error)) {
+                this.scheduleLocalPushRetry(
+                    relPath,
+                    fromUri,
+                    'unstable-read',
+                    generation,
+                    type,
+                );
+                outcome = 'blocked';
+                errorMessage = LOCAL_SNAPSHOT_UNSTABLE;
+            } else {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [${action} ${type}] ${relPath}: ${formatUnknownError(error)}`,
+                );
+                if (action==='push' && this.isSyncSessionActive(generation)) {
+                    this.locallyDivergedPaths.add(relPath);
+                    maybeWarnSyncFailure(relPath, error);
+                }
+                console.error(error);
+                outcome = 'error';
+                errorMessage = formatUnknownError(error);
             }
-            console.error(error);
-            outcome = 'error';
-            errorMessage = formatUnknownError(error);
         }
 
         if (
@@ -10329,7 +10809,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     }
                 }
                 if (currentType===undefined) {
+                    // Reached by a stabilization re-arm whose file settled back
+                    // to bytes we already delivered: the path is clean, so drop
+                    // its deferral history along with its divergence mark.
                     this.locallyDivergedPaths.delete(relPath);
+                    this.clearLocalStabilizeState(relPath);
                     return undefined;
                 }
                 return this.applySync(
