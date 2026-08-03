@@ -960,9 +960,11 @@ suite('Local Replica stable-snapshot push', function () {
         await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
         const internals = scm as any;
 
-        // The precompile source scan manufactures this delete from one directory
-        // listing: the path is simply absent from it. No watcher ever reported an
-        // unlink, so the destructive step must corroborate before acting.
+        // Pins the LAST-MOMENT probe in applySync only: the path is still absent
+        // when the barrier corroborates its synthesis, and only reappears inside
+        // the single probe immediately before the remote mutation. The wider gap
+        // — absent through that probe too — is covered by the barrier-level
+        // corroboration exercised in the next test.
         await fs.rm(localMain.fsPath);
 
         const originalCapture = internals.captureLocalPathRevision.bind(scm);
@@ -1000,6 +1002,73 @@ suite('Local Replica stable-snapshot push', function () {
         const retry = await waitForSyncComplete(localRoot, '/main.tex', 'push', 'update');
         assert.strictEqual(retry.outcome, 'success');
         assert.strictEqual(await readText(remoteMain), 'v2');
+    });
+
+    test('the precompile source scan corroborates its inferred deletes across a gap wider than one probe', async () => {
+        const remoteRoot = await tempDir('sr-stable-barrier-synth-remote-');
+        const localRoot = await tempDir('sr-stable-barrier-synth-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const remoteOther = vscode.Uri.joinPath(remoteRoot, 'other.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'v1');
+        await writeText(remoteOther, 'unrelated');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        // Hold the re-arm off so the barrier's own state is what gets asserted,
+        // not a retry that raced it; the re-drive is then flushed explicitly.
+        (LocalReplicaSCMProvider as any).localReadStabilizeRearmMs = 5_000;
+
+        // A remove-and-replace save is mid-flight when the barrier enumerates, so
+        // the source scan infers a deletion from one directory listing.
+        await fs.rm(localMain.fsPath);
+
+        const originalExists = internals.localPathExists.bind(scm);
+        let probes = 0;
+        internals.localPathExists = async (localPath: string) => {
+            if (localPath===localMain.fsPath) {
+                probes += 1;
+                // Still absent on the first corroboration probe (25ms). The
+                // replacement only lands before the second (125ms), so this
+                // exercises a gap the single last-moment probe cannot cover.
+                if (probes===2) { await writeText(localMain, 'v2'); }
+            }
+            return originalExists(localPath);
+        };
+
+        // Direct evidence: no remote deletion may be authorized for this path.
+        const originalRemoteDelete = internals.atomicDeleteRemotePathIfRevision.bind(scm);
+        const remoteDeletes: string[] = [];
+        internals.atomicDeleteRemotePathIfRevision = async (...args: unknown[]) => {
+            remoteDeletes.push(args[0] as string);
+            return originalRemoteDelete(...args);
+        };
+
+        try {
+            await scm.flushBeforeCompile([]);
+
+            assert.deepStrictEqual(
+                remoteDeletes,
+                [],
+                'a remote deletion was authorized from a single directory enumeration',
+            );
+            assert.ok(probes>=2, 'the barrier must re-observe beyond the first probe');
+            assert.ok(hasLine('[compile barrier delete withdrawn] /main.tex'));
+            assert.ok(hasLine('[compile barrier end]'));
+            assert.strictEqual(await pathExists(remoteMain), true);
+            // Withdrawn, then recovered in the same pass: the replacement is
+            // uploaded rather than the compile being failed.
+            assert.strictEqual(await readText(remoteMain), 'v2');
+            assert.strictEqual(internals.locallyDivergedPaths.has('/main.tex'), false);
+            // Unrelated tracked paths are untouched by the corroboration.
+            assert.strictEqual(await pathExists(remoteOther), true);
+        } finally {
+            internals.atomicDeleteRemotePathIfRevision = originalRemoteDelete;
+            internals.localPathExists = originalExists;
+        }
     });
 
     test('a transiently absent tracked directory is corroborated before the folder is removed', async () => {

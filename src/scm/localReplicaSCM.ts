@@ -6441,6 +6441,49 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.scheduleLocalPushRetry(relPath, localUri, 'unstable-read', generation);
     }
 
+    // The precompile source scan infers these deletions from a single directory
+    // enumeration, exactly the evidence the degraded-watcher scan is no longer
+    // allowed to act on alone. It cannot use that scan's "look again in 750ms"
+    // trick because the barrier runs once, so it re-observes here instead — and
+    // it re-observes the whole candidate set TOGETHER, spending one bounded
+    // window for any number of paths rather than a window per path. A barrier
+    // with nothing deleted pays nothing; a bulk deletion of hundreds of files
+    // pays one window, not one per file. Anything that reappears is withdrawn
+    // from the delete set and re-armed instead. The re-arm lands in
+    // pendingLocalEvents before this barrier captures that map, so the same pass
+    // reclassifies the path and uploads it — a path that materialised
+    // mid-enumeration was never considered for upload, and recovering it here is
+    // better than failing a compile that is otherwise fine. If it then cannot be
+    // read or pushed, the existing machinery blocks the compile as usual.
+    private async corroborateSynthesizedDeletes(
+        synthesized: Set<string>,
+        forcedDeleteTargets: Map<string, vscode.Uri>,
+        result: LocalReplicaPrecompileFlushResult,
+        generation: number,
+    ): Promise<void> {
+        let pending = [...synthesized];
+        for (const delay of LocalReplicaSCMProvider.localVanishRecheckDelays) {
+            if (pending.length===0) { return; }
+            await this.sleepForStabilization(delay);
+            this.requireSyncSession(generation);
+            const stillMissing: string[] = [];
+            await Promise.all(pending.map(async relPath => {
+                const localUri = this.localUri(relPath);
+                if (!await this.localPathExists(localUri.fsPath)) {
+                    stillMissing.push(relPath);
+                    return;
+                }
+                forcedDeleteTargets.delete(relPath);
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [compile barrier delete withdrawn] ${relPath}: ` +
+                    'the path reappeared after the source scan inferred its deletion',
+                );
+                this.scheduleLocalPushRetry(relPath, localUri, 'unstable-read', generation);
+            }));
+            pending = stillMissing;
+        }
+    }
+
     private async runPrecompilePush(
         relPath: string,
         localUri: vscode.Uri,
@@ -7496,6 +7539,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             generation,
         );
         this.requireSyncSession(generation);
+        const synthesizedDeletePaths = new Set<string>();
         if (result.failedCount===0) {
             const trackedFiles = new Set([
                 ...Object.keys(this.baseCache),
@@ -7506,6 +7550,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     continue;
                 }
                 forcedDeleteTargets.set(relPath, this.localUri(relPath));
+                synthesizedDeletePaths.add(relPath);
                 result.sourceScanDeleteCount += 1;
             }
             for (const relPath of Object.keys(this.syncManifest?.directories ?? {})) {
@@ -7513,6 +7558,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     continue;
                 }
                 forcedDeleteTargets.set(relPath, this.localUri(relPath));
+                synthesizedDeletePaths.add(relPath);
                 result.sourceScanDeleteCount += 1;
             }
         } else {
@@ -7521,6 +7567,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 `skipping delete synthesis for base=${this.baseUri.toString()}`,
             );
         }
+
+        await this.corroborateSynthesizedDeletes(
+            synthesizedDeletePaths,
+            forcedDeleteTargets,
+            result,
+            generation,
+        );
+        this.requireSyncSession(generation);
 
         const pendingEntries = [...this.pendingLocalEvents.entries()];
         result.pendingCount = pendingEntries.length;

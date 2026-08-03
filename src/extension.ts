@@ -28,6 +28,16 @@ export async function activate(context: vscode.ExtensionContext) {
     // never get a draft submission accepted by a build that no longer reads
     // drafts. Read-only towards the workspace, self-guarding and non-throwing.
     await cleanupRemovedAgentReview(context);
+    context.subscriptions.push(
+        // A folder added mid-session brings its own leftovers, and its own
+        // legacy helper. Waiting for the next window reload would leave both
+        // unchecked for the rest of the session.
+        vscode.workspace.onDidChangeWorkspaceFolders(event => {
+            if (event.added.length>0) {
+                void cleanupRemovedAgentReview(context);
+            }
+        }),
+    );
 
     // Register: [core] RemoteFileSystemProvider
     const remoteFileSystemProvider = new RemoteFileSystemProvider(context);

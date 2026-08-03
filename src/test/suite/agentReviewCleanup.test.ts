@@ -15,7 +15,8 @@ const MANAGED_BLOCK_END = '<!-- semantic-researcher-overleaf-agent-review:end --
 const HELPER_PATH_IN_BLOCK = '/global-storage/agent-review/bin/overleaf-agent-review';
 
 const INSPECTED_ROOTS_KEY = 'semantic-researcher-overleaf.agentReviewInspectedRoots';
-const STORAGE_CLEANUP_KEY = 'semantic-researcher-overleaf.agentReviewStorageCleanup';
+// The stub's self-identifying marker, checked instead of a stored "done" flag.
+const HELPER_STUB_MARKER = 'semantic-researcher-overleaf:agent-review-helper-disabled:v1';
 const REPORTED_KEY = 'semantic-researcher-overleaf.agentReviewReported';
 
 // Every `fs/promises` entry point that can change or destroy a file. The
@@ -149,17 +150,20 @@ suite('Agent Review removal cleanup', () => {
     let originalShowWarningMessage: typeof vscode.window.showWarningMessage;
     let originalWorkspaceFoldersDescriptor: PropertyDescriptor | undefined;
     const originalFsCalls = new Map<string, unknown>();
+    // Live fault injections, re-verified whenever another one is installed.
+    const injectionProbes: Array<{attempt: () => Promise<unknown>, code: string, what: string}> = [];
 
     setup(() => {
         notifications.length = 0;
         warnings.length = 0;
+        injectionProbes.length = 0;
         originalShowInformationMessage = vscode.window.showInformationMessage;
         originalShowWarningMessage = vscode.window.showWarningMessage;
         originalWorkspaceFoldersDescriptor = Object.getOwnPropertyDescriptor(
             vscode.workspace,
             'workspaceFolders',
         );
-        for (const name of ['open', 'readFile', 'stat', 'mkdtemp', ...MUTATING_FS_CALLS]) {
+        for (const name of ['open', 'readFile', 'readdir', 'stat', 'mkdtemp', ...MUTATING_FS_CALLS]) {
             originalFsCalls.set(name, (fs as any)[name]);
         }
         (vscode.window as any).showInformationMessage = async (message: string) => {
@@ -182,6 +186,7 @@ suite('Agent Review removal cleanup', () => {
             await fs.rm(tempRoots.pop()!, {recursive: true, force: true});
         }
         originalFsCalls.clear();
+        injectionProbes.length = 0;
     });
 
     function realFs<T>(name: string): T {
@@ -224,7 +229,7 @@ suite('Agent Review removal cleanup', () => {
     }
 
     async function listDir(dir: string) {
-        return (await fs.readdir(dir)).sort();
+        return (await realFs<(p: string) => Promise<string[]>>('readdir')(dir)).sort();
     }
 
     /** Identity + content, so any rewrite, replace or delete becomes detectable. */
@@ -244,7 +249,7 @@ suite('Agent Review removal cleanup', () => {
      * makes each of them fail, so a migration that tried to write would be both
      * caught and unable to do damage.
      */
-    function guardAgainstMutationOf(guarded: string[]) {
+    async function guardAgainstMutationOf(guarded: string[]) {
         const violations: string[] = [];
         const refuse = (label: string) => {
             violations.push(label);
@@ -253,23 +258,36 @@ suite('Agent Review removal cleanup', () => {
             throw error;
         };
         for (const name of MUTATING_FS_CALLS) {
-            const real = realFs<(...args: unknown[]) => unknown>(name);
+            // The binding as it is *now*, not the pristine one: injectors have to
+            // compose, or a later one silently undoes an earlier one.
+            const inner = (fs as any)[name] as (...args: unknown[]) => unknown;
             (fs as any)[name] = async (...args: unknown[]) => {
                 if (guarded.includes(String(args[0]))) {
                     refuse(`${name}(${String(args[0])})`);
                 }
-                return real(...args);
+                return inner(...args);
             };
         }
         // A writable descriptor is the other way to change a file.
-        const realOpen = realFs<(...args: unknown[]) => Promise<unknown>>('open');
+        const innerOpen = (fs as any).open as (...args: unknown[]) => Promise<unknown>;
         (fs as any).open = async (...args: unknown[]) => {
             const flags = args[1]===undefined ? 'r' : String(args[1]);
             if (guarded.includes(String(args[0])) && flags!=='r') {
                 refuse(`open(${String(args[0])}, ${flags})`);
             }
-            return realOpen(...args);
+            return innerOpen(...args);
         };
+        await registerInjection(
+            () => fs.writeFile(guarded[0], 'probe'),
+            'EPERM',
+            `mutation guard on ${guarded[0]}`,
+        );
+        await registerInjection(
+            () => fs.open(guarded[0], 'r+'),
+            'EPERM',
+            `writable-open guard on ${guarded[0]}`,
+        );
+        violations.length = 0;
         return violations;
     }
 
@@ -279,9 +297,9 @@ suite('Agent Review removal cleanup', () => {
      * could possibly have made — but before it could act on that snapshot.
      */
     function saveNewerRevisionAfterReadOf(targetPath: string, newerContent: string) {
-        const realReadFile = realFs<(...args: unknown[]) => Promise<unknown>>('readFile');
+        const innerReadFile = (fs as any).readFile as (...args: unknown[]) => Promise<unknown>;
         (fs as any).readFile = async (...args: unknown[]) => {
-            const result = await realReadFile(...args);
+            const result = await innerReadFile(...args);
             if (String(args[0])===targetPath) {
                 await realFs<typeof fs.writeFile>('writeFile')(targetPath, newerContent);
             }
@@ -289,40 +307,81 @@ suite('Agent Review removal cleanup', () => {
         };
     }
 
-    function failStatOf(targetPath: string, code: string) {
-        const realStat = realFs<(...args: unknown[]) => unknown>('stat');
-        (fs as any).stat = async (...args: unknown[]) => {
-            if (String(args[0])===targetPath) {
+    /**
+     * Makes one `fs/promises` call fail for the paths `matches` selects.
+     *
+     * Chains onto whatever is installed rather than the pristine binding, so two
+     * injectors compose instead of the second quietly undoing the first — which
+     * is exactly how this suite once asserted silence that production never
+     * produced.
+     */
+    function failCall(name: string, matches: (target: string) => boolean, code: string) {
+        const inner = (fs as any)[name] as (...args: unknown[]) => unknown;
+        (fs as any)[name] = async (...args: unknown[]) => {
+            if (matches(String(args[0]))) {
                 const error: NodeJS.ErrnoException = new Error(`${code}: simulated`);
                 error.code = code;
                 throw error;
             }
-            return realStat(...args);
+            return inner(...args);
         };
     }
 
-    function failReadOf(targetPath: string, code: string) {
-        const realReadFile = realFs<(...args: unknown[]) => unknown>('readFile');
-        (fs as any).readFile = async (...args: unknown[]) => {
-            if (String(args[0])===targetPath) {
-                const error: NodeJS.ErrnoException = new Error(`${code}: simulated`);
-                error.code = code;
-                throw error;
-            }
-            return realReadFile(...args);
-        };
+    /**
+     * Proves an injected failure is actually reachable through the binding
+     * production uses. Without this a test whose control silently stopped
+     * working still passes, and passes for the wrong reason.
+     */
+    async function assertInjectionBites(
+        attempt: () => Promise<unknown>,
+        code: string,
+        what: string,
+    ) {
+        await assert.rejects(
+            attempt,
+            (error: NodeJS.ErrnoException) => error.code===code,
+            `the injected ${what} never took effect, so this test proves nothing`,
+        );
     }
 
-    function failWritesUnder(directory: string) {
-        const real = realFs<(...args: unknown[]) => unknown>('writeFile');
-        (fs as any).writeFile = async (...args: unknown[]) => {
-            if (String(args[0]).startsWith(directory)) {
-                const error: NodeJS.ErrnoException = new Error('EACCES: simulated');
-                error.code = 'EACCES';
-                throw error;
-            }
-            return real(...args);
-        };
+    /**
+     * Records an injection and re-verifies every injection installed so far.
+     *
+     * Verifying only the newest one is not enough: an injector that chains onto
+     * the pristine binding rather than the current one undoes its predecessor
+     * *retroactively*, so the earlier probe passed and the earlier condition was
+     * gone by the time the test ran. Re-checking all of them turns that into an
+     * immediate, named failure.
+     */
+    async function registerInjection(attempt: () => Promise<unknown>, code: string, what: string) {
+        injectionProbes.push({attempt, code, what});
+        for (const probe of injectionProbes) {
+            await assertInjectionBites(probe.attempt, probe.code, probe.what);
+        }
+    }
+
+    async function failStatOf(targetPath: string, code: string) {
+        failCall('stat', target => target===targetPath, code);
+        await registerInjection(() => fs.stat(targetPath), code, `stat failure on ${targetPath}`);
+    }
+
+    async function failReadOf(targetPath: string, code: string) {
+        failCall('readFile', target => target===targetPath, code);
+        await registerInjection(() => fs.readFile(targetPath), code, `read failure on ${targetPath}`);
+    }
+
+    async function failReaddirOf(targetPath: string, code: string) {
+        failCall('readdir', target => target===targetPath, code);
+        await registerInjection(() => fs.readdir(targetPath), code, `readdir failure on ${targetPath}`);
+    }
+
+    async function failWritesUnder(directory: string) {
+        failCall('writeFile', target => target.startsWith(directory), 'EACCES');
+        await registerInjection(
+            () => fs.writeFile(path.join(directory, 'injection-probe'), ''),
+            'EACCES',
+            `write failure under ${directory}`,
+        );
     }
 
     /** Installs the pre-removal storage layout, optionally with a draft and a proposal. */
@@ -390,7 +449,7 @@ suite('Agent Review removal cleanup', () => {
         await writeFile(agentsPath, blockAbove(USER_PROSE));
         await writeFile(claudePath, managedBlock());
         const newerRevision = '# Real notes\n\nSaved after the migration read the file.\n';
-        const violations = guardAgainstMutationOf([agentsPath, claudePath]);
+        const violations = await guardAgainstMutationOf([agentsPath, claudePath]);
         saveNewerRevisionAfterReadOf(claudePath, newerRevision);
         const agentsBefore = await snapshot(agentsPath);
         const {context} = createContextStub(globalStoragePath);
@@ -533,7 +592,89 @@ suite('Agent Review removal cleanup', () => {
             draftContent,
             'submitting against the stub destroyed the draft',
         );
-        assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), 1);
+        assert.ok(helper.includes(HELPER_STUB_MARKER), 'the stub does not identify itself');
+    });
+
+    test('re-disables a helper that a still-running pre-upgrade window reinstalled', async () => {
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-resurrect-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const metaRoot = path.join(globalStoragePath, 'agent-review');
+        const installed = await installAgentReviewStorage(metaRoot, workspaceRoot);
+        const helperPath = path.join(metaRoot, 'bin', 'overleaf-agent-review');
+        const draftContent = await readFile(installed.draftFile);
+        const {context} = createContextStub(globalStoragePath);
+
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+        assert.ok((await readFile(helperPath)).includes(HELPER_STUB_MARKER));
+
+        // An extension host from before the upgrade is still running, and its
+        // `ensureHelperInstalled()` puts the accepting helper back. Nothing about
+        // "we already disabled it" may be trusted after that.
+        await writeFile(helperPath, ORIGINAL_HELPER);
+
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+
+        assert.ok(
+            (await readFile(helperPath)).includes(HELPER_STUB_MARKER),
+            'a reinstalled accepting helper was left live',
+        );
+        const status = runHelper(helperPath, installed.draftId);
+        if (status!==undefined) {
+            assert.strictEqual(status, 1, 'the reinstalled helper still accepts submissions');
+        }
+        assert.strictEqual(await readFile(installed.draftFile), draftContent);
+        // Re-disabling is not news: it must not produce a second notification.
+        assert.strictEqual(notifications.length, 1);
+        assert.strictEqual(warnings.length, 0);
+    });
+
+    test('does not rewrite a helper that is already ours', async () => {
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-stable-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const metaRoot = path.join(globalStoragePath, 'agent-review');
+        await installAgentReviewStorage(metaRoot, workspaceRoot, {withWork: false});
+        const helperPath = path.join(metaRoot, 'bin', 'overleaf-agent-review');
+        const {context} = createContextStub(globalStoragePath);
+
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+        const afterFirst = await snapshot(helperPath);
+
+        // The steady state has to be a read, not a write: this runs on every
+        // activation, and rewriting would churn mtimes and file watchers forever.
+        const violations = await guardAgainstMutationOf([helperPath]);
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+
+        assert.deepStrictEqual(violations, [], 'an already-neutralized helper was rewritten');
+        assert.deepStrictEqual(await snapshot(helperPath), afterFirst);
+        assert.strictEqual(notifications.length, 0);
+        assert.strictEqual(warnings.length, 0);
+    });
+
+    test('reports preserved work that an earlier activation could not read', async () => {
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-drafts-unknown-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const metaRoot = path.join(globalStoragePath, 'agent-review');
+        const installed = await installAgentReviewStorage(metaRoot, workspaceRoot);
+        const {context} = createContextStub(globalStoragePath);
+        await failReaddirOf(path.join(metaRoot, 'drafts'), 'EACCES');
+        await failReaddirOf(path.join(metaRoot, 'proposals'), 'EACCES');
+
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+
+        // Silence now is correct — we genuinely do not know — but it must not
+        // become permanent silence, which is what a completion marker made it.
+        assert.strictEqual(
+            notifications.length,
+            0,
+            `expected silence while the drafts probe was blind, got: ${notifications[0]}`,
+        );
+        assert.strictEqual(warnings.length, 0, `unexpected warning: ${warnings[0]}`);
+
+        (fs as any).readdir = realFs('readdir');
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+
+        assert.strictEqual(notifications.length, 1, 'the preserved work was never reported');
+        assert.ok(notifications[0].includes(installed.metaRoot));
     });
 
     test('leaves the registry usable when the helper could not be replaced, so no draft is destroyed', async () => {
@@ -547,7 +688,7 @@ suite('Agent Review removal cleanup', () => {
         // Only the helper is unwritable — a locked or read-only executable. The
         // registry beside it stays writable, which is exactly the situation in
         // which emptying it would arm the old helper's draft-deleting branch.
-        failWritesUnder(path.join(metaRoot, 'bin'));
+        await failWritesUnder(path.join(metaRoot, 'bin'));
 
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
 
@@ -572,11 +713,9 @@ suite('Agent Review removal cleanup', () => {
         assert.strictEqual(await exists(installed.draftDir), true, 'the draft directory was destroyed');
         assert.strictEqual(await readFile(installed.draftFile), draftContent);
 
-        // Nothing is marked done, so the next activation replaces the helper.
-        assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), undefined);
+        // Nothing was recorded as done, so the next activation replaces it.
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
-        assert.ok(!(await readFile(helperPath)).includes('Submitted successfully'));
-        assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), 1);
+        assert.ok((await readFile(helperPath)).includes(HELPER_STUB_MARKER));
     });
 
     test('does not record completion when the helper state could not be determined', async () => {
@@ -588,15 +727,10 @@ suite('Agent Review removal cleanup', () => {
         const {context, globalState} = createContextStub(globalStoragePath);
         // An EACCES probe is not evidence of absence: the live helper is still
         // there, and treating this as "nothing to do" would retire it forever.
-        failStatOf(helperPath, 'EACCES');
+        await failStatOf(helperPath, 'EACCES');
 
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
 
-        assert.strictEqual(
-            globalState.get(STORAGE_CLEANUP_KEY),
-            undefined,
-            'an unreadable helper was recorded as handled',
-        );
         assert.strictEqual(await readFile(helperPath), ORIGINAL_HELPER);
         assert.strictEqual(warnings.length, 1, 'the user was not warned that the helper is still live');
 
@@ -604,10 +738,9 @@ suite('Agent Review removal cleanup', () => {
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
 
         assert.ok(
-            !(await readFile(helperPath)).includes('Submitted successfully'),
+            (await readFile(helperPath)).includes(HELPER_STUB_MARKER),
             'the retry never replaced the helper',
         );
-        assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), 1);
         assert.strictEqual(
             await readFile(installed.registryPath),
             JSON.stringify({replicaRoots: [workspaceRoot]}, null, 2),
@@ -620,7 +753,7 @@ suite('Agent Review removal cleanup', () => {
         const agentsPath = path.join(workspaceRoot, 'AGENTS.md');
         await writeFile(agentsPath, blockAbove(USER_PROSE));
         const {context, workspaceState} = createContextStub(globalStoragePath);
-        failReadOf(agentsPath, 'EACCES');
+        await failReadOf(agentsPath, 'EACCES');
 
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
 
@@ -649,7 +782,6 @@ suite('Agent Review removal cleanup', () => {
 
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
         assert.strictEqual(notifications.length, 1);
-        assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), 1);
         assert.deepStrictEqual(
             storedList(workspaceState, INSPECTED_ROOTS_KEY),
             [vscode.Uri.file(workspaceRoot).toString()],
@@ -756,6 +888,7 @@ suite('Agent Review removal cleanup', () => {
 
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
 
+        assert.ok(reads>0, 'the injected record read never fired, so this proves nothing');
         assert.strictEqual(notifications.length, 1);
         assert.deepStrictEqual(
             storedList(globalState, REPORTED_KEY),
@@ -816,6 +949,7 @@ suite('Agent Review removal cleanup', () => {
 
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
 
+        assert.ok(alreadyFailed, 'the injected storage failure never fired, so this proves nothing');
         assert.strictEqual(notifications.length, 1, 'the finding was recorded but never shown');
         assert.ok(notifications[0].includes(agentsPath));
         assert.deepStrictEqual(
@@ -834,7 +968,7 @@ suite('Agent Review removal cleanup', () => {
         await installAgentReviewStorage(metaRoot, workspaceRoot, {withWork: false});
         const helperPath = path.join(metaRoot, 'bin', 'overleaf-agent-review');
         const {context, globalState} = createContextStub(globalStoragePath);
-        failWritesUnder(path.join(metaRoot, 'bin'));
+        await failWritesUnder(path.join(metaRoot, 'bin'));
 
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
 
@@ -842,7 +976,6 @@ suite('Agent Review removal cleanup', () => {
         assert.strictEqual(warnings.length, 1, 'a live helper was never reported');
         assert.ok(warnings[0].includes(metaRoot), `the warning does not name the helper: ${warnings[0]}`);
         assert.ok(warnings[0].includes('could not be disabled yet'));
-        assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), undefined);
 
         // The condition persists: retried, but not announced again.
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
@@ -851,8 +984,7 @@ suite('Agent Review removal cleanup', () => {
         (fs as any).writeFile = realFs('writeFile');
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
 
-        assert.ok(!(await readFile(helperPath)).includes('Submitted successfully'), 'the retry never ran');
-        assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), 1);
+        assert.ok((await readFile(helperPath)).includes(HELPER_STUB_MARKER), 'the retry never ran');
         assert.strictEqual(warnings.length, 1, 'a resolved condition was announced again');
         assert.strictEqual(notifications.length, 0);
     });

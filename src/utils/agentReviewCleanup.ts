@@ -48,15 +48,21 @@ const HELPER_NAME = 'overleaf-agent-review';
 const DRAFTS_DIR = 'drafts';
 const PROPOSALS_DIR = 'proposals';
 
-const CLEANUP_VERSION = 1;
-// Workspace folders already inspected, as URI strings. Per folder, not one bit
-// for the whole window: a folder added to a multi-root workspace later carries
-// its own leftovers, and a single flag would skip it forever.
+// Workspace folders whose instruction files have been read, as URI strings. Per
+// folder, not one bit for the whole window: a folder added to a multi-root
+// workspace later carries its own leftovers, and a single flag would skip it
+// forever. This records only that we have *read* those files — the helper's
+// state is never trusted to a marker, see `inspectStorageRoot`.
 const INSPECTED_ROOTS_KEY = `${ROOT_NAME}.agentReviewInspectedRoots`;
-// Global storage is shared by every window, so its marker is global.
-const STORAGE_CLEANUP_KEY = `${ROOT_NAME}.agentReviewStorageCleanup`;
 // Everything already named in a notification, so nothing is reported twice.
 const REPORTED_KEY = `${ROOT_NAME}.agentReviewReported`;
+
+// Identifies our stub. Cheap to check and impossible to produce by accident, so
+// "is the installed helper ours?" is a substring test rather than a stored flag.
+const HELPER_STUB_MARKER = `${ROOT_NAME}:agent-review-helper-disabled:v1`;
+// The stub is well under a kilobyte. Anything larger cannot be ours, so the
+// per-activation identity check stays bounded whatever is at that path.
+const MAX_HELPER_BYTES = 64 * 1024;
 
 // Name for the staged replacement helper. The `.sr-overleaf-*` prefix is in
 // `PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS`, so a transient staging file can
@@ -73,9 +79,9 @@ type Presence = 'present' | 'absent' | 'unknown';
 type InstructionFileState = 'stale' | 'clean' | 'absent' | 'unknown';
 
 interface StorageOutcome {
-    /** The location still holds drafts or proposals worth telling the user about. */
-    preserved: boolean;
-    /** The helper was definitively handled: replaced, or definitively not there. */
+    /** Whether the location still holds drafts or proposals worth reporting. */
+    preserved: Presence;
+    /** The helper is definitively ours, or definitively not there. */
     complete: boolean;
 }
 
@@ -154,6 +160,7 @@ async function inspectInstructionFile(filePath: string): Promise<InstructionFile
  */
 function neutralizedHelperScript(draftsRoot: string): string {
     return `#!/usr/bin/env node
+// ${HELPER_STUB_MARKER}
 // Agent Review was removed from Semantic Researcher Overleaf. This stub replaced
 // the helper that handed out draft copies and accepted submissions: nothing in
 // the extension imports drafts any more, so a "successful" submit would silently
@@ -186,61 +193,111 @@ async function replaceHelper(metaRoot: string, helperPath: string): Promise<bool
 }
 
 // Proposals are stored one directory deep (`proposals/<replica-hash>/*.json`),
-// so an empty hash directory must not be reported as recoverable work.
-async function hasProposalFiles(proposalsRoot: string): Promise<boolean> {
+// so an empty hash directory must not be reported as recoverable work. An
+// unreadable one must not be reported as empty either: that would turn real
+// preserved work into silence.
+async function probeProposalFiles(proposalsRoot: string): Promise<Presence> {
     let entries: string[];
     try {
         entries = await fs.readdir(proposalsRoot);
-    } catch {
-        return false;
+    } catch (error) {
+        return presenceFromError(error);
     }
 
+    let uncertain = false;
     for (const entry of entries) {
         const fullPath = path.join(proposalsRoot, entry);
+        let isDirectory: boolean;
         try {
-            if (!(await fs.stat(fullPath)).isDirectory()) {
-                return true;
+            isDirectory = (await fs.stat(fullPath)).isDirectory();
+        } catch (error) {
+            if (presenceFromError(error)==='unknown') {
+                uncertain = true;
             }
-            if (await probeDirectoryHasEntries(fullPath)==='present') {
-                return true;
-            }
-        } catch {
-            // Vanished between readdir and stat; nothing to report for it.
+            // Otherwise it vanished between readdir and stat; nothing to report.
+            continue;
+        }
+        if (!isDirectory) {
+            return 'present';
+        }
+        const nested = await probeDirectoryHasEntries(fullPath);
+        if (nested==='present') {
+            return 'present';
+        }
+        if (nested==='unknown') {
+            uncertain = true;
         }
     }
-    return false;
+    return uncertain ? 'unknown' : 'absent';
 }
 
 /**
- * Neutralizes one Agent Review storage root, and reports whether it still holds
- * drafts or proposals so the caller can point the user at them.
+ * Is the installed helper the stub we wrote?
+ *
+ * This is deliberately a property of the file rather than a stored flag. A
+ * pre-upgrade window that is still running re-runs the removed
+ * `ensureHelperInstalled()` on every Local Replica activation, which overwrites
+ * our stub with the accepting script again; a "we already did this" marker would
+ * make every window trust a helper that is live once more.
+ */
+async function inspectHelper(helperPath: string): Promise<'ours' | 'foreign' | 'absent' | 'unknown'> {
+    let stat: {isFile(): boolean, size: number};
+    try {
+        stat = await fs.stat(helperPath);
+    } catch (error) {
+        return presenceFromError(error)==='absent' ? 'absent' : 'unknown';
+    }
+    if (!stat.isFile() || stat.size>MAX_HELPER_BYTES) {
+        return 'foreign';
+    }
+    try {
+        return (await fs.readFile(helperPath, 'utf8')).includes(HELPER_STUB_MARKER) ? 'ours' : 'foreign';
+    } catch (error) {
+        return presenceFromError(error)==='absent' ? 'absent' : 'unknown';
+    }
+}
+
+/**
+ * Verifies — and if necessary restores — the neutralized helper at one storage
+ * root, and reports whether that root still holds drafts or proposals.
+ *
+ * This runs on every activation rather than once, and asks the filesystem rather
+ * than a stored marker. "We disabled it once" is not a safe thing to remember:
+ * an extension host from before the upgrade re-installs the accepting helper
+ * whenever it activates a Local Replica, and a one-shot marker would leave every
+ * window trusting a helper that is live again.
  *
  * Never removes drafts or proposals: they can hold real manuscript work an agent
  * produced but the user never accepted. `complete` is true only when the helper
- * was genuinely dealt with — a probe that merely failed leaves it false, so the
- * next activation tries again instead of recording a live helper as handled.
+ * is definitively ours or definitively absent — a probe that merely failed
+ * leaves it false rather than passing a live helper off as handled.
  */
-async function neutralizeStorageRoot(metaRoot: string): Promise<StorageOutcome> {
+async function inspectStorageRoot(metaRoot: string): Promise<StorageOutcome> {
     const metaPresence = await probe(metaRoot);
     if (metaPresence==='absent') {
-        // The feature was never used here. Do nothing, say nothing.
-        return {preserved: false, complete: true};
+        // The feature was never used here. Do nothing, say nothing. For almost
+        // every user this single `stat` is the whole cost of the check.
+        return {preserved: 'absent', complete: true};
     }
     if (metaPresence==='unknown') {
         console.warn(`Could not determine whether stale Agent Review storage exists at ${metaRoot}; will retry.`);
-        return {preserved: false, complete: false};
+        return {preserved: 'unknown', complete: false};
     }
 
     const helperPath = path.join(metaRoot, 'bin', HELPER_NAME);
-    const helperPresence = await probe(helperPath);
+    const helper = await inspectHelper(helperPath);
     let complete: boolean;
-    if (helperPresence==='present') {
-        complete = await replaceHelper(metaRoot, helperPath);
-    } else if (helperPresence==='absent') {
-        // Nothing installed here that could accept a submission.
+    if (helper==='ours' || helper==='absent') {
+        // Already neutralized, or nothing installed that could accept a
+        // submission. This is the steady state: one stat plus one small read.
         complete = true;
+    } else if (helper==='foreign') {
+        // Either the first run after the upgrade, or a still-running pre-upgrade
+        // window has re-installed the accepting helper behind us.
+        console.warn(`Disabling an active Agent Review helper at ${helperPath}.`);
+        complete = await replaceHelper(metaRoot, helperPath);
     } else {
-        console.warn(`Could not determine the state of the stale Agent Review helper at ${helperPath}; will retry.`);
+        console.warn(`Could not determine the state of the Agent Review helper at ${helperPath}; will retry.`);
         complete = false;
     }
 
@@ -254,8 +311,21 @@ async function neutralizeStorageRoot(metaRoot: string): Promise<StorageOutcome> 
     // resolves its registry from its own install location
     // (`dirname(dirname(__filename))`), so a copy elsewhere never reads ours.
 
-    const preserved = await probeDirectoryHasEntries(path.join(metaRoot, DRAFTS_DIR))==='present'
-        || await hasProposalFiles(path.join(metaRoot, PROPOSALS_DIR));
+    const drafts = await probeDirectoryHasEntries(path.join(metaRoot, DRAFTS_DIR));
+    if (drafts==='present') {
+        return {preserved: 'present', complete};
+    }
+    const proposals = await probeProposalFiles(path.join(metaRoot, PROPOSALS_DIR));
+    if (proposals==='present') {
+        return {preserved: 'present', complete};
+    }
+    // Unreadable is not empty. What actually keeps briefly unreadable work from
+    // being buried is that storage is re-probed on every activation and nothing
+    // records "there was nothing here" — so it is reported as soon as it can be
+    // read. This tri-state is kept so that stays true: anything that ever gates
+    // on "no preserved work" must not be able to mistake "could not tell" for
+    // "there is none", which is exactly how the old completion marker buried it.
+    const preserved: Presence = drafts==='unknown' || proposals==='unknown' ? 'unknown' : 'absent';
     return {preserved, complete};
 }
 
@@ -376,9 +446,17 @@ async function report(context: vscode.ExtensionContext, findings: Findings) {
 }
 
 /**
- * Runs the upgrade cleanup. Safe to call on every activation: an inspected
- * folder is never looked at again, and when the user never had Agent Review it
- * does nothing and says nothing.
+ * Runs the upgrade cleanup. Cheap enough to call on every activation and
+ * whenever the workspace gains a folder.
+ *
+ * Two different jobs with two different lifetimes:
+ *
+ * - The helper must be ours *now*, so every storage root is re-verified on every
+ *   call and nothing about it is remembered. For a user who never had Agent
+ *   Review that costs one `stat` per root; for one who did, a `stat` plus a
+ *   sub-kilobyte read.
+ * - The instruction files are only read, and the leftover text is inert once the
+ *   helper refuses, so each folder is read once and then remembered.
  *
  * Never throws — every failure path degrades to a logged warning.
  */
@@ -392,21 +470,32 @@ export async function cleanupRemovedAgentReview(
         // metadata to a workspace folder root, so those are the only roots worth
         // looking at.
         const fileRoots = workspaceRoots.filter(root => root.scheme==='file');
-        const inspectedRoots = new Set(readStringList(context.workspaceState, INSPECTED_ROOTS_KEY));
-        const pendingRoots = fileRoots.filter(root => !inspectedRoots.has(root.toString()));
-        const storageDone = (context.globalState.get<number>(STORAGE_CLEANUP_KEY, 0))>=CLEANUP_VERSION;
-        if (pendingRoots.length===0 && storageDone) {
-            return;
-        }
-
         const findings: Findings = {
             staleInstructionFiles: [],
             preservedWorkLocations: [],
             liveHelperLocations: [],
         };
-        const newlyInspected: string[] = [];
 
-        for (const root of pendingRoots) {
+        // Builds before the move to global storage kept the helper, registry and
+        // drafts inside each workspace folder, so both locations are checked —
+        // and both are checked every time, never gated on a stored marker.
+        const storageRoots = [
+            path.join(context.globalStorageUri.fsPath, AGENT_REVIEW_DIR),
+            ...fileRoots.map(root => path.join(root.fsPath, REPLICA_SETTINGS_DIR, AGENT_REVIEW_DIR)),
+        ];
+        for (const metaRoot of storageRoots) {
+            const outcome = await inspectStorageRoot(metaRoot);
+            if (outcome.preserved==='present') {
+                findings.preservedWorkLocations.push(metaRoot);
+            }
+            if (!outcome.complete) {
+                findings.liveHelperLocations.push(metaRoot);
+            }
+        }
+
+        const inspectedRoots = new Set(readStringList(context.workspaceState, INSPECTED_ROOTS_KEY));
+        const newlyInspected: string[] = [];
+        for (const root of fileRoots.filter(candidate => !inspectedRoots.has(candidate.toString()))) {
             // A root that is missing or unreachable right now is not "clean": a
             // disconnected mount can come back carrying a stale AGENTS.md, so it
             // must not be recorded as inspected.
@@ -422,38 +511,14 @@ export async function cleanupRemovedAgentReview(
                 }
             }
 
-            // Builds before the move to global storage kept the helper, registry
-            // and drafts inside each workspace folder instead. This runs per root
-            // and is not gated on the global marker, so a folder added later
-            // still gets its own legacy helper neutralized.
-            const legacyRoot = path.join(root.fsPath, REPLICA_SETTINGS_DIR, AGENT_REVIEW_DIR);
-            const legacy = await neutralizeStorageRoot(legacyRoot);
-            if (legacy.preserved) {
-                findings.preservedWorkLocations.push(legacyRoot);
-            }
-            if (!legacy.complete) {
-                findings.liveHelperLocations.push(legacyRoot);
-                complete = false;
-            }
-
             if (complete) {
                 newlyInspected.push(root.toString());
             }
         }
 
-        if (!storageDone) {
-            const globalRoot = path.join(context.globalStorageUri.fsPath, AGENT_REVIEW_DIR);
-            const result = await neutralizeStorageRoot(globalRoot);
-            if (result.preserved) {
-                findings.preservedWorkLocations.push(globalRoot);
-            }
-            if (result.complete) {
-                await context.globalState.update(STORAGE_CLEANUP_KEY, CLEANUP_VERSION);
-            } else {
-                findings.liveHelperLocations.push(globalRoot);
-            }
-        }
-
+        // Reported before anything is recorded, for the same reason the report
+        // record itself is written last: a crash or a rejected write must cost a
+        // repeat, never a finding the user is never shown.
         await report(context, findings);
 
         if (newlyInspected.length>0) {
