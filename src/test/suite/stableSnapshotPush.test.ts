@@ -450,9 +450,13 @@ suite('Local Replica stable-snapshot push', function () {
         internals.readOpenedLocalFile = originalRead;
     });
 
-    test('P0: the tombstone echo delete removes only the revision that authorized it', async () => {
-        const remoteRoot = await tempDir('sr-stable-echo-cas-remote-');
-        const localRoot = await tempDir('sr-stable-echo-cas-local-');
+    // The ambiguous case, pinned as a whole: a copy of the deleted revision is
+    // present again with its original timestamp. A backup tool and a person leave
+    // identical evidence, so neither winner may be chosen silently. Nothing is
+    // resurrected on Overleaf, the local copy survives, and the state is surfaced.
+    test('a restored copy of a remotely deleted file becomes a conflict, not a deletion', async () => {
+        const remoteRoot = await tempDir('sr-stable-echo-conflict-remote-');
+        const localRoot = await tempDir('sr-stable-echo-conflict-local-');
         tempRoots.push(remoteRoot, localRoot);
         const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
         const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
@@ -468,144 +472,93 @@ suite('Local Replica stable-snapshot push', function () {
         const tombstone = internals.remoteDeleteTombstones.get('/sample.tex');
         assert.ok(tombstone);
 
-        // Revision A is a genuine tombstone echo: same bytes, mtime inside the
-        // window. It authorizes the suppression delete.
+        // A restore tool puts the deleted revision back, timestamp and all.
         await writeText(localSample, 'tombstoned bytes');
         const staleTime = new Date(tombstone.staleLocalMtime);
         await fs.utimes(localSample.fsPath, staleTime, staleTime);
 
-        // Revision B lands after the authorization and before the delete: a real
-        // edit the user would lose if the delete were revision-unconditional.
-        const originalStableRead = internals.readStableConfinedLocalFile.bind(scm);
-        let replaced = false;
-        internals.readStableConfinedLocalFile = async (
-            relPath: string,
-            uri?: vscode.Uri,
-            generation?: number,
-        ) => {
-            const snapshot = await originalStableRead(relPath, uri, generation);
-            if (relPath==='/sample.tex' && !replaced) {
-                replaced = true;
-                await writeText(localSample, 'legitimate revision B');
-            }
-            return snapshot;
-        };
-
-        let event: Events['scmSyncCompleteEvent'];
-        try {
-            event = await internals.applySync(
-                'push',
-                'update',
-                '/sample.tex',
-                localSample,
-                remoteSample,
-            ) as Events['scmSyncCompleteEvent'];
-        } finally {
-            internals.readStableConfinedLocalFile = originalStableRead;
-        }
-
-        assert.strictEqual(replaced, true, 'revision B must have landed before the delete');
-        assert.strictEqual(await pathExists(localSample), true, 'revision B was deleted');
-        assert.strictEqual(await readText(localSample), 'legitimate revision B');
-        assert.ok(hasLine('[push update deferred:echo-delete-superseded]'));
-        assert.ok(
-            !hasLine('[push update suppressed:remote-delete-echo]'),
-            'a refused delete must not be reported as a completed suppression',
-        );
-        assert.strictEqual(event.outcome, 'blocked');
-        assert.strictEqual(internals.locallyDivergedPaths.has('/sample.tex'), true);
-
-        // And the deferral converges: B is not stranded by the cleared provenance.
-        const retry = await waitForSyncComplete(localRoot, '/sample.tex', 'push', 'update');
-        assert.strictEqual(retry.outcome, 'success');
-        assert.strictEqual(await readText(remoteSample), 'legitimate revision B');
-        assert.strictEqual(await readText(localSample), 'legitimate revision B');
-        assert.strictEqual(vfs.uploadCount, 1);
-    });
-
-    // Counterweight to the refusal tests below. They prove the compare-and-swap
-    // declines every superseded revision, but an implementation that refused
-    // unconditionally would satisfy all of them; this pins the behaviour they are
-    // guarding, including the ordering that keeps our own delete from echoing.
-    test('an unchanged tombstone echo is still deleted, with the bypass entry seeded first', async () => {
-        const remoteRoot = await tempDir('sr-stable-echo-happy-remote-');
-        const localRoot = await tempDir('sr-stable-echo-happy-local-');
-        tempRoots.push(remoteRoot, localRoot);
-        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
-        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
-        await writeText(remoteSample, 'tombstoned bytes');
-
-        const vfs = new FakeVirtualFileSystem(remoteRoot);
-        const scm = createSCM(remoteRoot, localRoot, vfs);
-        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
-        const internals = scm as any;
-
-        await vscode.workspace.fs.delete(remoteSample);
-        await internals.applySync('pull', 'delete', '/sample.tex', remoteSample, localSample);
-        const tombstone = internals.remoteDeleteTombstones.get('/sample.tex');
-        assert.ok(tombstone);
-
-        // The textbook stale echo: the watcher reports a file the remote delete
-        // already accounted for. Same bytes, mtime inside the window, and nothing
-        // races it.
-        await writeText(localSample, 'tombstoned bytes');
-        const staleTime = new Date(tombstone.staleLocalMtime);
-        await fs.utimes(localSample.fsPath, staleTime, staleTime);
-
-        // The bypass entry must already record the deletion when the removal
-        // starts, or the watcher event our own delete produces would be
-        // classified as a user deletion.
-        const originalDelete = internals.atomicDeleteLocalPathIfRevision.bind(scm);
-        let deleteAttempted = false;
-        let bypassAtDeleteTime: {hash: string; type: string} | undefined;
-        internals.atomicDeleteLocalPathIfRevision = async (...args: unknown[]) => {
-            deleteAttempted = true;
-            bypassAtDeleteTime = internals.bypassCache.get('/sample.tex')?.[0];
-            return originalDelete(...args);
-        };
-
-        let event: Events['scmSyncCompleteEvent'];
-        try {
-            event = await internals.applySync(
-                'push',
-                'update',
-                '/sample.tex',
-                localSample,
-                remoteSample,
-            ) as Events['scmSyncCompleteEvent'];
-        } finally {
-            internals.atomicDeleteLocalPathIfRevision = originalDelete;
-        }
-
-        assert.strictEqual(event.outcome, 'suppressed');
-        assert.strictEqual(
-            await pathExists(localSample),
-            false,
-            'the stale echo must actually be removed, not merely refused',
-        );
-        assert.strictEqual(await pathExists(remoteSample), false, 'the remote must stay deleted');
-        assert.ok(hasLine('[push update suppressed:remote-delete-echo]'));
-        assert.ok(!hasLine('[push update deferred:echo-delete-superseded]'));
-        assert.strictEqual(vfs.uploadCount, 0);
-        assert.ok(deleteAttempted, 'the delete must have been attempted');
-        assert.ok(
-            bypassAtDeleteTime,
-            'the bypass entry must be seeded before the removal runs, or our own '
-            + 'delete echoes back as a user deletion',
-        );
-        assert.strictEqual(bypassAtDeleteTime!.type, 'delete');
-        assert.strictEqual(bypassAtDeleteTime!.hash, contentDigestForDelete);
-
-        // And the watcher echo of our own removal propagates nothing.
-        const echo = await internals.applySync(
+        const event = await internals.applySync(
             'push',
-            'delete',
+            'update',
             '/sample.tex',
             localSample,
             remoteSample,
         ) as Events['scmSyncCompleteEvent'];
-        assert.strictEqual(echo.outcome, 'suppressed');
+
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(event.error, 'remote delete with a restored local copy');
+        assert.strictEqual(
+            await pathExists(localSample),
+            true,
+            'an ambiguous restore must never be destroyed',
+        );
+        assert.strictEqual(await readText(localSample), 'tombstoned bytes');
+        assert.strictEqual(
+            await pathExists(remoteSample),
+            false,
+            'and it must not be resurrected on Overleaf either',
+        );
         assert.strictEqual(vfs.uploadCount, 0);
+        assert.strictEqual(internals.syncConflicts.has('/sample.tex'), true);
+        assert.ok(hasLine('[push update blocked:remote-delete-restored]'));
+    });
+
+    test('the ordinary pull delete refuses a same-byte recreate on a new inode', async () => {
+        const remoteRoot = await tempDir('sr-stable-pulldel-remote-');
+        const localRoot = await tempDir('sr-stable-pulldel-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
+        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
+        await writeText(remoteSample, 'shared bytes');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        const originalIno = (await fs.lstat(localSample.fsPath)).ino;
+
+        // Overleaf deletes the file. Between the revision capture that authorizes
+        // the local removal and the removal itself, the user atomically recreates
+        // it: byte-for-byte identical, so a digest-only compare-and-swap sees
+        // nothing, but a different inode with a fresh timestamp.
+        await vscode.workspace.fs.delete(remoteSample);
+        const replacement = vscode.Uri.joinPath(localRoot, 'replacement.tmp');
+        await writeText(replacement, 'shared bytes');
+
+        const originalCapture = internals.captureLocalPathRevision.bind(scm);
+        let recreated = false;
+        internals.captureLocalPathRevision = async (relPath: string, generation?: number) => {
+            const revision = await originalCapture(relPath, generation);
+            if (relPath==='/sample.tex' && !recreated) {
+                recreated = true;
+                await fs.rename(replacement.fsPath, localSample.fsPath);
+            }
+            return revision;
+        };
+
+        let event: Events['scmSyncCompleteEvent'];
+        try {
+            event = await internals.applySync(
+                'pull',
+                'delete',
+                '/sample.tex',
+                remoteSample,
+                localSample,
+            ) as Events['scmSyncCompleteEvent'];
+        } finally {
+            internals.captureLocalPathRevision = originalCapture;
+        }
+
+        assert.strictEqual(recreated, true);
+        assert.strictEqual(
+            await pathExists(localSample),
+            true,
+            'the same-byte recreate was deleted by a digest-only compare-and-swap',
+        );
+        assert.notStrictEqual((await fs.lstat(localSample.fsPath)).ino, originalIno);
+        assert.strictEqual(await readText(localSample), 'shared bytes');
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(internals.syncConflicts.has('/sample.tex'), true);
     });
 
     test('P0: a same-byte re-creation moments after the delete is not mistaken for the echo', async () => {
@@ -671,88 +624,6 @@ suite('Local Replica stable-snapshot push', function () {
         assert.strictEqual(event.outcome, 'success');
         assert.strictEqual(await readText(remoteSample), 'shared bytes');
         assert.strictEqual(vfs.uploadCount, 1);
-    });
-
-    test('P0: the tombstone echo delete refuses a same-byte recreate on a new inode', async () => {
-        const remoteRoot = await tempDir('sr-stable-echo-samebytes-remote-');
-        const localRoot = await tempDir('sr-stable-echo-samebytes-local-');
-        tempRoots.push(remoteRoot, localRoot);
-        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
-        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
-        await writeText(remoteSample, 'tombstoned bytes');
-
-        const vfs = new FakeVirtualFileSystem(remoteRoot);
-        const scm = createSCM(remoteRoot, localRoot, vfs);
-        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
-        const internals = scm as any;
-
-        await vscode.workspace.fs.delete(remoteSample);
-        await internals.applySync('pull', 'delete', '/sample.tex', remoteSample, localSample);
-        const tombstone = internals.remoteDeleteTombstones.get('/sample.tex');
-        assert.ok(tombstone);
-
-        // Revision A: the stale echo. Same bytes as the tombstone, mtime inside
-        // the window, so it authorizes the suppression delete.
-        await writeText(localSample, 'tombstoned bytes');
-        const staleTime = new Date(tombstone.staleLocalMtime);
-        await fs.utimes(localSample.fsPath, staleTime, staleTime);
-        const staleIno = (await fs.lstat(localSample.fsPath)).ino;
-
-        // Revision B: the user restores the file on purpose. Byte-for-byte
-        // identical to A — so a digest-only compare-and-swap sees no difference —
-        // but a different inode with a fresh mtime, which is exactly what makes
-        // it an intentional restore rather than the stale echo.
-        const replacement = vscode.Uri.joinPath(localRoot, 'restore.tmp');
-        await writeText(replacement, 'tombstoned bytes');
-        const restoredTime = new Date(Date.now()+120_000);
-        const originalStableRead = internals.readStableConfinedLocalFile.bind(scm);
-        let recreated = false;
-        internals.readStableConfinedLocalFile = async (
-            relPath: string,
-            uri?: vscode.Uri,
-            generation?: number,
-        ) => {
-            const snapshot = await originalStableRead(relPath, uri, generation);
-            if (relPath==='/sample.tex' && !recreated) {
-                recreated = true;
-                await fs.rename(replacement.fsPath, localSample.fsPath);
-                await fs.utimes(localSample.fsPath, restoredTime, restoredTime);
-            }
-            return snapshot;
-        };
-
-        let event: Events['scmSyncCompleteEvent'];
-        try {
-            event = await internals.applySync(
-                'push',
-                'update',
-                '/sample.tex',
-                localSample,
-                remoteSample,
-            ) as Events['scmSyncCompleteEvent'];
-        } finally {
-            internals.readStableConfinedLocalFile = originalStableRead;
-        }
-
-        assert.strictEqual(recreated, true);
-        assert.strictEqual(
-            await pathExists(localSample),
-            true,
-            'the same-byte recreate was deleted by a digest-only compare-and-swap',
-        );
-        const survivingIno = (await fs.lstat(localSample.fsPath)).ino;
-        assert.notStrictEqual(survivingIno, staleIno, 'the recreate must be a new inode');
-        assert.strictEqual(await readText(localSample), 'tombstoned bytes');
-        assert.ok(hasLine('[push update deferred:echo-delete-superseded]'));
-        assert.ok(!hasLine('[push update suppressed:remote-delete-echo]'));
-        assert.strictEqual(event.outcome, 'blocked');
-
-        // The intentional restore then reaches Overleaf, because on re-read its
-        // fresh mtime no longer satisfies the tombstone predicate.
-        const retry = await waitForSyncComplete(localRoot, '/sample.tex', 'push', 'update');
-        assert.strictEqual(retry.outcome, 'success');
-        assert.strictEqual(await readText(remoteSample), 'tombstoned bytes');
-        assert.strictEqual(await readText(localSample), 'tombstoned bytes');
     });
 
     test('a short read is refused even when every metadata field matches', async () => {
@@ -1492,10 +1363,13 @@ suite('Local Replica stable-snapshot push', function () {
     // read, possibly through one or more merge stages: a payload is either
     // (a) causally traceable to an earlier confined read OF THE SAME PATH that
     // returned exactly those bytes, or (b) the output of an auto-merge that ran
-    // before it. A payload is never re-derived from a cache, a baseline buffer or
-    // a manifest entry, and never fabricated from nothing — though pushWithRetry
-    // does resend the SAME confined-read payload it captured when an upload
-    // attempt fails, which changes nothing about its ancestry.
+    // before it. Cached and manifest state is legitimately consulted — the merge
+    // BASE comes from baseCache or the manifest entry, and the VFS merge consumes
+    // a preserved remote baseline — but it never becomes the payload: the bytes
+    // uploaded are always read bytes, or the output of merging them, and never
+    // lifted from a cache in place of a read. pushWithRetry does resend the SAME
+    // confined-read payload it captured when an attempt fails, which changes
+    // nothing about its ancestry.
     //
     // Instrumentation notes. Uploads are recorded only after the bytes land, and
     // uploads and reads carry a path plus a sequence number, so a later read

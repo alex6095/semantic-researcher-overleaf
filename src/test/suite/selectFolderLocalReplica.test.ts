@@ -2608,10 +2608,18 @@ suite('Select Project Folder Local Replica', function () {
         await writeText(localSample, 'remote baseline');
         const staleMtime = new Date(Date.now() - 60_000);
         await fs.utimes(localSample.fsPath, staleMtime, staleMtime);
-        await applySync('push', 'update', '/sample.tex', localSample, remoteSample);
+        const event = await applySync('push', 'update', '/sample.tex', localSample, remoteSample);
 
+        // The property this test exists for is unchanged: the stale copy must not
+        // resurrect the file on Overleaf. What changed is what happens to the
+        // local copy. A restore tool preserving the deleted revision's timestamp
+        // and a person re-creating the file by hand leave identical evidence, so
+        // deleting on that evidence was choosing a winner silently. The ambiguity
+        // is now surfaced as a conflict and the local copy is preserved.
+        assert.strictEqual(event.outcome, 'blocked');
         assert.strictEqual(await pathExists(remoteSample), false);
-        assert.strictEqual(await pathExists(localSample), false);
+        assert.strictEqual(await pathExists(localSample), true);
+        assert.strictEqual((scm as any).syncConflicts.has('/sample.tex'), true);
     });
 
     test('allows an intentional same-content restore after a remote delete', async () => {

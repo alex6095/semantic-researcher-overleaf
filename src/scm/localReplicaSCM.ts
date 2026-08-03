@@ -6762,11 +6762,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async readConfinedLocalFileSnapshot(
         relPath: string,
         uri: vscode.Uri = this.localUri(relPath),
-    ): Promise<{content: Uint8Array; stat: vscode.FileStat; identity?: LocalReadIdentity}> {
+    ): Promise<{content: Uint8Array; stat: vscode.FileStat}> {
         if (uri.scheme!=='file' || this.baseUri.scheme!=='file') {
-            // No descriptor, so no inode identity to carry. Callers that need one
-            // to authorize a destructive action must refuse rather than fall back
-            // to a bytes-only comparison.
             const stat = await this.statConfinedLocalUri(uri, `read of ${relPath}`);
             return {content: await vscode.workspace.fs.readFile(uri), stat};
         }
@@ -6898,29 +6895,37 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     mtime: Number(descriptorStatAfter.mtimeMs),
                     size: Number(descriptorStatAfter.size),
                 },
-                identity: {
-                    dev: String(descriptorStatAfter.dev),
-                    ino: String(descriptorStatAfter.ino),
-                    size: String(descriptorStatAfter.size),
-                    mtimeNs: String(
-                        (descriptorStatAfter as unknown as {mtimeNs?: bigint}).mtimeNs
-                        ?? descriptorStatAfter.mtimeMs,
-                    ),
-                    ctimeNs: String(
-                        (descriptorStatAfter as unknown as {ctimeNs?: bigint}).ctimeNs
-                        ?? descriptorStatAfter.ctimeMs,
-                    ),
-                },
             };
         } finally {
             await handle.close();
         }
     }
 
-    // Does the path still hold the exact file object a confined read observed?
+    private async captureLocalPathIdentity(
+        fsPath: string,
+    ): Promise<LocalReadIdentity | undefined> {
+        try {
+            const stat = await nodeFs.lstat(fsPath, {bigint: true});
+            return {
+                dev: String(stat.dev),
+                ino: String(stat.ino),
+                size: String(stat.size),
+                mtimeNs: String(
+                    (stat as unknown as {mtimeNs?: bigint}).mtimeNs ?? stat.mtimeMs,
+                ),
+                ctimeNs: String(
+                    (stat as unknown as {ctimeNs?: bigint}).ctimeNs ?? stat.ctimeMs,
+                ),
+            };
+        } catch {
+            return undefined;
+        }
+    }
+
+    // Does the path still hold the exact file object an earlier observation saw?
     // Bytes alone cannot answer that: an atomic recreate with identical content
     // is a different inode with a fresh mtime, and is a legitimate user action
-    // rather than the stale revision we judged. `includeCtime` is false after a
+    // rather than the revision we authorized removing. `includeCtime` is false after a
     // quarantine rename, which necessarily bumps ctime while leaving dev, ino,
     // size and mtime intact.
     private async localPathIdentityMatches(
@@ -6960,7 +6965,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         relPath: string,
         uri: vscode.Uri = this.localUri(relPath),
         generation = this.syncGeneration,
-    ): Promise<{content: Uint8Array; stat: vscode.FileStat; identity?: LocalReadIdentity}> {
+    ): Promise<{content: Uint8Array; stat: vscode.FileStat}> {
         const delays = LocalReplicaSCMProvider.localReadStabilizeDelays;
         for (let attempt = 0; ; attempt++) {
             try {
@@ -7048,7 +7053,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         fromUri: vscode.Uri,
         type: 'update' | 'delete',
         generation: number,
-    ): Promise<{content: Uint8Array; stat: vscode.FileStat; identity?: LocalReadIdentity}> {
+    ): Promise<{content: Uint8Array; stat: vscode.FileStat}> {
         try {
             return await this.readStableConfinedLocalFile(relPath, fromUri, generation);
         } catch (error) {
@@ -9661,6 +9666,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 const directoryDelete = this.isTrackedDirectory(relPath);
                 let targetAlreadyMissing = false;
                 let expectedLocalDeleteRevision: string | undefined;
+                let expectedLocalDeleteIdentity: LocalReadIdentity | undefined;
                 let expectedRemoteDeleteRevision: string | undefined;
                 let localDeleteState: PathRevision | undefined;
                 let remoteDeleteState: PathRevision | undefined;
@@ -9673,9 +9679,20 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 // refuse to act on it and seed the bypass cache so any
                 // spurious echo gets suppressed too.
                 if (action==='pull') {
+                    // Digest alone is not enough to authorize removing a file: a
+                    // same-byte atomic recreation hashes identically while being a
+                    // different file somebody deliberately put there. The identity
+                    // is taken BEFORE the revision on purpose — if the path is
+                    // replaced between the two observations the identity is the
+                    // older file's, so the checks below refuse; taking it
+                    // afterwards would instead bless the replacement.
+                    expectedLocalDeleteIdentity = await this.captureLocalPathIdentity(
+                        this.localUri(relPath).fsPath,
+                    );
                     localDeleteState = await this.captureLocalPathRevision(relPath, generation);
                     const localExists = localDeleteState.kind!=='missing';
                     expectedLocalDeleteRevision = localDeleteState.revision;
+                    if (!localExists) { expectedLocalDeleteIdentity = undefined; }
                     const everReplicated = relPath in this.baseCache
                         || this.syncManifest?.files[relPath]!==undefined
                         || this.syncManifest?.directories[relPath]!==undefined;
@@ -9993,9 +10010,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     }
                 } else if (action==='pull') {
                     const latestLocal = await this.captureLocalPathRevision(relPath, generation);
+                    const localIdentityUnchanged = expectedLocalDeleteIdentity===undefined
+                        || await this.localPathIdentityMatches(
+                            this.localUri(relPath).fsPath,
+                            expectedLocalDeleteIdentity,
+                            true,
+                        );
                     if (
                         expectedLocalDeleteRevision!==undefined
-                        && latestLocal.revision!==expectedLocalDeleteRevision
+                        && (
+                            latestLocal.revision!==expectedLocalDeleteRevision
+                            || !localIdentityUnchanged
+                        )
                     ) {
                         await this.markSyncConflict(
                             relPath,
@@ -10013,6 +10039,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             relPath,
                             expectedLocalDeleteRevision!,
                             generation,
+                            expectedLocalDeleteIdentity,
                         ),
                     );
                     if (!deleted) {
@@ -10179,7 +10206,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         // and may describe an earlier revision entirely.
                         let newContent: Uint8Array;
                         let readStat = stat;
-                        let readIdentity: LocalReadIdentity | undefined;
                         if (action==='pull') {
                             newContent = await this.pullRemoteFile(relPath, fromUri, generation);
                         } else {
@@ -10191,7 +10217,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             );
                             newContent = snapshot.content;
                             readStat = snapshot.stat;
-                            readIdentity = snapshot.identity;
                         }
                         this.requireSyncSession(generation);
                         if (action==='pull') {
@@ -10242,51 +10267,44 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 && tombstone.staleLocalMtime!==undefined
                                 && normalizeMtimeMs(readStat.mtime)<=tombstone.staleLocalMtime;
                             if (staleLocalBytes) {
-                                this.requireSyncSession(generation);
-                                // Seeded before the delete so the watcher echo of
-                                // our own removal is suppressed; the terminal
-                                // 'blocked' path below restores the snapshot taken
-                                // at entry if the delete turns out to be refused.
-                                this.setBypassCache(relPath, undefined);
-                                // The delete must remove the exact revision that
-                                // authorized it. Between the read above and this
-                                // point an editor can land a legitimate new
-                                // revision, and an unconditional delete would
-                                // destroy it — the remote delete has already
-                                // cleared this path's manifest and baseline
-                                // provenance, so no later watcher event is
-                                // obliged to bring it back.
-                                const removedStaleRevision = readIdentity!==undefined
-                                    && await this.runSessionIO(
-                                        generation,
-                                        () => this.atomicDeleteLocalPathIfRevision(
-                                            relPath,
-                                            contentDigest(newContent),
-                                            generation,
-                                            readIdentity,
-                                        ),
-                                    );
-                                if (!removedStaleRevision) {
-                                    getOutputChannel().appendLine(
-                                        `${new Date().toISOString()} [push update deferred:echo-delete-superseded] ` +
-                                        `${relPath}: the local file advanced past the revision that matched the ` +
-                                        'remote-delete tombstone, so it was not removed',
-                                    );
-                                    this.scheduleLocalPushRetry(
-                                        relPath,
-                                        fromUri,
-                                        'local-advanced-before-echo-delete',
-                                        generation,
-                                        type,
-                                    );
-                                    outcome = 'blocked';
-                                    errorMessage = 'local file advanced before the remote-delete echo could be applied';
-                                    return;
-                                }
+                                // Both readings of this state fit the evidence: a
+                                // restore tool put the deleted revision back with
+                                // its original timestamp, or a person did.
+                                // Timestamps cannot separate them, and neither can
+                                // identity — every restore route that preserves an
+                                // mtime (cp -p, a backup, the OS trash) also
+                                // produces a new inode, exactly like a hand
+                                // re-creation.
+                                //
+                                // What IS certain is that the file was created
+                                // after our delete finished. The pull-delete
+                                // emptied the path; a later event for a missing
+                                // path classifies as a delete, and a push that
+                                // finds it missing defers. Nothing arrives here on
+                                // its own, so there is no subset that is provably
+                                // our own echo left to suppress.
+                                //
+                                // The point of this branch is to avoid
+                                // RESURRECTING the file on Overleaf, and declining
+                                // to push achieves that. Destroying the local copy
+                                // is a separate and irreversible choice made on
+                                // ambiguous evidence, so it becomes a conflict
+                                // instead: nothing is uploaded, nothing is
+                                // removed, and whoever created the file decides.
                                 getOutputChannel().appendLine(
-                                    `${new Date().toISOString()} [push update suppressed:remote-delete-echo] ${relPath}`,
+                                    `${new Date().toISOString()} ` +
+                                    `[push update blocked:remote-delete-restored] ${relPath}`,
                                 );
-                                outcome = 'suppressed';
+                                await this.markSyncConflict(
+                                    relPath,
+                                    'Overleaf deleted this file and a copy of the deleted contents '
+                                    + 'is present locally again; keep it to restore the file, or '
+                                    + 'delete it to accept the removal',
+                                    newContent,
+                                    generation,
+                                );
+                                outcome = 'blocked';
+                                errorMessage = 'remote delete with a restored local copy';
                                 return;
                             }
 
