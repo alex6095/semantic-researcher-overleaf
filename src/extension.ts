@@ -23,10 +23,10 @@ type ActiveReplicaSyncTarget = {
 
 export async function activate(context: vscode.ExtensionContext) {
     await migrateLegacyNamespace(context);
-    // Upgrade cleanup for the removed Agent Review feature. It runs before
-    // anything else touches the workspace so a coding agent can never pick up
-    // the stale "edit a draft copy instead" instructions from a build that no
-    // longer reads drafts. Self-guarding and non-throwing.
+    // Upgrade cleanup for the removed Agent Review feature: disables its
+    // leftover draft helper before anything else runs, so a coding agent can
+    // never get a draft submission accepted by a build that no longer reads
+    // drafts. Read-only towards the workspace, self-guarding and non-throwing.
     await cleanupRemovedAgentReview(context);
 
     // Register: [core] RemoteFileSystemProvider

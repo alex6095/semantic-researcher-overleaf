@@ -7035,6 +7035,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         observedType?: 'update' | 'delete',
     ): Promise<'update' | 'delete' | undefined> {
         const recheckDelays = LocalReplicaSCMProvider.localVanishRecheckDelays;
+        // Captured once: a teardown followed quickly by a new session bumps the
+        // generation, and this classification must abort rather than read again
+        // on behalf of a session that no longer exists.
+        const generation = this.syncGeneration;
         for (let attempt = 0; ; attempt++) {
             try {
                 const stat = await this.statConfinedLocalUri(
@@ -7064,7 +7068,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (
                     observedType!=='update'
                     || attempt>=recheckDelays.length
-                    || !this.isSyncSessionActive()
+                    || !this.isSyncSessionActive(generation)
                 ) {
                     return 'delete';
                 }
@@ -7075,7 +7079,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 await this.sleepForStabilization(recheckDelays[attempt]);
                 // Re-check on the way out of the sleep: a teardown during the
                 // recheck must not be followed by another confined read.
-                this.requireSyncSession();
+                this.requireSyncSession(generation);
             }
         }
     }
@@ -9849,10 +9853,32 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     // races its own descendants, and the existing post-delete
                     // recreation check at the end of this branch covers them.
                     if (!directoryDelete) {
-                        const currentLocalState = await this.captureLocalPathRevision(
+                        let currentLocalState = await this.captureLocalPathRevision(
                             relPath,
                             generation,
                         );
+                        // Some classifications MANUFACTURE 'delete' from a single
+                        // directory listing (the degraded-watcher scan and the
+                        // precompile source scan) rather than from a watcher
+                        // unlink notification, which is materially weaker
+                        // evidence. Rather than make every such classification
+                        // pay a recheck window — it would fan out across paths
+                        // that never reach a delete — the corroboration is spent
+                        // here, once per actual deletion, at the last moment
+                        // before the remote is mutated. One probe outlasts an
+                        // atomic replacement's unlinked window by orders of
+                        // magnitude; a genuine deletion still propagates, just
+                        // that much later.
+                        if (currentLocalState.kind==='missing') {
+                            await this.sleepForStabilization(
+                                LocalReplicaSCMProvider.localVanishRecheckDelays[0],
+                            );
+                            this.requireSyncSession(generation);
+                            currentLocalState = await this.captureLocalPathRevision(
+                                relPath,
+                                generation,
+                            );
+                        }
                         if (currentLocalState.kind==='file') {
                             throw new LocalReadUnstableError(
                                 relPath,

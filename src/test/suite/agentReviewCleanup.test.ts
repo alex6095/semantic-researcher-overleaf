@@ -14,13 +14,19 @@ const MANAGED_BLOCK_END = '<!-- semantic-researcher-overleaf-agent-review:end --
 
 const HELPER_PATH_IN_BLOCK = '/global-storage/agent-review/bin/overleaf-agent-review';
 
-const INSTRUCTION_ROOTS_KEY = 'semantic-researcher-overleaf.agentReviewInstructionCleanupRoots';
+const INSPECTED_ROOTS_KEY = 'semantic-researcher-overleaf.agentReviewInspectedRoots';
 const STORAGE_CLEANUP_KEY = 'semantic-researcher-overleaf.agentReviewStorageCleanup';
-const NOTICE_KEY = 'semantic-researcher-overleaf.agentReviewPreservedNoticeLocations';
+const REPORTED_KEY = 'semantic-researcher-overleaf.agentReviewReported';
 
-// Reproduces the shape `AgentReviewInstructionFiles` produced: the delimited
-// block, and — when the file already had content — a blank-line separator in
-// front of the preserved user prose.
+// Every `fs/promises` entry point that can change or destroy a file. The
+// migration must not call any of them on an instruction file under any
+// interleaving — that is what makes the concurrency question moot rather than
+// merely narrow.
+const MUTATING_FS_CALLS = [
+    'writeFile', 'appendFile', 'truncate', 'unlink', 'rm', 'rmdir',
+    'rename', 'copyFile', 'link', 'symlink', 'chmod', 'chown', 'utimes', 'mkdir',
+] as const;
+
 function managedBlock() {
     return `${MANAGED_BLOCK_START}
 
@@ -49,10 +55,9 @@ function blockAbove(userContent: string) {
     return `${managedBlock()}\n${userContent}`;
 }
 
-// Reproduces the removed helper's destructive `submit` branch verbatim in
-// behaviour: it deletes the whole draft directory when the registry no longer
-// lists that draft's replica root. The cleanup must never create that
-// precondition.
+// Reproduces the removed helper's destructive `submit` branch in behaviour: it
+// deletes the whole draft directory when the registry no longer lists that
+// draft's replica root. The cleanup must never create that precondition.
 const ORIGINAL_HELPER = `#!/usr/bin/env node
 const fs = require('fs');
 const path = require('path');
@@ -120,51 +125,59 @@ function createContextStub(globalStoragePath: string): ContextStub {
     };
 }
 
-function completedRoots(workspaceState: Map<string, unknown>): string[] {
-    return (workspaceState.get(INSTRUCTION_ROOTS_KEY) as string[] | undefined) ?? [];
+function storedList(state: Map<string, unknown>, key: string): string[] {
+    return ((state.get(key) as string[] | undefined) ?? []).slice().sort();
 }
 
 suite('Agent Review removal cleanup', () => {
     const tempRoots: string[] = [];
     const notifications: string[] = [];
+    const warnings: string[] = [];
     let originalShowInformationMessage: typeof vscode.window.showInformationMessage;
+    let originalShowWarningMessage: typeof vscode.window.showWarningMessage;
     let originalWorkspaceFoldersDescriptor: PropertyDescriptor | undefined;
-    let originalOpen: typeof fs.open;
-    let originalWriteFile: typeof fs.writeFile;
+    const originalFsCalls = new Map<string, unknown>();
 
     setup(() => {
         notifications.length = 0;
+        warnings.length = 0;
         originalShowInformationMessage = vscode.window.showInformationMessage;
-        originalOpen = fs.open;
-        originalWriteFile = fs.writeFile;
+        originalShowWarningMessage = vscode.window.showWarningMessage;
         originalWorkspaceFoldersDescriptor = Object.getOwnPropertyDescriptor(
             vscode.workspace,
             'workspaceFolders',
         );
+        for (const name of ['open', 'readFile', 'stat', 'mkdtemp', ...MUTATING_FS_CALLS]) {
+            originalFsCalls.set(name, (fs as any)[name]);
+        }
         (vscode.window as any).showInformationMessage = async (message: string) => {
             notifications.push(message);
+            return undefined;
+        };
+        (vscode.window as any).showWarningMessage = async (message: string) => {
+            warnings.push(message);
             return undefined;
         };
     });
 
     teardown(async () => {
         (vscode.window as any).showInformationMessage = originalShowInformationMessage;
-        (fs as any).open = originalOpen;
-        (fs as any).writeFile = originalWriteFile;
-        if (originalWorkspaceFoldersDescriptor) {
-            Object.defineProperty(
-                vscode.workspace,
-                'workspaceFolders',
-                originalWorkspaceFoldersDescriptor,
-            );
+        (vscode.window as any).showWarningMessage = originalShowWarningMessage;
+        for (const [name, implementation] of originalFsCalls) {
+            (fs as any)[name] = implementation;
         }
         while (tempRoots.length>0) {
             await fs.rm(tempRoots.pop()!, {recursive: true, force: true});
         }
+        originalFsCalls.clear();
     });
 
+    function realFs<T>(name: string): T {
+        return originalFsCalls.get(name) as T;
+    }
+
     async function tempDir(prefix: string) {
-        const root = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
+        const root = await realFs<typeof fs.mkdtemp>('mkdtemp')(path.join(os.tmpdir(), prefix));
         tempRoots.push(root);
         return root;
     }
@@ -181,17 +194,17 @@ suite('Agent Review removal cleanup', () => {
     }
 
     async function writeFile(filePath: string, content: string) {
-        await fs.mkdir(path.dirname(filePath), {recursive: true});
-        await originalWriteFile(filePath, content);
+        await realFs<typeof fs.mkdir>('mkdir')(path.dirname(filePath), {recursive: true});
+        await realFs<typeof fs.writeFile>('writeFile')(filePath, content);
     }
 
-    async function readFile(filePath: string) {
-        return fs.readFile(filePath, 'utf8');
+    async function readFile(filePath: string): Promise<string> {
+        return realFs<(p: string, e: string) => Promise<string>>('readFile')(filePath, 'utf8');
     }
 
     async function exists(filePath: string) {
         try {
-            await fs.stat(filePath);
+            await realFs<typeof fs.stat>('stat')(filePath);
             return true;
         } catch {
             return false;
@@ -202,54 +215,105 @@ suite('Agent Review removal cleanup', () => {
         return (await fs.readdir(dir)).sort();
     }
 
-    /**
-     * Simulates a save that lands between the cleanup's snapshot read and its
-     * rewrite: the first read the cleanup performs through its own descriptor
-     * triggers a newer revision being written to the same path behind its back.
-     */
-    function saveNewerRevisionDuringFirstReadOf(targetPath: string, newerContent: string) {
-        (fs as any).open = async (...args: unknown[]) => {
-            const handle = await (originalOpen as any)(...args);
-            if (String(args[0])!==targetPath) {
-                return handle;
-            }
-            const realRead = handle.read.bind(handle);
-            let reads = 0;
-            handle.read = async (...readArgs: unknown[]) => {
-                const result = await realRead(...readArgs);
-                reads += 1;
-                if (reads===1) {
-                    await originalWriteFile(targetPath, newerContent);
-                }
-                return result;
-            };
-            return handle;
+    /** Identity + content, so any rewrite, replace or delete becomes detectable. */
+    async function snapshot(filePath: string) {
+        const stat = await realFs<typeof fs.stat>('stat')(filePath);
+        return {
+            content: await readFile(filePath),
+            ino: stat.ino,
+            dev: stat.dev,
+            size: stat.size,
+            mtimeMs: stat.mtimeMs,
         };
     }
 
-    function failOpenOf(targetPath: string, code: string) {
+    /**
+     * Records every mutating `fs/promises` call aimed at one of `guarded`, and
+     * makes each of them fail, so a migration that tried to write would be both
+     * caught and unable to do damage.
+     */
+    function guardAgainstMutationOf(guarded: string[]) {
+        const violations: string[] = [];
+        const refuse = (label: string) => {
+            violations.push(label);
+            const error: NodeJS.ErrnoException = new Error('EPERM: guarded by test');
+            error.code = 'EPERM';
+            throw error;
+        };
+        for (const name of MUTATING_FS_CALLS) {
+            const real = realFs<(...args: unknown[]) => unknown>(name);
+            (fs as any)[name] = async (...args: unknown[]) => {
+                if (guarded.includes(String(args[0]))) {
+                    refuse(`${name}(${String(args[0])})`);
+                }
+                return real(...args);
+            };
+        }
+        // A writable descriptor is the other way to change a file.
+        const realOpen = realFs<(...args: unknown[]) => Promise<unknown>>('open');
         (fs as any).open = async (...args: unknown[]) => {
+            const flags = args[1]===undefined ? 'r' : String(args[1]);
+            if (guarded.includes(String(args[0])) && flags!=='r') {
+                refuse(`open(${String(args[0])}, ${flags})`);
+            }
+            return realOpen(...args);
+        };
+        return violations;
+    }
+
+    /**
+     * Simulates the exact interleaving earlier reviews called out: a save that
+     * lands *after* the migration has read the file — after any comparison it
+     * could possibly have made — but before it could act on that snapshot.
+     */
+    function saveNewerRevisionAfterReadOf(targetPath: string, newerContent: string) {
+        const realReadFile = realFs<(...args: unknown[]) => Promise<unknown>>('readFile');
+        (fs as any).readFile = async (...args: unknown[]) => {
+            const result = await realReadFile(...args);
             if (String(args[0])===targetPath) {
-                const error: NodeJS.ErrnoException = new Error(`${code}: simulated, open '${targetPath}'`);
+                await realFs<typeof fs.writeFile>('writeFile')(targetPath, newerContent);
+            }
+            return result;
+        };
+    }
+
+    function failStatOf(targetPath: string, code: string) {
+        const realStat = realFs<(...args: unknown[]) => unknown>('stat');
+        (fs as any).stat = async (...args: unknown[]) => {
+            if (String(args[0])===targetPath) {
+                const error: NodeJS.ErrnoException = new Error(`${code}: simulated`);
                 error.code = code;
                 throw error;
             }
-            return (originalOpen as any)(...args);
+            return realStat(...args);
+        };
+    }
+
+    function failReadOf(targetPath: string, code: string) {
+        const realReadFile = realFs<(...args: unknown[]) => unknown>('readFile');
+        (fs as any).readFile = async (...args: unknown[]) => {
+            if (String(args[0])===targetPath) {
+                const error: NodeJS.ErrnoException = new Error(`${code}: simulated`);
+                error.code = code;
+                throw error;
+            }
+            return realReadFile(...args);
         };
     }
 
     function failWritesUnder(directory: string) {
+        const real = realFs<(...args: unknown[]) => unknown>('writeFile');
         (fs as any).writeFile = async (...args: unknown[]) => {
             if (String(args[0]).startsWith(directory)) {
-                const error: NodeJS.ErrnoException = new Error(`EACCES: simulated, write '${String(args[0])}'`);
+                const error: NodeJS.ErrnoException = new Error('EACCES: simulated');
                 error.code = 'EACCES';
                 throw error;
             }
-            return (originalWriteFile as any)(...args);
+            return real(...args);
         };
     }
 
-    /** Installs the pre-removal global storage layout, optionally with a draft and a proposal. */
+    /** Installs the pre-removal storage layout, optionally with a draft and a proposal. */
     async function installAgentReviewStorage(
         metaRoot: string,
         replicaRoot: string,
@@ -303,71 +367,83 @@ suite('Agent Review removal cleanup', () => {
         }
     }
 
-    test('removes the managed block from AGENTS.md and CLAUDE.md with user prose intact', async () => {
-        const workspaceRoot = await tempDir('sr-overleaf-agent-review-blocks-');
+    test('never writes to or deletes an instruction file, even when one is saved mid-run', async () => {
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-readonly-');
         const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        await installAgentReviewStorage(path.join(globalStoragePath, 'agent-review'), workspaceRoot);
         const agentsPath = path.join(workspaceRoot, 'AGENTS.md');
         const claudePath = path.join(workspaceRoot, 'CLAUDE.md');
+        // The worst case for the removed rewrite: one file it would have edited,
+        // one whose entire content was the block and which it would have deleted.
         await writeFile(agentsPath, blockAbove(USER_PROSE));
-        // A file where the user moved their own prose above the managed block.
-        await writeFile(claudePath, `Team notes.\n\n${blockAbove('Trailing note.\n')}`);
-        // Exercise the production default, which reads vscode.workspace.workspaceFolders.
-        setWorkspaceFoldersForTest(vscode.Uri.file(workspaceRoot));
-        const {context, workspaceState} = createContextStub(globalStoragePath);
-
-        await cleanupRemovedAgentReview(context);
-
-        assert.strictEqual(await readFile(agentsPath), USER_PROSE);
-        assert.strictEqual(await readFile(claudePath), 'Team notes.\n\nTrailing note.\n');
-        for (const filePath of [agentsPath, claudePath]) {
-            const content = await readFile(filePath);
-            assert.ok(!content.includes(MANAGED_BLOCK_START), `${filePath} still carries the start marker`);
-            assert.ok(!content.includes(MANAGED_BLOCK_END), `${filePath} still carries the end marker`);
-            assert.ok(!content.includes(HELPER_PATH_IN_BLOCK), `${filePath} still points at the helper`);
-        }
-        assert.deepStrictEqual(
-            completedRoots(workspaceState),
-            [vscode.Uri.file(workspaceRoot).toString()],
-        );
-        // Nothing to preserve, so the user is not interrupted.
-        assert.strictEqual(notifications.length, 0, 'the user was interrupted with nothing to recover');
-        // No stray working files left in the user's folder.
-        assert.deepStrictEqual(await listDir(workspaceRoot), ['AGENTS.md', 'CLAUDE.md']);
-    });
-
-    test('deletes an instruction file that carried nothing but the managed block', async () => {
-        const workspaceRoot = await tempDir('sr-overleaf-agent-review-only-block-');
-        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
-        const agentsPath = path.join(workspaceRoot, 'AGENTS.md');
-        await writeFile(agentsPath, managedBlock());
+        await writeFile(claudePath, managedBlock());
+        const newerRevision = '# Real notes\n\nSaved after the migration read the file.\n';
+        const violations = guardAgainstMutationOf([agentsPath, claudePath]);
+        saveNewerRevisionAfterReadOf(claudePath, newerRevision);
+        const agentsBefore = await snapshot(agentsPath);
         const {context} = createContextStub(globalStoragePath);
 
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
 
-        // The feature created this file to carry the block, so removing the
-        // block removes the file rather than leaving an empty one behind.
-        assert.strictEqual(await exists(agentsPath), false);
-        // And the aside file used to prove the delete was safe is gone too.
-        assert.deepStrictEqual(await listDir(workspaceRoot), []);
+        assert.deepStrictEqual(violations, [], 'the migration attempted to mutate an instruction file');
+        // Untouched: same inode, same bytes, same timestamp.
+        assert.deepStrictEqual(await snapshot(agentsPath), agentsBefore);
+        // And the revision saved mid-run is still there, in full.
+        assert.strictEqual(await exists(claudePath), true, 'a block-only file was deleted');
+        assert.strictEqual(await readFile(claudePath), newerRevision);
+        assert.deepStrictEqual(await listDir(workspaceRoot), ['AGENTS.md', 'CLAUDE.md']);
     });
 
-    test('leaves files with absent or malformed markers byte-for-byte untouched', async () => {
+    test('reports the files that still carry the block, the markers and the drafts location', async () => {
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-report-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const installed = await installAgentReviewStorage(
+            path.join(globalStoragePath, 'agent-review'),
+            workspaceRoot,
+        );
+        const agentsPath = path.join(workspaceRoot, 'AGENTS.md');
+        const claudePath = path.join(workspaceRoot, 'CLAUDE.md');
+        await writeFile(agentsPath, blockAbove(USER_PROSE));
+        await writeFile(claudePath, `Team notes.\n\n${blockAbove('Trailing note.\n')}`);
+        // Exercise the production default, which reads vscode.workspace.workspaceFolders.
+        setWorkspaceFoldersForTest(vscode.Uri.file(workspaceRoot));
+        const {context, globalState} = createContextStub(globalStoragePath);
+
+        await cleanupRemovedAgentReview(context);
+
+        assert.strictEqual(warnings.length, 0, 'the helper was disabled, so this is not a warning');
+        assert.strictEqual(notifications.length, 1, 'the user was not told exactly once');
+        const notice = notifications[0];
+        for (const expected of [
+            agentsPath,
+            claudePath,
+            MANAGED_BLOCK_START,
+            MANAGED_BLOCK_END,
+            installed.metaRoot,
+        ]) {
+            assert.ok(notice.includes(expected), `the notice does not mention ${expected}: ${notice}`);
+        }
+        assert.deepStrictEqual(
+            storedList(globalState, REPORTED_KEY),
+            [agentsPath, claudePath, installed.metaRoot].sort(),
+        );
+    });
+
+    test('does not report files whose markers are absent or malformed', async () => {
         const workspaceRoot = await tempDir('sr-overleaf-agent-review-malformed-');
         const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
-        const noMarkers = `${USER_PROSE}\nNothing managed here.\n`;
         const startOnly = `${MANAGED_BLOCK_START}\n\nTruncated block, no end marker.\n\n${USER_PROSE}`;
         const reversed = `${MANAGED_BLOCK_END}\n\nEnd before start.\n\n${MANAGED_BLOCK_START}\n\n${USER_PROSE}`;
-        const endOnly = `${USER_PROSE}\n${MANAGED_BLOCK_END}\n`;
         const cases: Array<[string, string]> = [
             [path.join(workspaceRoot, 'AGENTS.md'), startOnly],
-            [path.join(workspaceRoot, 'CLAUDE.md'), noMarkers],
+            [path.join(workspaceRoot, 'CLAUDE.md'), `${USER_PROSE}\nNothing managed here.\n`],
             [path.join(workspaceRoot, 'nested', 'AGENTS.md'), reversed],
-            [path.join(workspaceRoot, 'nested', 'CLAUDE.md'), endOnly],
+            [path.join(workspaceRoot, 'nested', 'CLAUDE.md'), `${USER_PROSE}\n${MANAGED_BLOCK_END}\n`],
         ];
         for (const [filePath, content] of cases) {
             await writeFile(filePath, content);
         }
-        const {context} = createContextStub(globalStoragePath);
+        const {context, workspaceState} = createContextStub(globalStoragePath);
 
         await cleanupRemovedAgentReview(context, [
             vscode.Uri.file(workspaceRoot),
@@ -377,72 +453,23 @@ suite('Agent Review removal cleanup', () => {
         for (const [filePath, content] of cases) {
             assert.strictEqual(await readFile(filePath), content, `${filePath} was modified`);
         }
-    });
-
-    test('never overwrites an instruction file that was saved after the cleanup read it', async () => {
-        const workspaceRoot = await tempDir('sr-overleaf-agent-review-cas-write-');
-        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
-        const agentsPath = path.join(workspaceRoot, 'AGENTS.md');
-        await writeFile(agentsPath, blockAbove(USER_PROSE));
-        // The revision the user saves mid-cleanup. It still carries the block,
-        // so the retry has something real to do.
-        const newerRevision = blockAbove('# Newer revision\n\nSaved while the cleanup was deciding.\n');
-        const {context, workspaceState} = createContextStub(globalStoragePath);
-        saveNewerRevisionDuringFirstReadOf(agentsPath, newerRevision);
-
-        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
-
-        // The concurrent save wins, byte for byte.
-        assert.strictEqual(await readFile(agentsPath), newerRevision);
-        // And the root is not recorded, so the stale block is retried.
-        assert.deepStrictEqual(completedRoots(workspaceState), []);
-
-        (fs as any).open = originalOpen;
-        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
-
-        assert.strictEqual(
-            await readFile(agentsPath),
-            '# Newer revision\n\nSaved while the cleanup was deciding.\n',
-        );
+        assert.strictEqual(notifications.length, 0, 'a malformed marker pair was reported as ours');
         assert.deepStrictEqual(
-            completedRoots(workspaceState),
-            [vscode.Uri.file(workspaceRoot).toString()],
-        );
-    });
-
-    test('never deletes an instruction file that stopped being block-only after the read', async () => {
-        const workspaceRoot = await tempDir('sr-overleaf-agent-review-cas-delete-');
-        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
-        const agentsPath = path.join(workspaceRoot, 'AGENTS.md');
-        // Block-only: the snapshot the cleanup reads authorises a delete.
-        await writeFile(agentsPath, managedBlock());
-        const newerRevision = '# Real notes\n\nWritten while the cleanup held a block-only snapshot.\n';
-        const {context, workspaceState} = createContextStub(globalStoragePath);
-        saveNewerRevisionDuringFirstReadOf(agentsPath, newerRevision);
-
-        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
-
-        // The worst case: deleting a file that is no longer the one we read.
-        assert.strictEqual(await exists(agentsPath), true, 'a newer revision was deleted');
-        assert.strictEqual(await readFile(agentsPath), newerRevision);
-        assert.deepStrictEqual(completedRoots(workspaceState), []);
-        // Nothing was left behind by the prove-then-delete move.
-        assert.deepStrictEqual(await listDir(workspaceRoot), ['AGENTS.md']);
-
-        (fs as any).open = originalOpen;
-        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
-
-        assert.strictEqual(await readFile(agentsPath), newerRevision);
-        assert.deepStrictEqual(
-            completedRoots(workspaceState),
-            [vscode.Uri.file(workspaceRoot).toString()],
+            storedList(workspaceState, INSPECTED_ROOTS_KEY),
+            [
+                vscode.Uri.file(workspaceRoot).toString(),
+                vscode.Uri.file(path.join(workspaceRoot, 'nested')).toString(),
+            ].sort(),
         );
     });
 
     test('neutralizes the stale helper without deleting drafts, proposals or the registry', async () => {
         const workspaceRoot = await tempDir('sr-overleaf-agent-review-helper-');
         const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
-        const installed = await installAgentReviewStorage(path.join(globalStoragePath, 'agent-review'), workspaceRoot);
+        const installed = await installAgentReviewStorage(
+            path.join(globalStoragePath, 'agent-review'),
+            workspaceRoot,
+        );
         const draftContent = await readFile(installed.draftFile);
         const proposalContent = await readFile(installed.proposalPath);
         const registryContent = await readFile(installed.registryPath);
@@ -460,7 +487,6 @@ suite('Agent Review removal cleanup', () => {
         // helper's own trigger for deleting a draft directory.
         assert.strictEqual(await readFile(installed.registryPath), registryContent);
 
-        // The helper can no longer accept anything.
         const helperPath = path.join(installed.metaRoot, 'bin', 'overleaf-agent-review');
         const helper = await readFile(helperPath);
         assert.ok(!helper.includes('Submitted successfully'), 'helper still reports submissions as accepted');
@@ -469,9 +495,12 @@ suite('Agent Review removal cleanup', () => {
             helper.includes(JSON.stringify(path.join(installed.metaRoot, 'drafts'))),
             'helper does not name the drafts location',
         );
-        // The stub is executed by agents, so it has to parse as JavaScript.
-        // `Function` compiles without running; the shebang is stripped the way
-        // node strips it.
+        // The stub is now the whole safety mechanism, so it must countermand the
+        // leftover instructions it replaces.
+        assert.ok(helper.includes('edit the file in the Local Replica directly'));
+        assert.ok(helper.includes('Do not treat anything here as a completed edit'));
+        // It is executed by agents, so it has to parse as JavaScript. `Function`
+        // compiles without running; the shebang is stripped the way node does.
         new Function(helper.replace(/^#![^\n]*\n/, ''));
         // No half-written staging file is left in bin/.
         assert.deepStrictEqual(
@@ -488,13 +517,7 @@ suite('Agent Review removal cleanup', () => {
             draftContent,
             'submitting against the stub destroyed the draft',
         );
-
         assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), 1);
-        assert.strictEqual(notifications.length, 1, 'the preserved-work notice was not shown exactly once');
-        assert.ok(
-            notifications[0].includes(installed.metaRoot),
-            `the notice does not name ${installed.metaRoot}: ${notifications[0]}`,
-        );
     });
 
     test('leaves the registry usable when the helper could not be replaced, so no draft is destroyed', async () => {
@@ -514,16 +537,18 @@ suite('Agent Review removal cleanup', () => {
 
         const helperPath = path.join(metaRoot, 'bin', 'overleaf-agent-review');
         assert.strictEqual(await readFile(helperPath), ORIGINAL_HELPER, 'the helper was unexpectedly replaced');
-        // The registry must still list the root. An emptied registry plus a
-        // surviving old helper is exactly what destroys the draft.
         assert.strictEqual(await readFile(installed.registryPath), registryContent);
         assert.deepStrictEqual(
             await listDir(path.join(metaRoot, 'bin')),
             ['overleaf-agent-review', 'overleaf-agent-review.cmd'],
             'a failed replacement left staging litter behind',
         );
+        // A live helper is a warning, not a quiet notice.
+        assert.strictEqual(warnings.length, 1);
+        assert.ok(warnings[0].includes('could not be disabled yet'));
+        assert.strictEqual(notifications.length, 0);
 
-        (fs as any).writeFile = originalWriteFile;
+        (fs as any).writeFile = realFs('writeFile');
         const status = runHelper(helperPath, installed.draftId);
         if (status!==undefined) {
             assert.strictEqual(status, 0, 'the surviving helper refused a root it should still know');
@@ -538,36 +563,67 @@ suite('Agent Review removal cleanup', () => {
         assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), 1);
     });
 
-    test('retries a stale instruction file it could not read instead of marking it done', async () => {
+    test('does not record completion when the helper state could not be determined', async () => {
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-unknown-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const metaRoot = path.join(globalStoragePath, 'agent-review');
+        const installed = await installAgentReviewStorage(metaRoot, workspaceRoot);
+        const helperPath = path.join(metaRoot, 'bin', 'overleaf-agent-review');
+        const {context, globalState} = createContextStub(globalStoragePath);
+        // An EACCES probe is not evidence of absence: the live helper is still
+        // there, and treating this as "nothing to do" would retire it forever.
+        failStatOf(helperPath, 'EACCES');
+
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+
+        assert.strictEqual(
+            globalState.get(STORAGE_CLEANUP_KEY),
+            undefined,
+            'an unreadable helper was recorded as handled',
+        );
+        assert.strictEqual(await readFile(helperPath), ORIGINAL_HELPER);
+        assert.strictEqual(warnings.length, 1, 'the user was not warned that the helper is still live');
+
+        (fs as any).stat = realFs('stat');
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+
+        assert.ok(
+            !(await readFile(helperPath)).includes('Submitted successfully'),
+            'the retry never replaced the helper',
+        );
+        assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), 1);
+        assert.strictEqual(
+            await readFile(installed.registryPath),
+            JSON.stringify({replicaRoots: [workspaceRoot]}, null, 2),
+        );
+    });
+
+    test('re-inspects a root whose instruction file could not be read', async () => {
         const workspaceRoot = await tempDir('sr-overleaf-agent-review-unreadable-');
         const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
         const agentsPath = path.join(workspaceRoot, 'AGENTS.md');
-        const claudePath = path.join(workspaceRoot, 'CLAUDE.md');
-        const stale = blockAbove(USER_PROSE);
-        await writeFile(agentsPath, stale);
-        await writeFile(claudePath, stale);
+        await writeFile(agentsPath, blockAbove(USER_PROSE));
         const {context, workspaceState} = createContextStub(globalStoragePath);
-        failOpenOf(agentsPath, 'EACCES');
+        failReadOf(agentsPath, 'EACCES');
 
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
 
-        // Unreadable is not "no block here": the file still misleads agents.
-        assert.strictEqual(await readFile(agentsPath), stale);
-        assert.deepStrictEqual(completedRoots(workspaceState), [], 'an unreadable stale file was marked handled');
-        // Its readable neighbour is still fixed in the same pass.
-        assert.strictEqual(await readFile(claudePath), USER_PROSE);
+        // Unreadable is not "no block here", so the folder stays pending.
+        assert.deepStrictEqual(storedList(workspaceState, INSPECTED_ROOTS_KEY), []);
+        assert.strictEqual(notifications.length, 0);
 
-        (fs as any).open = originalOpen;
+        (fs as any).readFile = realFs('readFile');
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
 
-        assert.strictEqual(await readFile(agentsPath), USER_PROSE);
+        assert.strictEqual(notifications.length, 1);
+        assert.ok(notifications[0].includes(agentsPath));
         assert.deepStrictEqual(
-            completedRoots(workspaceState),
+            storedList(workspaceState, INSPECTED_ROOTS_KEY),
             [vscode.Uri.file(workspaceRoot).toString()],
         );
     });
 
-    test('does not rescan or re-notify for a folder it already cleaned', async () => {
+    test('does not re-inspect or re-report a folder it already handled', async () => {
         const workspaceRoot = await tempDir('sr-overleaf-agent-review-idempotent-');
         const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
         await installAgentReviewStorage(path.join(globalStoragePath, 'agent-review'), workspaceRoot);
@@ -576,81 +632,113 @@ suite('Agent Review removal cleanup', () => {
         const {context, globalState, workspaceState} = createContextStub(globalStoragePath);
 
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
-        assert.strictEqual(await readFile(agentsPath), USER_PROSE);
         assert.strictEqual(notifications.length, 1);
         assert.strictEqual(globalState.get(STORAGE_CLEANUP_KEY), 1);
         assert.deepStrictEqual(
-            completedRoots(workspaceState),
+            storedList(workspaceState, INSPECTED_ROOTS_KEY),
             [vscode.Uri.file(workspaceRoot).toString()],
         );
 
-        // A block that reappears after this folder was recorded proves the
-        // second activation short-circuits instead of scanning it again.
-        const reintroduced = blockAbove(USER_PROSE);
-        await writeFile(agentsPath, reintroduced);
-
+        // Even a block reappearing must not produce a second report: the folder
+        // has been inspected and the migration has nothing left to do to it.
+        await writeFile(agentsPath, blockAbove(USER_PROSE));
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
 
-        assert.strictEqual(await readFile(agentsPath), reintroduced);
-        assert.strictEqual(notifications.length, 1, 'the preserved-work notice was shown twice');
+        assert.strictEqual(notifications.length, 1, 'the user was told twice');
+        assert.strictEqual(warnings.length, 0);
     });
 
-    test('cleans a folder added to the workspace later, including its legacy helper', async () => {
+    test('reports a folder added to the workspace later, including its legacy helper', async () => {
         const firstRoot = await tempDir('sr-overleaf-agent-review-multi-a-');
         const laterRoot = await tempDir('sr-overleaf-agent-review-multi-b-');
         const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
         // Global storage holds only a helper, so the only preserved work in this
-        // test is the one inside the folder added later.
+        // test lives inside the folder that is added later.
         await installAgentReviewStorage(
             path.join(globalStoragePath, 'agent-review'),
             firstRoot,
             {withWork: false},
         );
-        await writeFile(path.join(firstRoot, 'AGENTS.md'), blockAbove(USER_PROSE));
-        const {context, workspaceState} = createContextStub(globalStoragePath);
+        const firstAgents = path.join(firstRoot, 'AGENTS.md');
+        await writeFile(firstAgents, blockAbove(USER_PROSE));
+        const {context, globalState, workspaceState} = createContextStub(globalStoragePath);
 
         await cleanupRemovedAgentReview(context, [vscode.Uri.file(firstRoot)]);
+        assert.strictEqual(notifications.length, 1);
         assert.deepStrictEqual(
-            completedRoots(workspaceState),
+            storedList(workspaceState, INSPECTED_ROOTS_KEY),
             [vscode.Uri.file(firstRoot).toString()],
         );
-        assert.strictEqual(notifications.length, 0, 'the user was interrupted with nothing to recover');
 
         // The user adds a second folder to the same window. It carries its own
         // stale block, its own legacy helper and its own unaccepted draft.
-        const laterAgents = path.join(laterRoot, 'CLAUDE.md');
-        await writeFile(laterAgents, blockAbove(USER_PROSE));
+        const laterClaude = path.join(laterRoot, 'CLAUDE.md');
+        await writeFile(laterClaude, blockAbove(USER_PROSE));
         const legacyMeta = path.join(laterRoot, REPLICA_SETTINGS_DIR, 'agent-review');
         const legacy = await installAgentReviewStorage(legacyMeta, laterRoot);
         const legacyDraftContent = await readFile(legacy.draftFile);
-        // Re-introduce a block in the finished folder: it must stay untouched.
-        const reintroduced = blockAbove(USER_PROSE);
-        await writeFile(path.join(firstRoot, 'AGENTS.md'), reintroduced);
 
         await cleanupRemovedAgentReview(context, [
             vscode.Uri.file(firstRoot),
             vscode.Uri.file(laterRoot),
         ]);
 
-        assert.strictEqual(await readFile(laterAgents), USER_PROSE, 'the folder added later was never scanned');
+        assert.strictEqual(notifications.length, 2, 'the folder added later was never inspected');
+        assert.ok(notifications[1].includes(laterClaude));
+        assert.ok(notifications[1].includes(legacyMeta));
+        assert.ok(
+            !notifications[1].includes(firstAgents),
+            'an already-reported file was reported again',
+        );
         const legacyHelper = await readFile(path.join(legacyMeta, 'bin', 'overleaf-agent-review'));
         assert.ok(!legacyHelper.includes('Submitted successfully'), 'the later folder kept a live legacy helper');
         assert.strictEqual(await readFile(legacy.draftFile), legacyDraftContent);
-        assert.strictEqual(await readFile(legacy.registryPath), JSON.stringify({replicaRoots: [laterRoot]}, null, 2));
-        assert.strictEqual(await readFile(path.join(firstRoot, 'AGENTS.md')), reintroduced);
-        assert.deepStrictEqual(
-            completedRoots(workspaceState).sort(),
-            [vscode.Uri.file(firstRoot).toString(), vscode.Uri.file(laterRoot).toString()].sort(),
+        assert.strictEqual(
+            await readFile(legacy.registryPath),
+            JSON.stringify({replicaRoots: [laterRoot]}, null, 2),
         );
-        // Exactly one notice for the newly discovered location, and none repeated.
-        assert.strictEqual(notifications.length, 1);
-        assert.ok(notifications[0].includes(legacyMeta));
+        // The record grew; the first folder's entry was not replaced.
+        assert.deepStrictEqual(
+            storedList(globalState, REPORTED_KEY),
+            [firstAgents, laterClaude, legacyMeta].sort(),
+        );
 
         await cleanupRemovedAgentReview(context, [
             vscode.Uri.file(firstRoot),
             vscode.Uri.file(laterRoot),
         ]);
-        assert.strictEqual(notifications.length, 1, 'a settled workspace notified again');
+        assert.strictEqual(notifications.length, 2, 'a settled workspace reported again');
+    });
+
+    test('merges the report record instead of overwriting another window\'s entries', async () => {
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-concurrent-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const agentsPath = path.join(workspaceRoot, 'AGENTS.md');
+        await writeFile(agentsPath, blockAbove(USER_PROSE));
+        const {context, globalState} = createContextStub(globalStoragePath);
+        // Another window records its own finding between our read and our write.
+        const foreignEntry = '/other/window/CLAUDE.md';
+        let reads = 0;
+        const realGet = context.globalState.get.bind(context.globalState);
+        (context.globalState as any).get = (key: string, defaultValue?: unknown) => {
+            const value = realGet(key, defaultValue as any);
+            if (key===REPORTED_KEY) {
+                reads += 1;
+                if (reads===1) {
+                    globalState.set(REPORTED_KEY, [foreignEntry]);
+                }
+            }
+            return value;
+        };
+
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+
+        assert.strictEqual(notifications.length, 1);
+        assert.deepStrictEqual(
+            storedList(globalState, REPORTED_KEY),
+            [agentsPath, foreignEntry].sort(),
+            'the other window\'s entry was lost',
+        );
     });
 
     test('does nothing and says nothing when Agent Review was never installed', async () => {
@@ -665,16 +753,17 @@ suite('Agent Review removal cleanup', () => {
         assert.deepStrictEqual(await listDir(workspaceRoot), ['README.md']);
         assert.strictEqual(await readFile(readmePath), USER_PROSE);
         assert.strictEqual(await exists(globalStoragePath), false, 'global storage was created unnecessarily');
-        assert.strictEqual(notifications.length, 0, 'the user was interrupted with nothing to recover');
-        assert.strictEqual(globalState.get(NOTICE_KEY), undefined);
+        assert.strictEqual(notifications.length, 0);
+        assert.strictEqual(warnings.length, 0);
+        assert.strictEqual(globalState.get(REPORTED_KEY), undefined);
     });
 
-    test('never throws when roots or instruction files are missing or not files', async () => {
+    test('keeps a missing or unreachable root pending instead of settling it', async () => {
         const workspaceRoot = await tempDir('sr-overleaf-agent-review-missing-');
         const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
-        // A directory where an instruction file is expected. It cannot hold a
-        // managed block, so it is settled, not endlessly retried.
-        await fs.mkdir(path.join(workspaceRoot, 'AGENTS.md'), {recursive: true});
+        // A directory where an instruction file is expected: it cannot hold a
+        // block, so it is settled rather than retried forever.
+        await realFs<typeof fs.mkdir>('mkdir')(path.join(workspaceRoot, 'AGENTS.md'), {recursive: true});
         const claudePath = path.join(workspaceRoot, 'CLAUDE.md');
         await writeFile(claudePath, blockAbove(USER_PROSE));
         const missingRoot = path.join(workspaceRoot, 'does-not-exist');
@@ -687,14 +776,18 @@ suite('Agent Review removal cleanup', () => {
             vscode.Uri.parse('semantic-researcher-overleaf://www.overleaf.com/Project'),
         ]);
 
-        assert.strictEqual((await fs.stat(path.join(workspaceRoot, 'AGENTS.md'))).isDirectory(), true);
-        assert.strictEqual(await readFile(claudePath), USER_PROSE);
-        assert.deepStrictEqual(
-            completedRoots(workspaceState).sort(),
-            [
-                vscode.Uri.file(missingRoot).toString(),
-                vscode.Uri.file(workspaceRoot).toString(),
-            ].sort(),
+        assert.strictEqual(
+            (await realFs<typeof fs.stat>('stat')(path.join(workspaceRoot, 'AGENTS.md'))).isDirectory(),
+            true,
         );
+        assert.strictEqual(await readFile(claudePath), blockAbove(USER_PROSE));
+        // A folder that is not there right now may come back carrying a stale
+        // file, so it must not be recorded as inspected.
+        assert.deepStrictEqual(
+            storedList(workspaceState, INSPECTED_ROOTS_KEY),
+            [vscode.Uri.file(workspaceRoot).toString()],
+        );
+        assert.strictEqual(notifications.length, 1);
+        assert.ok(notifications[0].includes(claudePath));
     });
 });

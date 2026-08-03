@@ -947,6 +947,61 @@ suite('Local Replica stable-snapshot push', function () {
         }
     });
 
+    test('a synthesized delete is corroborated before the Overleaf copy is removed', async () => {
+        const remoteRoot = await tempDir('sr-stable-synthdel-remote-');
+        const localRoot = await tempDir('sr-stable-synthdel-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'v1');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+
+        // The precompile source scan manufactures this delete from one directory
+        // listing: the path is simply absent from it. No watcher ever reported an
+        // unlink, so the destructive step must corroborate before acting.
+        await fs.rm(localMain.fsPath);
+
+        const originalCapture = internals.captureLocalPathRevision.bind(scm);
+        let captures = 0;
+        internals.captureLocalPathRevision = async (relPath: string, generation?: number) => {
+            if (relPath==='/main.tex') {
+                captures += 1;
+                // The rename half of the replacement lands while the corroboration
+                // probe is asleep, i.e. after the first capture saw it missing.
+                if (captures===2) { await writeText(localMain, 'v2'); }
+            }
+            return originalCapture(relPath, generation);
+        };
+
+        let barrierRejected = false;
+        try {
+            await scm.flushBeforeCompile([]).catch(() => { barrierRejected = true; });
+            // The data-loss assertion comes first so a regression names the harm
+            // rather than the barrier's downstream reaction to it.
+            assert.strictEqual(
+                await pathExists(remoteMain),
+                true,
+                'Overleaf copy was deleted on a single absence observation',
+            );
+            assert.strictEqual(await readText(remoteMain), 'v1');
+            assert.ok(captures>=2, 'the destructive step must corroborate the absence');
+            assert.ok(barrierRejected, 'a deferred delete must block the compile');
+            assert.ok(hasLine('[push deferred:unstable-read]'));
+            assert.strictEqual(internals.locallyDivergedPaths.has('/main.tex'), true);
+        } finally {
+            internals.captureLocalPathRevision = originalCapture;
+        }
+
+        // The replacement then reaches Overleaf as the update it always was.
+        const retry = await waitForSyncComplete(localRoot, '/main.tex', 'push', 'update');
+        assert.strictEqual(retry.outcome, 'success');
+        assert.strictEqual(await readText(remoteMain), 'v2');
+    });
+
     test('a vanish during an already-classified update defers instead of deleting the remote', async () => {
         const remoteRoot = await tempDir('sr-stable-enoent-remote-');
         const localRoot = await tempDir('sr-stable-enoent-local-');
@@ -1114,9 +1169,12 @@ suite('Local Replica stable-snapshot push', function () {
     // Instrumentation notes. Uploads are recorded only after the bytes land, and
     // uploads and reads carry a path plus a sequence number, so a later read
     // cannot retroactively legitimise an earlier upload. Merge observations carry
-    // a sequence number but NO path: mergeTextContents receives only contents, so
-    // the merge side proves ordering ("an auto-merge produced these bytes before
-    // this upload") and not path linkage.
+    // a sequence number but NO path, because mergeTextContents receives only
+    // contents and wrapping more production surface purely for a test is not
+    // worth it. So the merge side proves exactly this and no more: "some
+    // auto-merge produced these bytes before this upload". It does NOT prove the
+    // merge was for this path, so an unrelated earlier merge that happened to
+    // produce an identical digest would satisfy it.
     function installProvenanceProbes(scm: LocalReplicaSCMProvider) {
         const internals = scm as any;
         const reads: Array<{seq: number; relPath: string; digest: string}> = [];
