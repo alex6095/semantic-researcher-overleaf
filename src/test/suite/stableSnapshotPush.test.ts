@@ -517,6 +517,88 @@ suite('Local Replica stable-snapshot push', function () {
         assert.strictEqual(vfs.uploadCount, 1);
     });
 
+    test('P0: the tombstone echo delete refuses a same-byte recreate on a new inode', async () => {
+        const remoteRoot = await tempDir('sr-stable-echo-samebytes-remote-');
+        const localRoot = await tempDir('sr-stable-echo-samebytes-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
+        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
+        await writeText(remoteSample, 'tombstoned bytes');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+
+        await vscode.workspace.fs.delete(remoteSample);
+        await internals.applySync('pull', 'delete', '/sample.tex', remoteSample, localSample);
+        const tombstone = internals.remoteDeleteTombstones.get('/sample.tex');
+        assert.ok(tombstone);
+
+        // Revision A: the stale echo. Same bytes as the tombstone, mtime inside
+        // the window, so it authorizes the suppression delete.
+        await writeText(localSample, 'tombstoned bytes');
+        const staleTime = new Date(tombstone.staleLocalMtime);
+        await fs.utimes(localSample.fsPath, staleTime, staleTime);
+        const staleIno = (await fs.lstat(localSample.fsPath)).ino;
+
+        // Revision B: the user restores the file on purpose. Byte-for-byte
+        // identical to A — so a digest-only compare-and-swap sees no difference —
+        // but a different inode with a fresh mtime, which is exactly what makes
+        // it an intentional restore rather than the stale echo.
+        const replacement = vscode.Uri.joinPath(localRoot, 'restore.tmp');
+        await writeText(replacement, 'tombstoned bytes');
+        const restoredTime = new Date(Date.now()+120_000);
+        const originalStableRead = internals.readStableConfinedLocalFile.bind(scm);
+        let recreated = false;
+        internals.readStableConfinedLocalFile = async (
+            relPath: string,
+            uri?: vscode.Uri,
+            generation?: number,
+        ) => {
+            const snapshot = await originalStableRead(relPath, uri, generation);
+            if (relPath==='/sample.tex' && !recreated) {
+                recreated = true;
+                await fs.rename(replacement.fsPath, localSample.fsPath);
+                await fs.utimes(localSample.fsPath, restoredTime, restoredTime);
+            }
+            return snapshot;
+        };
+
+        let event: Events['scmSyncCompleteEvent'];
+        try {
+            event = await internals.applySync(
+                'push',
+                'update',
+                '/sample.tex',
+                localSample,
+                remoteSample,
+            ) as Events['scmSyncCompleteEvent'];
+        } finally {
+            internals.readStableConfinedLocalFile = originalStableRead;
+        }
+
+        assert.strictEqual(recreated, true);
+        assert.strictEqual(
+            await pathExists(localSample),
+            true,
+            'the same-byte recreate was deleted by a digest-only compare-and-swap',
+        );
+        const survivingIno = (await fs.lstat(localSample.fsPath)).ino;
+        assert.notStrictEqual(survivingIno, staleIno, 'the recreate must be a new inode');
+        assert.strictEqual(await readText(localSample), 'tombstoned bytes');
+        assert.ok(hasLine('[push update deferred:echo-delete-superseded]'));
+        assert.ok(!hasLine('[push update suppressed:remote-delete-echo]'));
+        assert.strictEqual(event.outcome, 'blocked');
+
+        // The intentional restore then reaches Overleaf, because on re-read its
+        // fresh mtime no longer satisfies the tombstone predicate.
+        const retry = await waitForSyncComplete(localRoot, '/sample.tex', 'push', 'update');
+        assert.strictEqual(retry.outcome, 'success');
+        assert.strictEqual(await readText(remoteSample), 'tombstoned bytes');
+        assert.strictEqual(await readText(localSample), 'tombstoned bytes');
+    });
+
     test('a short read is refused even when every metadata field matches', async () => {
         const remoteRoot = await tempDir('sr-stable-shortread-remote-');
         const localRoot = await tempDir('sr-stable-shortread-local-');
@@ -809,6 +891,62 @@ suite('Local Replica stable-snapshot push', function () {
         }
     });
 
+    test('the synthesized save flush also rechecks a momentary vanish', async () => {
+        const remoteRoot = await tempDir('sr-stable-flush-enoent-remote-');
+        const localRoot = await tempDir('sr-stable-flush-enoent-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'v1');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+
+        const pathEvents: Events['scmSyncCompleteEvent'][] = [];
+        const subscription = EventBus.on('scmSyncCompleteEvent', pushEvent => {
+            if (pushEvent.relPath==='/main.tex' && pushEvent.direction==='push') {
+                pathEvents.push(pushEvent);
+            }
+        });
+
+        // flushPendingPush with no debounced event synthesises its own push, so
+        // it classifies without any watcher observation to inherit.
+        await fs.rm(localMain.fsPath);
+        const originalStat = internals.statConfinedLocalUri.bind(scm);
+        let classificationStats = 0;
+        internals.statConfinedLocalUri = async (uri: vscode.Uri, operation: string) => {
+            if (
+                uri.fsPath===localMain.fsPath
+                && operation.startsWith('classification of')
+            ) {
+                classificationStats += 1;
+                if (classificationStats===2) { await writeText(localMain, 'v2'); }
+            }
+            return originalStat(uri, operation);
+        };
+
+        try {
+            assert.strictEqual(internals.pendingLocalEvents.has('/main.tex'), false);
+            await scm.flushPendingPush(localMain);
+
+            assert.ok(classificationStats>=2, 'the classifier must look more than once');
+            assert.ok(hasLine('[classification recheck:vanished-during-update]'));
+            assert.strictEqual(await pathExists(remoteMain), true, 'Overleaf copy was deleted');
+            assert.strictEqual(await readText(remoteMain), 'v2');
+            assert.deepStrictEqual(
+                pathEvents.filter(pushEvent => pushEvent.type==='delete'),
+                [],
+                'no delete may be propagated for a replacement in flight',
+            );
+            assert.strictEqual(vfs.uploadCount, 1);
+        } finally {
+            internals.statConfinedLocalUri = originalStat;
+            subscription.dispose();
+        }
+    });
+
     test('a vanish during an already-classified update defers instead of deleting the remote', async () => {
         const remoteRoot = await tempDir('sr-stable-enoent-remote-');
         const localRoot = await tempDir('sr-stable-enoent-local-');
@@ -964,20 +1102,25 @@ suite('Local Replica stable-snapshot push', function () {
     //
     // The guarantee that must hold regardless is narrower than "every payload was
     // returned by a confined read", which is false: the auto-merge writers push
-    // diff3 output that no read produced. The true guarantee is that a payload is
-    // either (a) causally traceable to an earlier confined read OF THE SAME PATH
-    // that returned exactly those bytes, or (b) the output of an auto-merge whose
-    // local side was such a read. Nothing is cached, replayed from a buffer, or
-    // fabricated from nothing.
+    // diff3 output that no read produced, and the production VFS can merge again
+    // before emitting OT, so a payload's local side may itself already be a merge
+    // product. The honest statement is that remote bytes are ROOTED in a confined
+    // read, possibly through one or more merge stages: a payload is either
+    // (a) causally traceable to an earlier confined read OF THE SAME PATH that
+    // returned exactly those bytes, or (b) the output of an auto-merge that ran
+    // before it. Nothing is cached, replayed from a buffer, or fabricated from
+    // nothing.
     //
-    // Instrumentation notes, both of which the previous version of this test got
-    // wrong: uploads are recorded only after the bytes land, and every
-    // observation carries a path and a sequence number, so a later read cannot
-    // retroactively legitimise an earlier upload.
+    // Instrumentation notes. Uploads are recorded only after the bytes land, and
+    // uploads and reads carry a path plus a sequence number, so a later read
+    // cannot retroactively legitimise an earlier upload. Merge observations carry
+    // a sequence number but NO path: mergeTextContents receives only contents, so
+    // the merge side proves ordering ("an auto-merge produced these bytes before
+    // this upload") and not path linkage.
     function installProvenanceProbes(scm: LocalReplicaSCMProvider) {
         const internals = scm as any;
         const reads: Array<{seq: number; relPath: string; digest: string}> = [];
-        const mergeProducts = new Set<string>();
+        const mergeProducts: Array<{seq: number; digest: string}> = [];
         const originalSnapshotRead = internals.readConfinedLocalFileSnapshot.bind(scm);
         internals.readConfinedLocalFileSnapshot = async (relPath: string, uri?: vscode.Uri) => {
             const snapshot = await originalSnapshotRead(relPath, uri);
@@ -991,7 +1134,9 @@ suite('Local Replica stable-snapshot push', function () {
         const originalMerge = internals.mergeTextContents.bind(scm);
         internals.mergeTextContents = (...args: unknown[]) => {
             const merged = originalMerge(...args);
-            if (merged!==undefined) { mergeProducts.add(sha1Bytes(merged)); }
+            if (merged!==undefined) {
+                mergeProducts.push({seq: nextObservationSeq(), digest: sha1Bytes(merged)});
+            }
             return merged;
         };
         return {
@@ -1006,7 +1151,10 @@ suite('Local Replica stable-snapshot push', function () {
 
     function assertUploadProvenance(
         vfs: FakeVirtualFileSystem,
-        probes: {reads: Array<{seq: number; relPath: string; digest: string}>; mergeProducts: Set<string>},
+        probes: {
+            reads: Array<{seq: number; relPath: string; digest: string}>;
+            mergeProducts: Array<{seq: number; digest: string}>;
+        },
     ) {
         for (const upload of vfs.uploads) {
             const causallyRead = probes.reads.some(read =>
@@ -1014,8 +1162,11 @@ suite('Local Replica stable-snapshot push', function () {
                 && read.relPath===upload.relPath
                 && read.digest===upload.digest
             );
+            const causallyMerged = probes.mergeProducts.some(merge =>
+                merge.seq<upload.seq && merge.digest===upload.digest
+            );
             assert.ok(
-                causallyRead || probes.mergeProducts.has(upload.digest),
+                causallyRead || causallyMerged,
                 `upload #${upload.seq} of ${upload.relPath} carried bytes that no earlier `
                 + 'confined read of that path returned and that no auto-merge produced',
             );
@@ -1081,7 +1232,7 @@ suite('Local Replica stable-snapshot push', function () {
 
         assert.strictEqual(supersededCount, 2, 'the blind spot must have been exercised');
         assert.ok(vfs.uploads.length>=2, 'the scenario must actually upload');
-        assert.strictEqual(probes.mergeProducts.size, 0, 'this scenario must not auto-merge');
+        assert.strictEqual(probes.mergeProducts.length, 0, 'this scenario must not auto-merge');
         assertUploadProvenance(vfs, probes);
         assert.strictEqual(await readText(remoteMain), 'settled revision 3');
         assert.strictEqual(await readText(localMain), 'settled revision 3');
@@ -1125,7 +1276,12 @@ suite('Local Replica stable-snapshot push', function () {
         assert.strictEqual(vfs.uploads.length, 1);
 
         const merged = sha1Bytes(Buffer.from('LOCAL\nline2\nREMOTE\n', 'utf-8'));
-        assert.ok(probes.mergeProducts.has(merged), 'the upload must be recorded as merge output');
+        assert.ok(
+            probes.mergeProducts.some(merge =>
+                merge.digest===merged && merge.seq<vfs.uploads[0].seq
+            ),
+            'the upload must be recorded as merge output produced before it',
+        );
         // The exception is real: these bytes were never returned by any read.
         assert.strictEqual(
             probes.reads.some(read => read.digest===merged && read.seq<vfs.uploads[0].seq),

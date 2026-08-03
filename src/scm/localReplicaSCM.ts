@@ -289,6 +289,17 @@ class LocalReplicaFolderSelectionRejectedError extends Error {}
 class ConcurrentReplicaChangeError extends Error {}
 export class LocalReplicaOwnershipUnavailableError extends Error {}
 
+// Identity of the file object a confined read actually observed, taken from the
+// same descriptor as the bytes. It is what lets a destructive action be
+// conditioned on the revision that authorized it rather than on its bytes alone.
+export type LocalReadIdentity = {
+    dev: string;
+    ino: string;
+    size: string;
+    mtimeNs: string;
+    ctimeNs: string;
+};
+
 export type LocalReadUnstableReason =
     // The bytes moved under the open descriptor (latexmk rewriting in place).
     | 'descriptor-changed'
@@ -5194,10 +5205,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return written;
     }
 
+    // `expectedIdentity`, when supplied, narrows the compare-and-swap from "the
+    // bytes still hash the same" to "this is still the same file object". A
+    // same-byte atomic recreate is a different inode with a fresh mtime and is a
+    // legitimate user action, so a digest-only comparison would delete it.
     private async atomicDeleteLocalPathIfRevision(
         relPath: string,
         expectedRevision: string,
         generation = this.syncGeneration,
+        expectedIdentity?: LocalReadIdentity,
     ): Promise<boolean> {
         this.requireSyncSession(generation);
         const targetPath = this.localUri(relPath).fsPath;
@@ -5212,6 +5228,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return true;
         }
         if (current.revision!==expectedRevision) {
+            return false;
+        }
+        if (
+            expectedIdentity!==undefined
+            && !await this.localPathIdentityMatches(targetPath, expectedIdentity, true)
+        ) {
             return false;
         }
         const operationRecord: LocalReplicaOperationRecord = {
@@ -5250,7 +5272,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 relPath,
                 generation,
             );
-            if (moved.revision!==expectedRevision) {
+            // Authoritative check: whatever the rename captured is now pinned
+            // under a private name, so this observation cannot be raced.
+            const movedIdentityMatches = expectedIdentity===undefined
+                || await this.localPathIdentityMatches(
+                    quarantinePath,
+                    expectedIdentity,
+                    false,
+                );
+            if (moved.revision!==expectedRevision || !movedIdentityMatches) {
                 rollbackPath = undefined;
                 await this.restoreStagedPathWithoutOverwrite(
                     quarantinePath,
@@ -6431,7 +6461,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (type==='delete' || queuedBehindExistingSync) {
                     let reclassifiedType: 'update' | 'delete' | undefined;
                     try {
-                        reclassifiedType = await this.localTargetNeedsPush(relPath, localUri);
+                        reclassifiedType = await this.localTargetNeedsPush(relPath, localUri, type);
                     } catch (error) {
                         if (!LocalReplicaSCMProvider.isLocalReadUnstable(error)) { throw error; }
                         unstableSnapshot = true;
@@ -6479,7 +6509,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             case 'success': {
                 let remainingChange: 'update' | 'delete' | undefined;
                 try {
-                    remainingChange = await this.localTargetNeedsPush(relPath, localUri);
+                    remainingChange = await this.localTargetNeedsPush(relPath, localUri, type);
                 } catch (error) {
                     if (!LocalReplicaSCMProvider.isLocalReadUnstable(error)) { throw error; }
                     // The upload itself landed; what we cannot prove is that the
@@ -6684,8 +6714,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async readConfinedLocalFileSnapshot(
         relPath: string,
         uri: vscode.Uri = this.localUri(relPath),
-    ): Promise<{content: Uint8Array; stat: vscode.FileStat}> {
+    ): Promise<{content: Uint8Array; stat: vscode.FileStat; identity?: LocalReadIdentity}> {
         if (uri.scheme!=='file' || this.baseUri.scheme!=='file') {
+            // No descriptor, so no inode identity to carry. Callers that need one
+            // to authorize a destructive action must refuse rather than fall back
+            // to a bytes-only comparison.
             const stat = await this.statConfinedLocalUri(uri, `read of ${relPath}`);
             return {content: await vscode.workspace.fs.readFile(uri), stat};
         }
@@ -6817,9 +6850,51 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     mtime: Number(descriptorStatAfter.mtimeMs),
                     size: Number(descriptorStatAfter.size),
                 },
+                identity: {
+                    dev: String(descriptorStatAfter.dev),
+                    ino: String(descriptorStatAfter.ino),
+                    size: String(descriptorStatAfter.size),
+                    mtimeNs: String(
+                        (descriptorStatAfter as unknown as {mtimeNs?: bigint}).mtimeNs
+                        ?? descriptorStatAfter.mtimeMs,
+                    ),
+                    ctimeNs: String(
+                        (descriptorStatAfter as unknown as {ctimeNs?: bigint}).ctimeNs
+                        ?? descriptorStatAfter.ctimeMs,
+                    ),
+                },
             };
         } finally {
             await handle.close();
+        }
+    }
+
+    // Does the path still hold the exact file object a confined read observed?
+    // Bytes alone cannot answer that: an atomic recreate with identical content
+    // is a different inode with a fresh mtime, and is a legitimate user action
+    // rather than the stale revision we judged. `includeCtime` is false after a
+    // quarantine rename, which necessarily bumps ctime while leaving dev, ino,
+    // size and mtime intact.
+    private async localPathIdentityMatches(
+        fsPath: string,
+        expected: LocalReadIdentity,
+        includeCtime: boolean,
+    ): Promise<boolean> {
+        try {
+            const stat = await nodeFs.lstat(fsPath, {bigint: true});
+            const mtimeNs = String(
+                (stat as unknown as {mtimeNs?: bigint}).mtimeNs ?? stat.mtimeMs,
+            );
+            const ctimeNs = String(
+                (stat as unknown as {ctimeNs?: bigint}).ctimeNs ?? stat.ctimeMs,
+            );
+            return String(stat.dev)===expected.dev
+                && String(stat.ino)===expected.ino
+                && String(stat.size)===expected.size
+                && mtimeNs===expected.mtimeNs
+                && (!includeCtime || ctimeNs===expected.ctimeNs);
+        } catch {
+            return false;
         }
     }
 
@@ -6837,7 +6912,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         relPath: string,
         uri: vscode.Uri = this.localUri(relPath),
         generation = this.syncGeneration,
-    ): Promise<{content: Uint8Array; stat: vscode.FileStat}> {
+    ): Promise<{content: Uint8Array; stat: vscode.FileStat; identity?: LocalReadIdentity}> {
         const delays = LocalReplicaSCMProvider.localReadStabilizeDelays;
         for (let attempt = 0; ; attempt++) {
             try {
@@ -6925,7 +7000,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         fromUri: vscode.Uri,
         type: 'update' | 'delete',
         generation: number,
-    ): Promise<{content: Uint8Array; stat: vscode.FileStat}> {
+    ): Promise<{content: Uint8Array; stat: vscode.FileStat; identity?: LocalReadIdentity}> {
         try {
             return await this.readStableConfinedLocalFile(relPath, fromUri, generation);
         } catch (error) {
@@ -6998,6 +7073,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     `(attempt ${attempt+1}/${recheckDelays.length})`,
                 );
                 await this.sleepForStabilization(recheckDelays[attempt]);
+                // Re-check on the way out of the sleep: a teardown during the
+                // recheck must not be followed by another confined read.
+                this.requireSyncSession();
             }
         }
     }
@@ -7317,7 +7395,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // No debounced event yet — the watcher may simply not have fired
         // before onDidSaveTextDocument. Synthesise a push so the VFS is
         // current before the caller proceeds.
-        const currentType = await this.localTargetNeedsPush(relPath, localUri);
+        const currentType = await this.localTargetNeedsPush(relPath, localUri, 'update');
         this.requireSyncSession(generation);
         if (currentType===undefined) { return; }
         const vfsUri = this.vfs.pathToUri(relPath);
@@ -7373,7 +7451,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             const relPath = this.relPathFromLocalFileUri(localUri, 'precompile saved document flush');
             if (relPath===undefined || this.matchIgnorePatterns(relPath)) { continue; }
             explicitTargets.add(relPath);
-            const type = await classifyCompileTarget(relPath, localUri);
+            const type = await classifyCompileTarget(relPath, localUri, 'update');
             this.requireSyncSession(generation);
             if (type==='update') {
                 forcedTargets.set(relPath, localUri);
@@ -7387,7 +7465,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         for (const relPath of divergedPaths) {
             if (this.matchIgnorePatterns(relPath)) { continue; }
             const localUri = this.localUri(relPath);
-            const type = await classifyCompileTarget(relPath, localUri);
+            const type = await classifyCompileTarget(relPath, localUri, 'update');
             this.requireSyncSession(generation);
             if (type==='update') {
                 forcedTargets.set(relPath, localUri);
@@ -10009,6 +10087,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         // and may describe an earlier revision entirely.
                         let newContent: Uint8Array;
                         let readStat = stat;
+                        let readIdentity: LocalReadIdentity | undefined;
                         if (action==='pull') {
                             newContent = await this.pullRemoteFile(relPath, fromUri, generation);
                         } else {
@@ -10020,6 +10099,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             );
                             newContent = snapshot.content;
                             readStat = snapshot.stat;
+                            readIdentity = snapshot.identity;
                         }
                         this.requireSyncSession(generation);
                         if (action==='pull') {
@@ -10056,14 +10136,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 // cleared this path's manifest and baseline
                                 // provenance, so no later watcher event is
                                 // obliged to bring it back.
-                                const removedStaleRevision = await this.runSessionIO(
-                                    generation,
-                                    () => this.atomicDeleteLocalPathIfRevision(
-                                        relPath,
-                                        contentDigest(newContent),
+                                const removedStaleRevision = readIdentity!==undefined
+                                    && await this.runSessionIO(
                                         generation,
-                                    ),
-                                );
+                                        () => this.atomicDeleteLocalPathIfRevision(
+                                            relPath,
+                                            contentDigest(newContent),
+                                            generation,
+                                            readIdentity,
+                                        ),
+                                    );
                                 if (!removedStaleRevision) {
                                     getOutputChannel().appendLine(
                                         `${new Date().toISOString()} [push update deferred:echo-delete-superseded] ` +

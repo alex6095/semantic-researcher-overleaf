@@ -1,4 +1,5 @@
 import * as vscode from 'vscode';
+import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
 import * as path from 'path';
 import { REPLICA_SETTINGS_DIR, ROOT_NAME } from '../consts';
@@ -17,10 +18,17 @@ import { REPLICA_SETTINGS_DIR, ROOT_NAME } from '../consts';
  * (`PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS`), so the stale instructions would
  * otherwise survive indefinitely.
  *
- * The cleanup therefore removes exactly what misleads — our own delimited block
- * and the helper that keeps "accepting" submissions — and preserves everything
- * that may hold real work (draft copies, pending proposals), telling the user
- * once where it is.
+ * The cleanup removes exactly what misleads — our own delimited block and the
+ * helper that keeps "accepting" submissions — and preserves everything that may
+ * hold real work (draft copies, pending proposals), telling the user once where
+ * it is.
+ *
+ * Every mutation here races the user and their coding agents, who may be saving
+ * the very files we rewrite. So the instruction-file edits use node's `fs`
+ * rather than `vscode.workspace.fs`: they need a held file descriptor, inode
+ * identity and non-clobbering `link`/`rename`, none of which the workspace
+ * FileSystem API exposes. That is safe because only `file:`-scheme roots are
+ * ever scanned.
  */
 
 // Copied verbatim from the removed `src/agentReview/instructionFiles.ts`; these
@@ -36,22 +44,72 @@ const INSTRUCTION_FILE_NAMES = ['AGENTS.md', 'CLAUDE.md'];
 // `AgentReviewWorkspaceInstructionManager` and `AgentReviewProposalStore`.
 const AGENT_REVIEW_DIR = 'agent-review';
 const HELPER_NAME = 'overleaf-agent-review';
-const REGISTRY_FILE = 'registry.json';
 const DRAFTS_DIR = 'drafts';
 const PROPOSALS_DIR = 'proposals';
 
 const CLEANUP_VERSION = 1;
-// Instruction blocks live in the workspace, so their "already done" marker has
-// to be workspace-scoped: a global-only marker would let the first upgraded
-// window mark the job finished and leave every other workspace's AGENTS.md
-// advertising the dead draft workflow forever.
-const INSTRUCTION_CLEANUP_KEY = `${ROOT_NAME}.agentReviewInstructionCleanup`;
+// Which workspace folders have been fully cleaned, as URI strings. Per folder,
+// not one bit for the whole window: a folder added to a multi-root workspace
+// later still carries its own stale block and its own legacy helper, and a
+// single "done" flag would silently skip it forever.
+const INSTRUCTION_CLEANUP_ROOTS_KEY = `${ROOT_NAME}.agentReviewInstructionCleanupRoots`;
 // Global storage is shared by every window, so its marker is global.
 const STORAGE_CLEANUP_KEY = `${ROOT_NAME}.agentReviewStorageCleanup`;
-// Separate from the cleanup markers so a retried cleanup can never re-notify.
-const PRESERVED_NOTICE_KEY = `${ROOT_NAME}.agentReviewPreservedNotice`;
+// Storage locations already named in a notification, so no location is ever
+// announced twice and no location is silently dropped.
+const PRESERVED_NOTICE_KEY = `${ROOT_NAME}.agentReviewPreservedNoticeLocations`;
 
-type InstructionCleanupResult = 'unchanged' | 'cleaned' | 'failed';
+// Sibling name used to hold a file's bytes while proving it is safe to delete.
+// The `.sr-overleaf-*` prefix is in `PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS`,
+// so a transient temporary can never be pushed to Overleaf.
+const ASIDE_PREFIX = '.sr-overleaf-agent-review-cleanup-';
+
+type InstructionCleanupResult =
+    /** No such file. Nothing to do now and nothing to retry. */
+    | 'absent'
+    /** Readable, no managed block. */
+    | 'unchanged'
+    | 'cleaned'
+    /** The file exists but could not be read, so a stale block may still be in it. */
+    | 'unreadable'
+    /** Someone else changed the file while we worked; theirs wins, we retry. */
+    | 'deferred'
+    /** The rewrite itself failed. */
+    | 'failed';
+
+interface FileIdentity {
+    dev: number;
+    ino: number;
+    size: number;
+    mtimeMs: number;
+}
+
+function errorCode(error: unknown): string {
+    return typeof error==='object' && error!==null && 'code' in error
+        ? String((error as {code?: unknown}).code)
+        : '';
+}
+
+function identityOf(stat: {dev: number, ino: number, size: number, mtimeMs: number}): FileIdentity {
+    return {dev: stat.dev, ino: stat.ino, size: stat.size, mtimeMs: stat.mtimeMs};
+}
+
+/**
+ * `ino`/`dev` catch an atomic replace, `size`/`mtimeMs` an in-place rewrite.
+ * Some Windows filesystems report `ino` as 0; the size and timestamp checks and
+ * the byte re-read below still stand on their own there.
+ */
+function sameIdentity(a: FileIdentity, b: FileIdentity): boolean {
+    return sameInode(a, b) && a.size===b.size && a.mtimeMs===b.mtimeMs;
+}
+
+/**
+ * "Still the same file", ignoring content. Used after our own write, which
+ * necessarily changed the size and timestamp.
+ */
+function sameInode(a: FileIdentity, b: FileIdentity): boolean {
+    return a.dev===b.dev && a.ino===b.ino;
+}
 
 /**
  * Removes every well-formed managed block, and only that. Returns `undefined`
@@ -95,49 +153,212 @@ function stripManagedBlocks(existing: string): string | undefined {
     return changed ? result : undefined;
 }
 
-async function removeManagedBlockFromFile(uri: vscode.Uri): Promise<InstructionCleanupResult> {
-    let existing: string;
+/** Reads the whole file through an explicit position, so it can be re-read. */
+async function readAllFromHandle(handle: fs.FileHandle, size: number): Promise<string> {
+    const buffer = Buffer.alloc(size);
+    let offset = 0;
+    while (offset<size) {
+        const {bytesRead} = await handle.read(buffer, offset, size-offset, offset);
+        if (bytesRead===0) {
+            break;
+        }
+        offset += bytesRead;
+    }
+    return buffer.subarray(0, offset).toString('utf8');
+}
+
+/**
+ * Puts a file we moved aside back where it was, without ever overwriting
+ * whatever may now occupy that path. `link` is the primitive that makes this
+ * safe: it fails with EEXIST instead of clobbering.
+ */
+async function restoreAside(asidePath: string, filePath: string): Promise<void> {
     try {
-        existing = new TextDecoder().decode(await vscode.workspace.fs.readFile(uri));
-    } catch {
-        // Absent or unreadable. Both mean the same thing here: there is no
-        // content we can safely rewrite, and we never recreate the file.
-        return 'unchanged';
+        await fs.link(asidePath, filePath);
+        // The content is back at its own path; a leftover alias is only litter.
+        await fs.unlink(asidePath).catch(() => undefined);
+        return;
+    } catch (error) {
+        if (errorCode(error)==='EEXIST') {
+            // Something new lives at the original path. Their file wins; ours
+            // stays beside it rather than being destroyed.
+            console.warn(`Agent Review cleanup left the previous ${filePath} at ${asidePath}: a new file now occupies that path.`);
+            return;
+        }
+        // Filesystems without hard links (some network/FUSE mounts): fall back
+        // to a rename, but only when the destination is demonstrably free.
     }
 
-    const next = stripManagedBlocks(existing);
-    if (next===undefined) {
-        return 'unchanged';
+    if (!await pathExists(filePath)) {
+        try {
+            await fs.rename(asidePath, filePath);
+            return;
+        } catch (error) {
+            console.warn(`Agent Review cleanup could not restore ${filePath} from ${asidePath}:`, error);
+            return;
+        }
+    }
+    console.warn(`Agent Review cleanup left the previous ${filePath} at ${asidePath}; move it back manually.`);
+}
+
+/**
+ * Deletes a file only after proving its bytes are still exactly the block-only
+ * content we validated.
+ *
+ * A stat-then-unlink check cannot make that promise: an editor saving between
+ * the check and the unlink loses its write into an unlinked inode. Moving the
+ * file aside first is atomic and reversible — after the rename nothing can
+ * reach those bytes through the original name, so they can be re-read and
+ * compared at leisure, and anything unexpected is put back.
+ *
+ * If the process dies mid-sequence the bytes survive under the aside name
+ * rather than being destroyed, and in this branch those bytes are by definition
+ * nothing but our own managed block, so nothing of the user's is at stake.
+ */
+async function deleteIfStillBlockOnly(filePath: string, expected: string): Promise<InstructionCleanupResult> {
+    const asidePath = path.join(path.dirname(filePath), `${ASIDE_PREFIX}${crypto.randomUUID()}`);
+    try {
+        await fs.rename(filePath, asidePath);
+    } catch (error) {
+        console.warn(`Could not set ${filePath} aside for Agent Review cleanup:`, error);
+        return 'deferred';
+    }
+
+    let moved: string | undefined;
+    try {
+        moved = await fs.readFile(asidePath, 'utf8');
+    } catch (error) {
+        console.warn(`Could not re-read ${filePath} after setting it aside:`, error);
+    }
+
+    if (moved===expected) {
+        try {
+            await fs.unlink(asidePath);
+            return 'cleaned';
+        } catch (error) {
+            console.warn(`Could not delete the emptied ${filePath}:`, error);
+            await restoreAside(asidePath, filePath);
+            return 'failed';
+        }
+    }
+
+    // Not what we read: a newer revision, or bytes we could not verify. Put it
+    // back untouched and try again on a later activation.
+    await restoreAside(asidePath, filePath);
+    return 'deferred';
+}
+
+/**
+ * Strips the managed block from one instruction file under a compare-and-swap.
+ *
+ * The file is read through a held descriptor, and immediately before the
+ * rewrite the same descriptor is re-stat'd and re-read and the path is checked
+ * to still resolve to that inode. Any mismatch means the user or an agent saved
+ * a newer revision, and that revision always wins: we skip and retry on the
+ * next activation rather than overwrite — or, in the block-only case, delete —
+ * work we never saw.
+ */
+async function removeManagedBlockFromFile(filePath: string): Promise<InstructionCleanupResult> {
+    let handle: fs.FileHandle | undefined;
+    try {
+        handle = await fs.open(filePath, 'r+');
+    } catch (error) {
+        if (errorCode(error)==='ENOENT') {
+            return 'absent';
+        }
+        if (errorCode(error)==='EISDIR') {
+            // A directory cannot hold a managed block, so there is nothing to
+            // retry either.
+            return 'absent';
+        }
+        // Permissions, a locked file, an I/O error: a stale block may well still
+        // be in there, so this must not count as cleaned up.
+        console.warn(`Could not open ${filePath} for Agent Review cleanup:`, error);
+        return 'unreadable';
     }
 
     try {
+        const before = identityOf(await handle.stat());
+        const original = await readAllFromHandle(handle, before.size);
+        const next = stripManagedBlocks(original);
+        if (next===undefined) {
+            return 'unchanged';
+        }
+
+        // --- compare-and-swap ---------------------------------------------
+        const after = identityOf(await handle.stat());
+        if (!sameIdentity(before, after)) {
+            return 'deferred';
+        }
+        if (await readAllFromHandle(handle, after.size)!==original) {
+            return 'deferred';
+        }
+        let current: FileIdentity;
+        try {
+            current = identityOf(await fs.stat(filePath));
+        } catch (error) {
+            console.warn(`Could not confirm ${filePath} before rewriting it:`, error);
+            return 'deferred';
+        }
+        // An atomic replace (write-to-temp then rename) leaves our descriptor on
+        // an unlinked inode while the user's new file sits at the path.
+        if (!sameIdentity(before, current)) {
+            return 'deferred';
+        }
+        // -------------------------------------------------------------------
+
         if (next.length===0) {
             // Nothing but our block was in the file, so the feature created it.
             // Deleting restores the pre-feature state instead of leaving an
             // empty file behind; this mirrors what the removed
-            // `removeManagedBlock` did when the feature was disabled.
-            await vscode.workspace.fs.delete(uri, {recursive: false, useTrash: false});
-        } else {
-            await vscode.workspace.fs.writeFile(uri, new TextEncoder().encode(next));
+            // `removeManagedBlock` did when the feature was disabled. Release
+            // the descriptor first — Windows refuses to rename an open file.
+            await handle.close();
+            handle = undefined;
+            return await deleteIfStillBlockOnly(filePath, original);
+        }
+
+        const bytes = Buffer.from(next, 'utf8');
+        try {
+            // Writing through the validated descriptor keeps the edit on the
+            // inode we checked. Write before truncating so the file never
+            // momentarily holds less than the cleaned content.
+            await handle.write(bytes, 0, bytes.length, 0);
+            await handle.truncate(bytes.length);
+            // Make the cleaned bytes durable before this root can be recorded as
+            // done, so a crash can never leave the marker without the fix.
+            await handle.sync().catch(() => undefined);
+        } catch (error) {
+            console.warn(`Could not remove the stale Agent Review block from ${filePath}:`, error);
+            return 'failed';
+        }
+
+        try {
+            if (!sameInode(before, identityOf(await fs.stat(filePath)))) {
+                // Replaced between the check and the write: our bytes went to an
+                // inode nobody can reach any more and the user's file is intact.
+                return 'deferred';
+            }
+        } catch {
+            return 'deferred';
         }
         return 'cleaned';
     } catch (error) {
-        // Read-only file, permission loss, racing delete… Never fail activation;
-        // report 'failed' so the caller retries on the next activation instead
-        // of marking a still-misleading file as cleaned up.
-        console.warn(`Could not remove the stale Agent Review block from ${uri.fsPath}:`, error);
+        // Never fail activation for one file.
+        console.warn(`Agent Review cleanup could not process ${filePath}:`, error);
         return 'failed';
+    } finally {
+        await handle?.close().catch(() => undefined);
     }
 }
 
-async function removeWorkspaceInstructionBlocks(roots: readonly vscode.Uri[]): Promise<boolean> {
+/** True when every instruction file under this root reached a settled state. */
+async function cleanInstructionFilesForRoot(root: vscode.Uri): Promise<boolean> {
     let complete = true;
-    for (const root of roots) {
-        for (const name of INSTRUCTION_FILE_NAMES) {
-            const result = await removeManagedBlockFromFile(vscode.Uri.joinPath(root, name));
-            if (result==='failed') {
-                complete = false;
-            }
+    for (const name of INSTRUCTION_FILE_NAMES) {
+        const result = await removeManagedBlockFromFile(path.join(root.fsPath, name));
+        if (result==='unreadable' || result==='deferred' || result==='failed') {
+            complete = false;
         }
     }
     return complete;
@@ -149,8 +370,8 @@ async function removeWorkspaceInstructionBlocks(roots: readonly vscode.Uri[]): P
  * The original helper's `submit` removed the draft directory whenever the
  * registry no longer listed the replica root, so a plain "unregister" would
  * destroy exactly the work we are trying to preserve. Replacing the executable
- * itself is the only neutralization that both stops submissions and keeps the
- * drafts intact.
+ * is the only neutralization that both stops submissions and keeps the drafts
+ * intact.
  */
 function neutralizedHelperScript(draftsRoot: string): string {
     return `#!/usr/bin/env node
@@ -211,8 +432,23 @@ async function hasProposalFiles(proposalsRoot: string): Promise<boolean> {
     return false;
 }
 
+/** Installs the stub over the old helper atomically, so it is never half-written. */
+async function replaceHelper(metaRoot: string, helperPath: string): Promise<boolean> {
+    const stagedPath = path.join(path.dirname(helperPath), `${ASIDE_PREFIX}${crypto.randomUUID()}`);
+    try {
+        await fs.writeFile(stagedPath, neutralizedHelperScript(path.join(metaRoot, DRAFTS_DIR)));
+        await fs.chmod(stagedPath, 0o755);
+        await fs.rename(stagedPath, helperPath);
+        return true;
+    } catch (error) {
+        console.warn(`Could not neutralize the stale Agent Review helper at ${helperPath}:`, error);
+        await fs.unlink(stagedPath).catch(() => undefined);
+        return false;
+    }
+}
+
 /**
- * Neutralizes one Agent Review storage root in place. Returns the root when it
+ * Neutralizes one Agent Review storage root in place, and reports whether it
  * still holds drafts or proposals so the caller can point the user at it.
  *
  * Never removes drafts or proposals: they can contain real manuscript work that
@@ -227,31 +463,35 @@ async function neutralizeStorageRoot(metaRoot: string): Promise<{preserved: bool
     let complete = true;
     const helperPath = path.join(metaRoot, 'bin', HELPER_NAME);
     if (await pathExists(helperPath)) {
-        try {
-            await fs.writeFile(helperPath, neutralizedHelperScript(path.join(metaRoot, DRAFTS_DIR)));
-            await fs.chmod(helperPath, 0o755);
-        } catch (error) {
-            console.warn(`Could not neutralize the stale Agent Review helper at ${helperPath}:`, error);
-            complete = false;
-        }
+        complete = await replaceHelper(metaRoot, helperPath);
     }
 
-    // The registry was the helper's own record of which replica roots were
-    // enabled. Emptying it means "no root is registered"; the stub above is the
-    // real guard, this only matters for a helper copy still reading this file.
-    const registryPath = path.join(metaRoot, REGISTRY_FILE);
-    if (await pathExists(registryPath)) {
-        try {
-            await fs.writeFile(registryPath, JSON.stringify({replicaRoots: []}, null, 2));
-        } catch (error) {
-            console.warn(`Could not clear the stale Agent Review registry at ${registryPath}:`, error);
-            complete = false;
-        }
-    }
+    // `registry.json` is deliberately left exactly as it is, even though an
+    // emptied registry would read like extra safety. Emptying it is precisely
+    // the trigger for the removed helper's own destructive path: its `submit`
+    // deletes the entire draft directory when the registry no longer lists that
+    // draft's replica root. So any old helper that outlives this cleanup — one
+    // whose replacement failed above, or one already mid-`submit` when we ran —
+    // would answer an emptied registry by destroying the manuscript work this
+    // migration exists to preserve. And it protects nothing in exchange: the
+    // helper resolves its registry from its own install location
+    // (`dirname(dirname(__filename))`), so a copy elsewhere never reads this
+    // file. Replacing the executable is the neutralization; the registry is
+    // inert once the executable is a stub, and leaving it untouched means the
+    // draft-deleting branch is never reachable at all.
 
     const preserved = await directoryHasEntries(path.join(metaRoot, DRAFTS_DIR))
         || await hasProposalFiles(path.join(metaRoot, PROPOSALS_DIR));
     return {preserved, complete};
+}
+
+function readStringSet(memento: vscode.Memento, key: string): Set<string> {
+    const stored = memento.get<unknown>(key);
+    return new Set(
+        Array.isArray(stored)
+            ? stored.filter((entry): entry is string => typeof entry==='string')
+            : [],
+    );
 }
 
 function notifyPreservedWork(locations: string[]) {
@@ -271,10 +511,25 @@ function notifyPreservedWork(locations: string[]) {
     }, () => undefined);
 }
 
+async function announcePreservedWork(context: vscode.ExtensionContext, locations: string[]) {
+    if (locations.length===0) {
+        return;
+    }
+    const announced = readStringSet(context.globalState, PRESERVED_NOTICE_KEY);
+    const fresh = locations.filter(location => !announced.has(location));
+    if (fresh.length===0) {
+        return;
+    }
+    // Recorded before the notification is shown, so a retry after a partial
+    // cleanup — or a second window — can never announce the same folder twice.
+    await context.globalState.update(PRESERVED_NOTICE_KEY, [...announced, ...fresh]);
+    notifyPreservedWork(fresh);
+}
+
 /**
- * Runs the upgrade cleanup once. Safe to call on every activation: when the
- * markers are recorded it costs two `Memento.get` calls, and when the user never
- * had Agent Review it does nothing and says nothing.
+ * Runs the upgrade cleanup. Safe to call on every activation: a folder that has
+ * been cleaned is never scanned again, and when the user never had Agent Review
+ * it does nothing and says nothing.
  *
  * Never throws — every failure path degrades to a logged warning.
  */
@@ -284,57 +539,57 @@ export async function cleanupRemovedAgentReview(
         (vscode.workspace.workspaceFolders ?? []).map(folder => folder.uri),
 ): Promise<void> {
     try {
-        const instructionsDone = (context.workspaceState.get<number>(INSTRUCTION_CLEANUP_KEY, 0))>=CLEANUP_VERSION;
-        const storageDone = (context.globalState.get<number>(STORAGE_CLEANUP_KEY, 0))>=CLEANUP_VERSION;
-        if (instructionsDone && storageDone) {
-            return;
-        }
-
         // The removed code only ever resolved instruction targets and legacy
         // metadata to a workspace folder root, so those are the only roots worth
         // scanning.
         const fileRoots = workspaceRoots.filter(root => root.scheme==='file');
-        const preserved: string[] = [];
-        let instructionsComplete = true;
-        let storageComplete = true;
+        const completedRoots = readStringSet(context.workspaceState, INSTRUCTION_CLEANUP_ROOTS_KEY);
+        const pendingRoots = fileRoots.filter(root => !completedRoots.has(root.toString()));
+        const storageDone = (context.globalState.get<number>(STORAGE_CLEANUP_KEY, 0))>=CLEANUP_VERSION;
+        if (pendingRoots.length===0 && storageDone) {
+            return;
+        }
 
-        if (!instructionsDone) {
-            instructionsComplete = await removeWorkspaceInstructionBlocks(fileRoots);
+        const preserved: string[] = [];
+        const newlyCompleted: string[] = [];
+
+        for (const root of pendingRoots) {
+            let complete = await cleanInstructionFilesForRoot(root);
             // Builds before the move to global storage kept the helper, registry
-            // and drafts inside each workspace folder instead.
-            for (const root of fileRoots) {
-                const legacyRoot = path.join(root.fsPath, REPLICA_SETTINGS_DIR, AGENT_REVIEW_DIR);
-                const result = await neutralizeStorageRoot(legacyRoot);
-                // Workspace-scoped work is gated by the workspace marker, so a
-                // legacy failure has to hold back that marker, not the global one.
-                instructionsComplete = instructionsComplete && result.complete;
-                if (result.preserved) {
-                    preserved.push(legacyRoot);
-                }
+            // and drafts inside each workspace folder instead. This is per root
+            // and not gated on the global marker, so a folder added later still
+            // gets its own legacy helper neutralized.
+            const legacyRoot = path.join(root.fsPath, REPLICA_SETTINGS_DIR, AGENT_REVIEW_DIR);
+            const legacy = await neutralizeStorageRoot(legacyRoot);
+            complete = complete && legacy.complete;
+            if (legacy.preserved) {
+                preserved.push(legacyRoot);
+            }
+            // Only a root that fully settled is recorded, so a file that was
+            // unreadable or concurrently edited is retried later instead of
+            // being abandoned with its misleading block still in place.
+            if (complete) {
+                newlyCompleted.push(root.toString());
             }
         }
 
+        let storageComplete = true;
         if (!storageDone) {
             const globalRoot = path.join(context.globalStorageUri.fsPath, AGENT_REVIEW_DIR);
             const result = await neutralizeStorageRoot(globalRoot);
-            storageComplete = storageComplete && result.complete;
+            storageComplete = result.complete;
             if (result.preserved) {
                 preserved.push(globalRoot);
             }
         }
 
-        if (preserved.length>0 && !context.globalState.get<boolean>(PRESERVED_NOTICE_KEY, false)) {
-            // One notification, ever — not one per file and not once per window.
-            // Recorded before it is shown so a concurrent window cannot repeat it.
-            await context.globalState.update(PRESERVED_NOTICE_KEY, true);
-            notifyPreservedWork(preserved);
-        }
+        await announcePreservedWork(context, preserved);
 
-        // Only record a step that fully succeeded, so a file that was read-only
-        // during this activation is retried later instead of being abandoned
-        // with its misleading block still in place.
-        if (!instructionsDone && instructionsComplete) {
-            await context.workspaceState.update(INSTRUCTION_CLEANUP_KEY, CLEANUP_VERSION);
+        if (newlyCompleted.length>0) {
+            await context.workspaceState.update(
+                INSTRUCTION_CLEANUP_ROOTS_KEY,
+                [...completedRoots, ...newlyCompleted],
+            );
         }
         if (!storageDone && storageComplete) {
             await context.globalState.update(STORAGE_CLEANUP_KEY, CLEANUP_VERSION);
