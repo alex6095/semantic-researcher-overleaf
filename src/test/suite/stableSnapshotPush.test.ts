@@ -23,6 +23,10 @@ import { setActiveReplicaRoot } from '../../utils/localReplicaWorkspace';
 // the window it is reasoning about rather than inferring it.
 const REMOTE_DELETE_MTIME_SLOP_MS = 2_000;
 
+// contentDigest(undefined) in localReplicaSCM.ts. Stated here because the module
+// keeps it private and the bypass-seed assertion needs the exact value.
+const contentDigestForDelete = '\0';
+
 interface PersistRecord {
     enabled: boolean;
     label: string;
@@ -515,6 +519,91 @@ suite('Local Replica stable-snapshot push', function () {
         assert.strictEqual(await readText(remoteSample), 'legitimate revision B');
         assert.strictEqual(await readText(localSample), 'legitimate revision B');
         assert.strictEqual(vfs.uploadCount, 1);
+    });
+
+    // Counterweight to the refusal tests below. They prove the compare-and-swap
+    // declines every superseded revision, but an implementation that refused
+    // unconditionally would satisfy all of them; this pins the behaviour they are
+    // guarding, including the ordering that keeps our own delete from echoing.
+    test('an unchanged tombstone echo is still deleted, with the bypass entry seeded first', async () => {
+        const remoteRoot = await tempDir('sr-stable-echo-happy-remote-');
+        const localRoot = await tempDir('sr-stable-echo-happy-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
+        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
+        await writeText(remoteSample, 'tombstoned bytes');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+
+        await vscode.workspace.fs.delete(remoteSample);
+        await internals.applySync('pull', 'delete', '/sample.tex', remoteSample, localSample);
+        const tombstone = internals.remoteDeleteTombstones.get('/sample.tex');
+        assert.ok(tombstone);
+
+        // The textbook stale echo: the watcher reports a file the remote delete
+        // already accounted for. Same bytes, mtime inside the window, and nothing
+        // races it.
+        await writeText(localSample, 'tombstoned bytes');
+        const staleTime = new Date(tombstone.staleLocalMtime);
+        await fs.utimes(localSample.fsPath, staleTime, staleTime);
+
+        // The bypass entry must already record the deletion when the removal
+        // starts, or the watcher event our own delete produces would be
+        // classified as a user deletion.
+        const originalDelete = internals.atomicDeleteLocalPathIfRevision.bind(scm);
+        let deleteAttempted = false;
+        let bypassAtDeleteTime: {hash: string; type: string} | undefined;
+        internals.atomicDeleteLocalPathIfRevision = async (...args: unknown[]) => {
+            deleteAttempted = true;
+            bypassAtDeleteTime = internals.bypassCache.get('/sample.tex')?.[0];
+            return originalDelete(...args);
+        };
+
+        let event: Events['scmSyncCompleteEvent'];
+        try {
+            event = await internals.applySync(
+                'push',
+                'update',
+                '/sample.tex',
+                localSample,
+                remoteSample,
+            ) as Events['scmSyncCompleteEvent'];
+        } finally {
+            internals.atomicDeleteLocalPathIfRevision = originalDelete;
+        }
+
+        assert.strictEqual(event.outcome, 'suppressed');
+        assert.strictEqual(
+            await pathExists(localSample),
+            false,
+            'the stale echo must actually be removed, not merely refused',
+        );
+        assert.strictEqual(await pathExists(remoteSample), false, 'the remote must stay deleted');
+        assert.ok(hasLine('[push update suppressed:remote-delete-echo]'));
+        assert.ok(!hasLine('[push update deferred:echo-delete-superseded]'));
+        assert.strictEqual(vfs.uploadCount, 0);
+        assert.ok(deleteAttempted, 'the delete must have been attempted');
+        assert.ok(
+            bypassAtDeleteTime,
+            'the bypass entry must be seeded before the removal runs, or our own '
+            + 'delete echoes back as a user deletion',
+        );
+        assert.strictEqual(bypassAtDeleteTime!.type, 'delete');
+        assert.strictEqual(bypassAtDeleteTime!.hash, contentDigestForDelete);
+
+        // And the watcher echo of our own removal propagates nothing.
+        const echo = await internals.applySync(
+            'push',
+            'delete',
+            '/sample.tex',
+            localSample,
+            remoteSample,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(echo.outcome, 'suppressed');
+        assert.strictEqual(vfs.uploadCount, 0);
     });
 
     test('P0: the tombstone echo delete refuses a same-byte recreate on a new inode', async () => {
@@ -1336,8 +1425,10 @@ suite('Local Replica stable-snapshot push', function () {
     // read, possibly through one or more merge stages: a payload is either
     // (a) causally traceable to an earlier confined read OF THE SAME PATH that
     // returned exactly those bytes, or (b) the output of an auto-merge that ran
-    // before it. Nothing is cached, replayed from a buffer, or fabricated from
-    // nothing.
+    // before it. A payload is never re-derived from a cache, a baseline buffer or
+    // a manifest entry, and never fabricated from nothing — though pushWithRetry
+    // does resend the SAME confined-read payload it captured when an upload
+    // attempt fails, which changes nothing about its ancestry.
     //
     // Instrumentation notes. Uploads are recorded only after the bytes land, and
     // uploads and reads carry a path plus a sequence number, so a later read

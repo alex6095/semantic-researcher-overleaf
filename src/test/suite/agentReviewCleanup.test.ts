@@ -5,7 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import { REPLICA_SETTINGS_DIR } from '../../consts';
-import { cleanupRemovedAgentReview } from '../../utils/agentReviewCleanup';
+import { cleanupRemovedAgentReview, watchAgentReviewHelper } from '../../utils/agentReviewCleanup';
 
 // Verbatim from the removed `src/agentReview/instructionFiles.ts`: the tests
 // must exercise the literals real user files were written with, not a paraphrase.
@@ -226,6 +226,21 @@ suite('Agent Review removal cleanup', () => {
         } catch {
             return false;
         }
+    }
+
+    function delay(ms: number) {
+        return new Promise<void>(resolve => setTimeout(resolve, ms));
+    }
+
+    async function waitUntil(condition: () => Promise<boolean>, timeoutMs: number, what: string) {
+        const deadline = Date.now()+timeoutMs;
+        while (Date.now()<deadline) {
+            if (await condition()) {
+                return;
+            }
+            await delay(50);
+        }
+        assert.fail(what);
     }
 
     async function listDir(dir: string) {
@@ -595,7 +610,7 @@ suite('Agent Review removal cleanup', () => {
         assert.ok(helper.includes(HELPER_STUB_MARKER), 'the stub does not identify itself');
     });
 
-    test('re-disables a helper that a still-running pre-upgrade window reinstalled', async () => {
+    test('re-disables a reinstalled helper on the next activation', async () => {
         const workspaceRoot = await tempDir('sr-overleaf-agent-review-resurrect-');
         const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
         const metaRoot = path.join(globalStoragePath, 'agent-review');
@@ -625,6 +640,108 @@ suite('Agent Review removal cleanup', () => {
         assert.strictEqual(await readFile(installed.draftFile), draftContent);
         // Re-disabling is not news: it must not produce a second notification.
         assert.strictEqual(notifications.length, 1);
+        assert.strictEqual(warnings.length, 0);
+    });
+
+    test('re-disables a resurrected helper through its watcher, with no further activation', async function () {
+        this.timeout(30000);
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-watch-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const metaRoot = path.join(globalStoragePath, 'agent-review');
+        const installed = await installAgentReviewStorage(metaRoot, workspaceRoot);
+        const helperPath = path.join(metaRoot, 'bin', 'overleaf-agent-review');
+        const draftContent = await readFile(installed.draftFile);
+        const {context} = createContextStub(globalStoragePath);
+
+        // Armed *before* the cleanup, so the cleanup's own replacement fires it.
+        const guard = watchAgentReviewHelper(context);
+        try {
+            await guard.armed;
+            await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+            const afterCleanup = await snapshot(helperPath);
+            assert.ok(afterCleanup.content.includes(HELPER_STUB_MARKER));
+            // The cleanup legitimately reports the preserved drafts; what the
+            // watcher must add to that is nothing at all.
+            const noticesFromCleanup = notifications.length;
+            const warningsFromCleanup = warnings.length;
+
+            // Our own staged write, chmod and rename all land inside the watched
+            // directory. Reacting to them must not rewrite anything.
+            await delay(1000);
+            assert.deepStrictEqual(
+                await snapshot(helperPath),
+                afterCleanup,
+                'reacting to its own write made the watcher rewrite the helper',
+            );
+
+            // A still-running pre-upgrade host reinstalls the accepting helper.
+            // Nothing calls the cleanup again: the watcher is the whole mechanism.
+            await writeFile(helperPath, ORIGINAL_HELPER);
+            await waitUntil(
+                async () => (await readFile(helperPath)).includes(HELPER_STUB_MARKER),
+                15000,
+                'the watcher never re-disabled a resurrected helper',
+            );
+
+            const status = runHelper(helperPath, installed.draftId);
+            if (status!==undefined) {
+                assert.strictEqual(status, 1, 'the resurrected helper still accepts submissions');
+            }
+            assert.strictEqual(await readFile(installed.draftFile), draftContent);
+            // Re-disabling is not news the user can act on.
+            assert.strictEqual(
+                notifications.length,
+                noticesFromCleanup,
+                `the watcher raised a notice: ${notifications[noticesFromCleanup]}`,
+            );
+            assert.strictEqual(
+                warnings.length,
+                warningsFromCleanup,
+                `the watcher raised a warning: ${warnings[warningsFromCleanup]}`,
+            );
+        } finally {
+            guard.dispose();
+        }
+    });
+
+    test('a disposed watcher stops reacting', async function () {
+        this.timeout(20000);
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-disposed-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const metaRoot = path.join(globalStoragePath, 'agent-review');
+        await installAgentReviewStorage(metaRoot, workspaceRoot, {withWork: false});
+        const helperPath = path.join(metaRoot, 'bin', 'overleaf-agent-review');
+        const {context} = createContextStub(globalStoragePath);
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+
+        // Armed after the cleanup, so this watcher has never attempted a
+        // replacement and no cooldown can stand in for disposal.
+        const guard = watchAgentReviewHelper(context);
+        await guard.armed;
+        guard.dispose();
+
+        await writeFile(helperPath, ORIGINAL_HELPER);
+        await delay(1500);
+
+        assert.strictEqual(
+            await readFile(helperPath),
+            ORIGINAL_HELPER,
+            'a disposed watcher still reacted',
+        );
+    });
+
+    test('arms no watcher when the helper directory does not exist', async () => {
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-nowatch-'), 'globalStorage');
+        const {context} = createContextStub(globalStoragePath);
+
+        // The overwhelming majority of users never had Agent Review; they must
+        // pay a probe and nothing else.
+        const guard = watchAgentReviewHelper(context);
+        await guard.armed;
+        guard.dispose();
+
+        assert.strictEqual(await exists(globalStoragePath), false, 'watching created global storage');
+        assert.strictEqual(notifications.length, 0);
         assert.strictEqual(warnings.length, 0);
     });
 

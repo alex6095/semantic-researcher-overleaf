@@ -13,7 +13,7 @@ import {
     onDidChangeActiveReplicaRoot,
 } from './utils/localReplicaWorkspace';
 import { migrateLegacyNamespace } from './utils/namespaceMigration';
-import { cleanupRemovedAgentReview } from './utils/agentReviewCleanup';
+import { cleanupRemovedAgentReview, watchAgentReviewHelper } from './utils/agentReviewCleanup';
 
 type ActiveReplicaSyncTarget = {
     key: string,
@@ -37,6 +37,12 @@ export async function activate(context: vscode.ExtensionContext) {
                 void cleanupRemovedAgentReview(context);
             }
         }),
+        // Checking on activation cannot cover the interval after the last check:
+        // a pre-upgrade window still running re-installs the accepting helper
+        // whenever it activates a Local Replica. This keeps it disabled for as
+        // long as this window lives, and arms nothing unless the directory it
+        // guards already exists.
+        watchAgentReviewHelper(context),
     );
 
     // Register: [core] RemoteFileSystemProvider

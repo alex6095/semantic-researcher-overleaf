@@ -1,6 +1,7 @@
 import * as vscode from 'vscode';
 import * as crypto from 'crypto';
 import * as fs from 'fs/promises';
+import * as nodeFs from 'fs';
 import * as path from 'path';
 import { REPLICA_SETTINGS_DIR, ROOT_NAME } from '../consts';
 
@@ -64,6 +65,14 @@ const HELPER_STUB_MARKER = `${ROOT_NAME}:agent-review-helper-disabled:v1`;
 // per-activation identity check stays bounded whatever is at that path.
 const MAX_HELPER_BYTES = 64 * 1024;
 
+// Coalesces the burst a single replacement produces (staged write, chmod,
+// rename) into one reaction.
+const HELPER_WATCH_DEBOUNCE_MS = 250;
+// After an attempted replacement, ignore events for this long. A replacement
+// that keeps failing also produces events, and without this those events would
+// re-trigger the attempt that produced them.
+const HELPER_WATCH_COOLDOWN_MS = 5000;
+
 // Name for the staged replacement helper. The `.sr-overleaf-*` prefix is in
 // `PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS`, so a transient staging file can
 // never be pushed to Overleaf.
@@ -83,6 +92,16 @@ interface StorageOutcome {
     preserved: Presence;
     /** The helper is definitively ours, or definitively not there. */
     complete: boolean;
+}
+
+export interface AgentReviewHelperWatch {
+    dispose(): void;
+    /**
+     * Resolves once the watcher is armed, or has decided there is nothing to
+     * arm. Nothing in production waits on this; it exists so a test can drive
+     * the watcher instead of sleeping and hoping.
+     */
+    readonly armed: Promise<void>;
 }
 
 interface Findings {
@@ -258,6 +277,32 @@ async function inspectHelper(helperPath: string): Promise<'ours' | 'foreign' | '
 }
 
 /**
+ * Makes the helper at one storage root ours, if it is not already.
+ *
+ * `attempted` reports whether a replacement was actually tried, which is what
+ * the watcher uses to keep the events its own write produces from re-triggering
+ * it.
+ */
+async function ensureHelperNeutralized(metaRoot: string): Promise<{complete: boolean, attempted: boolean}> {
+    const helperPath = path.join(metaRoot, 'bin', HELPER_NAME);
+    const helper = await inspectHelper(helperPath);
+    if (helper==='ours' || helper==='absent') {
+        // Already neutralized, or nothing installed that could accept a
+        // submission. This is the steady state: one stat plus one small read,
+        // and — importantly for the watcher — no write.
+        return {complete: true, attempted: false};
+    }
+    if (helper==='foreign') {
+        // Either the first run after the upgrade, or a still-running pre-upgrade
+        // window has re-installed the accepting helper behind us.
+        console.warn(`Disabling an active Agent Review helper at ${helperPath}.`);
+        return {complete: await replaceHelper(metaRoot, helperPath), attempted: true};
+    }
+    console.warn(`Could not determine the state of the Agent Review helper at ${helperPath}; will retry.`);
+    return {complete: false, attempted: false};
+}
+
+/**
  * Verifies — and if necessary restores — the neutralized helper at one storage
  * root, and reports whether that root still holds drafts or proposals.
  *
@@ -284,22 +329,7 @@ async function inspectStorageRoot(metaRoot: string): Promise<StorageOutcome> {
         return {preserved: 'unknown', complete: false};
     }
 
-    const helperPath = path.join(metaRoot, 'bin', HELPER_NAME);
-    const helper = await inspectHelper(helperPath);
-    let complete: boolean;
-    if (helper==='ours' || helper==='absent') {
-        // Already neutralized, or nothing installed that could accept a
-        // submission. This is the steady state: one stat plus one small read.
-        complete = true;
-    } else if (helper==='foreign') {
-        // Either the first run after the upgrade, or a still-running pre-upgrade
-        // window has re-installed the accepting helper behind us.
-        console.warn(`Disabling an active Agent Review helper at ${helperPath}.`);
-        complete = await replaceHelper(metaRoot, helperPath);
-    } else {
-        console.warn(`Could not determine the state of the Agent Review helper at ${helperPath}; will retry.`);
-        complete = false;
-    }
+    const {complete} = await ensureHelperNeutralized(metaRoot);
 
     // `registry.json` is deliberately never written. Emptying it looks like
     // extra safety but is the precondition for the removed helper's own
@@ -443,6 +473,110 @@ async function report(context: vscode.ExtensionContext, findings: Findings) {
     showReport({...fresh, liveHelperLocations: findings.liveHelperLocations});
     const merged = new Set([...readStringList(context.globalState, REPORTED_KEY), ...newEntries]);
     await context.globalState.update(REPORTED_KEY, [...merged]);
+}
+
+/**
+ * Keeps the neutralized helper neutralized for the lifetime of the window.
+ *
+ * Checking on activation closes every interval except the one that matters
+ * most: the one after the last check. A pre-upgrade extension host that is still
+ * running re-installs the accepting helper whenever it activates a Local
+ * Replica, and until something looks again an agent can follow the leftover
+ * instructions, get a successful `submit`, and strand real work.
+ *
+ * Only global storage is watched. That is where the removed
+ * `ensureHelperInstalled()` writes — `metaRootPath` is
+ * `globalStorageUri/agent-review` — and the same build's
+ * `migrateLegacyWorkspaceMeta()` deletes the per-workspace copies, so no live
+ * writer targets those. They stay covered by the activation-time check.
+ *
+ * Nothing is armed unless `bin/` already exists, so a user who never had Agent
+ * Review pays one `stat` and no watcher. If `bin/` is absent there is no helper
+ * to resurrect; should it appear later, the next activation catches it.
+ */
+export function watchAgentReviewHelper(context: vscode.ExtensionContext): AgentReviewHelperWatch {
+    let watcher: nodeFs.FSWatcher | undefined;
+    let timer: NodeJS.Timeout | undefined;
+    let disposed = false;
+    let cooldownUntil = 0;
+
+    const stop = () => {
+        if (timer) {
+            clearTimeout(timer);
+            timer = undefined;
+        }
+        try {
+            watcher?.close();
+        } catch {
+            // Already closed, or the handle died with the directory.
+        }
+        watcher = undefined;
+    };
+
+    const react = async (metaRoot: string) => {
+        // Disposal is re-checked here as well as at scheduling time: the debounce
+        // may have elapsed after the extension shut down. An attempt already in
+        // flight is allowed to finish — its only effect is making the helper
+        // ours, which is harmless at any time.
+        if (disposed || Date.now()<cooldownUntil) {
+            return;
+        }
+        try {
+            const {attempted} = await ensureHelperNeutralized(metaRoot);
+            if (attempted) {
+                // Our own staged write, chmod and rename are about to fire this
+                // very watcher. Ignoring events for a moment keeps a replacement
+                // — including one that fails and retries — from feeding itself.
+                cooldownUntil = Date.now() + HELPER_WATCH_COOLDOWN_MS;
+            }
+        } catch (error) {
+            console.warn('Agent Review helper watch could not re-check the helper:', error);
+        }
+    };
+
+    const schedule = (metaRoot: string) => {
+        if (disposed) {
+            return;
+        }
+        if (timer) {
+            clearTimeout(timer);
+        }
+        timer = setTimeout(() => {
+            timer = undefined;
+            void react(metaRoot);
+        }, HELPER_WATCH_DEBOUNCE_MS);
+    };
+
+    const armed = (async () => {
+        try {
+            const metaRoot = path.join(context.globalStorageUri.fsPath, AGENT_REVIEW_DIR);
+            const binRoot = path.join(metaRoot, 'bin');
+            if (await probe(binRoot)!=='present' || disposed) {
+                return;
+            }
+            // `persistent: false` so this can never hold the host process open.
+            watcher = nodeFs.watch(binRoot, {persistent: false}, () => schedule(metaRoot));
+            watcher.on('error', error => {
+                // Watch limits, an unmounted path, a deleted directory: give up
+                // quietly. The activation-time check still covers this window.
+                console.warn(`Agent Review helper watch stopped for ${binRoot}:`, error);
+                stop();
+            });
+            if (disposed) {
+                stop();
+            }
+        } catch (error) {
+            console.warn('Could not watch the Agent Review helper directory:', error);
+        }
+    })();
+
+    return {
+        armed,
+        dispose: () => {
+            disposed = true;
+            stop();
+        },
+    };
 }
 
 /**
