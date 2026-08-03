@@ -3848,10 +3848,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+    // `confirmLocalStillAbsent` is consulted at the one moment that matters: after
+    // the Overleaf entity has been staged aside but before it is destroyed.
     private async atomicDeleteRemotePathIfRevision(
         relPath: string,
         expectedRevision: string,
         generation = this.syncGeneration,
+        confirmLocalStillAbsent?: () => Promise<boolean>,
     ): Promise<boolean> {
         this.requireSyncSession(generation);
         const targetUri = this.vfs.pathToUri(relPath);
@@ -3894,7 +3897,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
         };
 
-        const restoreChangedStaging = async (reason: string) => {
+        const restoreChangedStaging = async (
+            reason: string,
+            makeError: (message: string) => Error = message => new ConcurrentReplicaChangeError(message),
+        ) => {
             const restored = await this.restoreRemoteStagingPath(
                 stagingUri,
                 targetUri,
@@ -3909,7 +3915,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } else {
                 await this.removeRemoteDeleteOperationRecord(operationId);
             }
-            throw new ConcurrentReplicaChangeError(reason);
+            throw makeError(reason);
         };
 
         try {
@@ -4028,6 +4034,25 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
             }
 
+            // The last reversible instant. Up to here the target has only been
+            // RENAMED aside, so Overleaf still holds the same entity — its id,
+            // history, comments and links are intact and a rename back restores
+            // all of it. Once the staged copy is destroyed that identity is gone
+            // for good, and re-uploading the bytes later creates a NEW entity
+            // rather than bringing the old one back. The local absence that
+            // authorized this delete was last observed several network round
+            // trips ago, so it is confirmed once more here; a path that has
+            // returned in the meantime un-stages the entity and defers instead.
+            if (confirmLocalStillAbsent!==undefined && !await confirmLocalStillAbsent()) {
+                await restoreChangedStaging(
+                    `the local path for ${relPath} reappeared before its Overleaf entity was destroyed`,
+                    message => new LocalReadUnstableError(
+                        relPath,
+                        'vanished-during-update',
+                        message,
+                    ),
+                );
+            }
             await deleteExpectedStaging();
             await this.refreshRemoteStateForReconciliation(
                 relPath,
@@ -4044,7 +4069,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             await this.removeRemoteDeleteOperationRecord(operationId);
             return true;
         } catch (error) {
-            if (error instanceof ConcurrentReplicaChangeError) {
+            if (
+                error instanceof ConcurrentReplicaChangeError
+                || LocalReplicaSCMProvider.isLocalReadUnstable(error)
+            ) {
                 throw error;
             }
             try {
@@ -9986,6 +10014,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 relPath,
                                 expectedRemoteDeleteRevision,
                                 generation,
+                                async () => (
+                                    await this.captureLocalPathRevision(relPath, generation)
+                                ).kind==='missing',
                             );
                         }, {
                             delays: LocalReplicaSCMProvider.pushRetryDelays,

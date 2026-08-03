@@ -1243,6 +1243,72 @@ suite('Local Replica stable-snapshot push', function () {
         assert.strictEqual(vfs.uploadCount, 1);
     });
 
+    test('a replacement landing after staging un-stages the Overleaf entity instead of destroying it', async () => {
+        const remoteRoot = await tempDir('sr-stable-unstage-remote-');
+        const localRoot = await tempDir('sr-stable-unstage-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'v1');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        (LocalReplicaSCMProvider as any).localReadStabilizeRearmMs = 5_000;
+
+        // A real local deletion: every local check up to and including the
+        // pre-mutation probe legitimately sees the path missing.
+        await fs.rm(localMain.fsPath);
+
+        // The replacement lands after the Overleaf entity has been staged aside,
+        // i.e. after the last local observation the delete was authorized on and
+        // before the staged entity would be destroyed.
+        const originalStage = internals.renameRemotePathForDelete.bind(scm);
+        let staged = 0;
+        internals.renameRemotePathForDelete = async (...args: unknown[]) => {
+            const result = await originalStage(...args);
+            staged += 1;
+            if (staged===1) { await writeText(localMain, 'v2'); }
+            return result;
+        };
+
+        let event: Events['scmSyncCompleteEvent'];
+        try {
+            event = await internals.applySync(
+                'push',
+                'delete',
+                '/main.tex',
+                localMain,
+                remoteMain,
+            ) as Events['scmSyncCompleteEvent'];
+        } finally {
+            internals.renameRemotePathForDelete = originalStage;
+        }
+
+        assert.strictEqual(staged, 1, 'the entity must actually have been staged');
+        assert.strictEqual(
+            await pathExists(remoteMain),
+            true,
+            'the staged Overleaf entity was destroyed after the local path returned',
+        );
+        assert.strictEqual(await readText(remoteMain), 'v1');
+        assert.deepStrictEqual(
+            (await vscode.workspace.fs.readDirectory(remoteRoot))
+                .map(([name]) => name)
+                .filter(name => name!=='main.tex'),
+            [],
+            'the staging entity must be renamed back, not left behind',
+        );
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(event.error, LOCAL_SNAPSHOT_UNSTABLE);
+        assert.strictEqual(internals.locallyDivergedPaths.has('/main.tex'), true);
+
+        // And the replacement converges as the update it always was.
+        await scm.flushPendingPush(localMain);
+        assert.strictEqual(await readText(remoteMain), 'v2');
+    });
+
     test('a push delete does not propagate while the local path is back', async () => {
         const remoteRoot = await tempDir('sr-stable-redelete-remote-');
         const localRoot = await tempDir('sr-stable-redelete-local-');

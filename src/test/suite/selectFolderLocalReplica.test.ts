@@ -6814,6 +6814,16 @@ suite('Select Project Folder Local Replica', function () {
                 'push',
                 'delete',
             );
+            // Counts the staged entity being renamed BACK, which happens only when
+            // the delete is abandoned. Inode identity is not usable as the proxy
+            // here: a file deleted and immediately recreated in the same directory
+            // routinely gets its inode number recycled.
+            const originalRestoreStaging = internals.restoreRemoteStagingPath.bind(scm);
+            let stagingRestored = 0;
+            internals.restoreRemoteStagingPath = async (...restoreArgs: unknown[]) => {
+                stagingRestored += 1;
+                return originalRestoreStaging(...restoreArgs);
+            };
             await vscode.workspace.fs.delete(recreateUri);
             localWatcher.fireDelete(recreateUri);
             await remoteDeleteStart;
@@ -6828,9 +6838,28 @@ suite('Select Project Folder Local Replica', function () {
             localWatcher.fireCreate(recreateUri);
             releaseRemoteDelete();
 
-            assert.strictEqual((await recreateDeleteWait).outcome, 'success');
-            assert.strictEqual((await recreatedUpdateWait).outcome, 'success');
+            const recreateDeleteEvent = await recreateDeleteWait;
+            const recreatedUpdateEvent = await recreatedUpdateWait;
+            internals.restoreRemoteStagingPath = originalRestoreStaging;
             assert.strictEqual(await readText(recreateRemoteUri), 'newer recreation');
+            // Asserted first, because it is the property the change exists for and
+            // a regression should say so: the Overleaf entity was renamed back into
+            // place, so its id, history, comments and links survived. Without this
+            // the entity is destroyed and the recreation rebuilds a new one.
+            assert.strictEqual(
+                stagingRestored,
+                1,
+                'the Overleaf entity was destroyed instead of being restored',
+            );
+            // Behaviour change, deliberate. The delete assertion used to be
+            // 'success': the entity was destroyed and the recreation later rebuilt
+            // it. The staged delete now re-checks local absence after the entity
+            // has been renamed aside but before it is destroyed, finds the path
+            // back, renames it into place and defers. Nothing was deleted, so
+            // reporting success would be false; the deferral re-drives and the
+            // bytes converge exactly as they did before.
+            assert.strictEqual(recreateDeleteEvent.outcome, 'blocked');
+            assert.strictEqual(recreatedUpdateEvent.outcome, 'success');
             internals.atomicDeleteRemotePathIfRevision = originalAtomicDelete;
 
             const concurrentRecreateUri = vscode.Uri.joinPath(
@@ -6861,11 +6890,16 @@ suite('Select Project Folder Local Replica', function () {
             });
             internals.atomicDeleteRemotePathIfRevision = async (...args: unknown[]) => {
                 concurrentDeleteStarted();
-                await concurrentDeleteGate;
-                const result = await originalAtomicDelete(...args);
+                // The collaborator's remote write is hooked to the delete STARTING
+                // rather than to it returning. Chaining it to completion no longer
+                // establishes the premise at all: the staged delete now abandons
+                // itself when the local path reappears, so a write that waits for
+                // it to finish would never run and the scenario would silently
+                // stop testing a concurrent remote recreation.
                 await writeText(concurrentRecreateRemoteUri, 'collaborator recreation');
                 vfsWatcher.fireCreate(concurrentRecreateRemoteUri);
-                return result;
+                await concurrentDeleteGate;
+                return originalAtomicDelete(...args);
             };
             const concurrentDeleteWait = waitForSyncComplete(
                 localRoot,
@@ -6887,25 +6921,50 @@ suite('Select Project Folder Local Replica', function () {
             localWatcher.fireCreate(concurrentRecreateUri);
             releaseConcurrentDelete();
 
-            assert.strictEqual((await concurrentDeleteWait).outcome, 'success');
+            // Behaviour change, deliberate, and larger than a changed value.
+            //
+            // This used to assert 'success' here and a
+            // 'concurrent untracked local and remote files' conflict below. That
+            // outcome was manufactured by the delete SUCCEEDING: destroying the
+            // remote entity also cleared this path's tracking state, so the local
+            // recreation then met a remote file it had no baseline for and the two
+            // untracked copies collided.
+            //
+            // The delete no longer succeeds. The collaborator wins the race
+            // outright — the remote revision no longer matches the one the delete
+            // was authorized against — so it is refused before anything is staged,
+            // the entity is never destroyed, and the tracking state survives. With
+            // a baseline still in hand the local recreation simply rebases through
+            // the ordinary pull/push path. The old conflict is therefore not
+            // reachable any more, and asserting it would mean contriving a state
+            // the code can no longer produce.
+            //
+            // What this scenario exists to prove is unchanged and still asserted:
+            // a collaborator recreating the file remotely while our delete is in
+            // flight is handled without destroying either side.
+            const concurrentDeleteEvent = await concurrentDeleteWait;
             const concurrentRecreatePush = await concurrentRecreatePushWait;
-            assert.strictEqual(concurrentRecreatePush.outcome, 'blocked');
-            assert.strictEqual(
-                concurrentRecreatePush.error,
-                'concurrent untracked local and remote files',
-            );
             assert.strictEqual(
                 await readText(concurrentRecreateUri),
                 'local recreation',
             );
             assert.strictEqual(
                 await readText(concurrentRecreateRemoteUri),
-                'collaborator recreation',
+                'local recreation',
             );
+            // Note for the reader: this scenario does NOT exercise the staged
+            // delete's final local-absence gate. The collaborator's write lands
+            // before anything is staged, so the pre-existing expected-revision
+            // check refuses the delete first and the outcome is the same with or
+            // without that gate. It is kept because the property it proves — a
+            // collaborator recreating remotely mid-delete destroys neither side —
+            // is independent of it.
+            assert.strictEqual(concurrentDeleteEvent.outcome, 'blocked');
             assert.strictEqual(
-                internals.syncConflicts.has('/concurrent-recreate-during-delete.tex'),
-                true,
+                concurrentDeleteEvent.error,
+                'concurrent remote change before delete',
             );
+            assert.strictEqual(concurrentRecreatePush.outcome, 'success');
             internals.atomicDeleteRemotePathIfRevision = originalAtomicDelete;
 
             const createRaceUri = vscode.Uri.joinPath(localRoot, 'create-race.tex');

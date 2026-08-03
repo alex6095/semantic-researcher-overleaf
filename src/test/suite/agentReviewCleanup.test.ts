@@ -177,16 +177,29 @@ suite('Agent Review removal cleanup', () => {
     });
 
     teardown(async () => {
+        // Restore every global first and unconditionally. Removing the temporary
+        // directories can fail, and if that ran first a failure would leave the
+        // whole extension host patched for every later suite.
         (vscode.window as any).showInformationMessage = originalShowInformationMessage;
         (vscode.window as any).showWarningMessage = originalShowWarningMessage;
         for (const [name, implementation] of originalFsCalls) {
             (fs as any)[name] = implementation;
         }
-        while (tempRoots.length>0) {
-            await fs.rm(tempRoots.pop()!, {recursive: true, force: true});
+        if (originalWorkspaceFoldersDescriptor) {
+            // Without this, a suite that ran `setWorkspaceFoldersForTest` leaves
+            // every later suite pointed at a deleted temporary directory.
+            Object.defineProperty(
+                vscode.workspace,
+                'workspaceFolders',
+                originalWorkspaceFoldersDescriptor,
+            );
         }
         originalFsCalls.clear();
         injectionProbes.length = 0;
+
+        while (tempRoots.length>0) {
+            await fs.rm(tempRoots.pop()!, {recursive: true, force: true}).catch(() => undefined);
+        }
     });
 
     function realFs<T>(name: string): T {
@@ -784,6 +797,54 @@ suite('Agent Review removal cleanup', () => {
                 'the watcher lost a change that arrived while it was already checking',
             );
             assert.ok(interleaved, 'the interleaving never happened, so this test proves nothing');
+        } finally {
+            guard.dispose();
+        }
+    });
+
+    test('keeps retrying, and tells the user, when it cannot disable a resurrected helper', async function () {
+        this.timeout(60000);
+        const workspaceRoot = await tempDir('sr-overleaf-agent-review-failopen-');
+        const globalStoragePath = path.join(await tempDir('sr-overleaf-agent-review-storage-'), 'globalStorage');
+        const metaRoot = path.join(globalStoragePath, 'agent-review');
+        await installAgentReviewStorage(metaRoot, workspaceRoot, {withWork: false});
+        const helperPath = path.join(metaRoot, 'bin', 'overleaf-agent-review');
+        const binRoot = path.join(metaRoot, 'bin');
+        const {context} = createContextStub(globalStoragePath);
+        await cleanupRemovedAgentReview(context, [vscode.Uri.file(workspaceRoot)]);
+        assert.strictEqual(warnings.length, 0, 'the fixture already warned, so this proves nothing');
+
+        const guard = watchAgentReviewHelper(context);
+        try {
+            await guard.armed;
+            // The directory refuses new files, so staging the replacement fails
+            // before it creates anything — and therefore without producing another
+            // watch event for the retry to ride on.
+            await failWritesUnder(binRoot);
+            await writeFile(helperPath, ORIGINAL_HELPER);
+
+            await waitUntil(
+                async () => warnings.length>0,
+                15000,
+                'a helper that could not be disabled was never surfaced to the user',
+            );
+            assert.ok(warnings[0].includes(metaRoot), `the warning does not name the helper: ${warnings[0]}`);
+            assert.ok(warnings[0].includes('could not be disabled yet'));
+            assert.strictEqual(await readFile(helperPath), ORIGINAL_HELPER);
+
+            // Nothing further happens inside the watched directory, so only the
+            // check's own scheduled retry can rescue this.
+            (fs as any).writeFile = realFs('writeFile');
+            await waitUntil(
+                async () => (await readFile(helperPath)).includes(HELPER_STUB_MARKER),
+                30000,
+                'the watcher never retried after a replacement failed',
+            );
+            const status = runHelper(helperPath, 'unused-draft-id');
+            if (status!==undefined) {
+                assert.notStrictEqual(status, 0, 'the recovered helper still accepts submissions');
+            }
+            assert.strictEqual(warnings.length, 1, 'the retry warned the user again');
         } finally {
             guard.dispose();
         }

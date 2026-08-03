@@ -68,10 +68,18 @@ const MAX_HELPER_BYTES = 64 * 1024;
 // Coalesces the burst a single replacement produces (staged write, chmod,
 // rename) into one reaction.
 const HELPER_WATCH_DEBOUNCE_MS = 250;
-// After an attempted replacement, ignore events for this long. A replacement
-// that keeps failing also produces events, and without this those events would
+// After an attempted replacement, hold off for this long. A replacement that
+// keeps failing also produces events, and without this those events would
 // re-trigger the attempt that produced them.
 const HELPER_WATCH_COOLDOWN_MS = 5000;
+// While the helper cannot be made ours, re-try on a backoff. A failed
+// replacement can fail *before* touching the directory — a staging write into a
+// bin/ that refuses new files never lands — so there is no event to retry on and
+// the check has to schedule its own. The rate is bounded, the number of attempts
+// deliberately is not: giving up would leave an accepting helper live for the
+// rest of the session, which is the failure this whole migration exists to stop.
+const HELPER_RETRY_BASE_MS = 5000;
+const HELPER_RETRY_MAX_MS = 5*60*1000;
 
 // Name for the staged replacement helper. The `.sr-overleaf-*` prefix is in
 // `PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS`, so a transient staging file can
@@ -503,6 +511,11 @@ export function watchAgentReviewHelper(context: vscode.ExtensionContext): AgentR
     let running = false;
     // Something changed that no check has looked at yet.
     let pending = false;
+    // Consecutive checks that could not leave the helper ours; drives the retry
+    // backoff and is reset the moment one succeeds.
+    let failures = 0;
+
+    const retryDelay = () => Math.min(HELPER_RETRY_BASE_MS*(2**(failures-1)), HELPER_RETRY_MAX_MS);
 
     const stop = () => {
         if (timer) {
@@ -528,6 +541,7 @@ export function watchAgentReviewHelper(context: vscode.ExtensionContext): AgentR
             timer = undefined;
             void react(metaRoot);
         }, delayMs);
+        timer.unref?.();
     };
 
     /**
@@ -561,21 +575,40 @@ export function watchAgentReviewHelper(context: vscode.ExtensionContext): AgentR
         running = true;
         pending = false;
         try {
-            const {attempted} = await ensureHelperNeutralized(metaRoot);
+            const {complete, attempted} = await ensureHelperNeutralized(metaRoot);
             if (attempted) {
                 // Our own staged write, chmod and rename are about to fire this
                 // very watcher. Holding off briefly keeps a replacement — including
                 // one that fails and retries — from feeding itself.
                 cooldownUntil = Date.now()+HELPER_WATCH_COOLDOWN_MS;
             }
+            if (complete) {
+                failures = 0;
+            } else {
+                // "We could not do it" must not become silence. A live helper is
+                // the one state in which the leftover instruction blocks are not
+                // inert, so it is the one worth interrupting the user for. The
+                // shared record keeps that to once per location.
+                failures += 1;
+                await report(context, {
+                    staleInstructionFiles: [],
+                    preservedWorkLocations: [],
+                    liveHelperLocations: [metaRoot],
+                });
+            }
         } catch (error) {
             console.warn('Agent Review helper watch could not re-check the helper:', error);
         } finally {
             running = false;
-            if (pending && !disposed) {
-                // Something changed while that check was running. Run again, after
-                // the cooldown if one is now in force.
-                scheduleIn(metaRoot, Math.max(HELPER_WATCH_DEBOUNCE_MS, cooldownUntil-Date.now()));
+            if (!disposed) {
+                const cooldownRemaining = cooldownUntil-Date.now();
+                if (failures>0) {
+                    // Nothing else will wake us: schedule our own retry.
+                    scheduleIn(metaRoot, Math.max(retryDelay(), cooldownRemaining));
+                } else if (pending) {
+                    // Something changed while that check was running.
+                    scheduleIn(metaRoot, Math.max(HELPER_WATCH_DEBOUNCE_MS, cooldownRemaining));
+                }
             }
         }
     };
