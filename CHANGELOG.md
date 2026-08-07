@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.16.0] - 2026-08-02
+## [0.16.0] - 2026-08-06
 
 First release published to the VS Marketplace since 0.15.28 (Remote Pack
 0.15.11). Versions 0.15.31 through 0.15.34 shipped only as GitHub Releases,
@@ -15,6 +15,7 @@ deliberately omitted; users upgrading from a v0.15.31-v0.15.34 GitHub Release
 can find the interim details in the entries below.
 
 ### Added
+- Add a persistent, project-scoped last-rendered PDF cache on the workspace extension host. A restored `output.pdf` tab can show the previous rendered build while its new extension host reconnects; cache promotion requires a matching PDF.js render acknowledgement, uses atomic writes, and is bounded by age, entry count, and total size.
 - Add a durable Local Replica sync manifest and guarded three-way merging so offline and concurrent local/Overleaf edits are reconciled without silently discarding either copy. States that cannot be proven safe become conflicts.
 - Add per-folder Local Replica ownership fencing so two VS Code extension hosts cannot watch and submit changes for the same folder, plus an explicitly confirmed `Repair Local Replica Ownership Marker` command that can reclaim a marker whose owner is provably gone.
 - Add a selected-folder-only recursive watcher for Remote SSH hosts, and a watcher-health monitor that falls back to exact-content scanning when event delivery is lost and reports paths it cannot scan.
@@ -27,6 +28,8 @@ can find the interim details in the entries below.
 - Log the compile lifecycle to the `Semantic Researcher Overleaf` output channel so a failed compile can be diagnosed after the fact.
 
 ### Changed
+- Open the project UI immediately while Local Replica startup reconciliation continues in the background. Compile requests made during that handoff now wait at the precompile barrier for buffered watcher replay and initial document subscriptions, instead of failing just before startup becomes ready.
+- Download the initial text snapshot over at most eight concurrent HTTP/2 streams and reconcile unchanged project files concurrently, while preserving request order, ordered watcher replay, and guarded per-path publication. A real stream reset or GOAWAY aborts sibling work promptly and falls back to the authenticated HTTP/1 path.
 - Make <kbd>Ctrl</kbd>+<kbd>S</kbd> on a supported source file sync the saved disk bytes and then compile. Manual Compile and PDF Recompile keep using saved state and never transmit unsaved editor buffers.
 - Run the main extension on the workspace extension host and the Remote Pack on the local UI host, so Local Replica state is isolated correctly in Remote SSH windows.
 - Port upstream `v0.15.10` selectively, without adopting its save-only synchronization: closed files edited by shells or coding agents stay watcher-driven. Authentication, connection compatibility, and dependency updates were adopted or adapted.
@@ -34,6 +37,14 @@ can find the interim details in the entries below.
 - Verify at package time that the PDF viewer and LaTeX language vendor trees are present, that every staged runtime module resolves inside the packaged runtime, and that every authenticated-handshake hunk of the Socket.IO patch survives.
 
 ### Fixed
+- Restore `output.pdf` after a VS Code window reload. Compile-output entities and CDN routing are still session-owned, but a missing live output now falls back only to a previously rendered cache; authentication, permission, and network failures remain visible. A cache miss triggers one project-scoped recovery compile without saving or transmitting unsaved editor buffers.
+- Refresh a server-generated PDF even when `output.log` contains LaTeX errors, while retaining the red `Compile Failed` verdict. Previously a successful PDF artifact stayed undiscoverable because diagnostic failure returned before PDF refresh.
+- Publish compile output files, build ID, compile group, and CDN routing as one validated snapshot, so a malformed compile response cannot attach an older PDF to newer routing metadata and turn it into a 404.
+- Treat files that advance while an agent, shell, or local compiler is writing them as deferred work. Stable descriptor/content snapshots are retried and coalesced without surfacing ordinary mid-write races as sync failures; a compile remains fail-closed if a coherent saved snapshot cannot be obtained.
+- Seal the entire saved local project tree before compiling, not only the paths changed by the first source scan. A clean tracked file edit, new path, or deletion that lands after that scan now re-queues synchronization and blocks the stale remote compile.
+- Keep HTTP bootstrap documents non-authoritative until their Socket.IO `joinDoc` subscription is verified. A collaborator revision in the snapshot-to-subscription gap is pulled and merged, overlapping local/remote revisions remain preserved as a conflict, and a failed join keeps compilation blocked until recovery.
+- Preserve a prompt local recreation that races an Overleaf deletion long enough to classify it, while allowing an ordinary agent/local deletion to propagate to Overleaf without inventing a conflict.
+- Key Local Replica ownership and lifecycle state by stable server, user, and project identity rather than a renameable display path, retaining compatibility with existing mappings while preventing same-name projects from sharing state.
 - Preserve the three-way merge baseline across a reconnect. A rejoin previously reset the baseline to the current remote text, so the next save deleted every collaborator edit made during the outage.
 - Reject a cached realtime project record belonging to a superseded or dead socket, and treat a disconnected socket as needing re-initialization, instead of reporting a live connection while serving pre-outage content.
 - Notify the connection state machine before stripping socket listeners, so a mid-session protocol fallback reconnects instead of leaving the project permanently unable to save.
@@ -63,7 +74,7 @@ can find the interim details in the entries below.
 - Retain a Local Replica mapping another window owns during startup cleanup, and never let that cleanup prevent the selected replica from being created.
 
 ### Verified
-- Pass all 340 extension-host tests on VS Code 1.130.0, including 45 regression tests added for the fixes above.
+- Pass all 430 extension-host tests on VS Code 1.130.0, including render-confirmed PDF persistence, reload recovery, whole-tree compile fencing, HTTP snapshot-to-subscription races, real HTTP/2 stream/reset/GOAWAY behavior, registered Select Folder rollback, continuous writer stabilization, remote-delete races, compile ordering, and account/project isolation.
 - `npm run lint`, `npm audit --omit=dev`, and `npm --prefix remote-pack audit --omit=dev` report no errors, warnings, or vulnerabilities.
 - Reload a signed-in Remote SSH window on the packaged build and round-trip a closed `.tex` and a PNG through Overleaf in both directions, including deletion, with no connection or provider failures.
 

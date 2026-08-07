@@ -1819,6 +1819,108 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(unrelatedDocument.isDirty, true);
     });
 
+    test('bootstraps text documents in parallel and waits for socket verification before compile', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-http-bootstrap-remote-');
+        const localRoot = await tempDir('sr-overleaf-http-bootstrap-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const remoteChapter = vscode.Uri.joinPath(remoteRoot, 'chapter.tex');
+        await writeText(remoteMain, 'main snapshot');
+        await writeText(remoteChapter, 'chapter snapshot');
+
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot) as FakeVirtualFileSystem & {
+            downloadDocumentSnapshot(uri: vscode.Uri): Promise<Uint8Array>;
+        };
+        let activeSnapshots = 0;
+        let maximumActiveSnapshots = 0;
+        fakeVfs.downloadDocumentSnapshot = async uri => {
+            activeSnapshots += 1;
+            maximumActiveSnapshots = Math.max(maximumActiveSnapshots, activeSnapshots);
+            try {
+                await new Promise(resolve => setTimeout(resolve, 25));
+                return await vscode.workspace.fs.readFile(uri);
+            } finally {
+                activeSnapshots -= 1;
+            }
+        };
+
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        assert.ok(maximumActiveSnapshots>=2, 'document snapshots were fetched sequentially');
+        assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, 'main.tex')), 'main snapshot');
+        assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, 'chapter.tex')), 'chapter snapshot');
+        assert.deepStrictEqual(
+            [...(scm as any).pendingInitialDocumentSubscriptions].sort(),
+            ['/chapter.tex', '/main.tex'],
+        );
+        let flushSettled = false;
+        const pendingFlush = scm.flushBeforeCompile([]).finally(() => {
+            flushSettled = true;
+        });
+        await new Promise(resolve => setTimeout(resolve, 75));
+        assert.strictEqual(flushSettled, false);
+        await (scm as any).verifyInitialDocumentSubscriptions();
+        assert.strictEqual((scm as any).pendingInitialDocumentSubscriptions.size, 0);
+        const result = await pendingFlush;
+        assert.strictEqual(result.blockedCount, 0);
+        assert.strictEqual(result.failedCount, 0);
+
+        const internals = scm as any;
+        internals.precompileStartupReadinessWaitMs = 20;
+        internals.pendingInitialDocumentSubscriptions.add('/main.tex');
+        await assert.rejects(
+            scm.flushBeforeCompile([]),
+            /initial Overleaf document subscription is still being verified/i,
+        );
+        internals.pendingInitialDocumentSubscriptions.clear();
+    });
+
+    test('uses one document snapshot batch for initial text bootstrap', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-http-batch-remote-');
+        const localRoot = await tempDir('sr-overleaf-http-batch-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'main batch snapshot');
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'chapter.tex'), 'chapter batch snapshot');
+
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot) as FakeVirtualFileSystem & {
+            downloadDocumentSnapshots(uris: vscode.Uri[]): Promise<Map<string, Uint8Array>>;
+            downloadDocumentSnapshot(uri: vscode.Uri): Promise<Uint8Array>;
+        };
+        let batchCount = 0;
+        fakeVfs.downloadDocumentSnapshots = async uris => {
+            batchCount += 1;
+            return new Map(await Promise.all(uris
+                .filter(uri => uri.path.endsWith('.tex'))
+                .map(async uri => [
+                    uri.toString(),
+                    await vscode.workspace.fs.readFile(uri),
+                ] as const)));
+        };
+        fakeVfs.downloadDocumentSnapshot = async () => {
+            throw new Error('per-document bootstrap should not run after a complete batch');
+        };
+
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        assert.strictEqual(batchCount, 1);
+        assert.strictEqual(
+            await readText(vscode.Uri.joinPath(localRoot, 'main.tex')),
+            'main batch snapshot',
+        );
+        assert.strictEqual(
+            await readText(vscode.Uri.joinPath(localRoot, 'chapter.tex')),
+            'chapter batch snapshot',
+        );
+        assert.deepStrictEqual(
+            [...(scm as any).pendingInitialDocumentSubscriptions].sort(),
+            ['/chapter.tex', '/main.tex'],
+        );
+    });
+
     test('detects closed local source edits before compile without watcher events', async () => {
         const remoteRoot = await tempDir('sr-overleaf-closed-source-remote-');
         const localRoot = await tempDir('sr-overleaf-closed-source-local-');
@@ -1867,7 +1969,10 @@ suite('Select Project Folder Local Replica', function () {
             return content;
         };
         try {
-            await scm.flushBeforeCompile([localMain]);
+            await assert.rejects(
+                scm.flushBeforeCompile([localMain]),
+                /precompile flush failed:.*local file is still being written/i,
+            );
 
             const manifest = (scm as any).syncManifest as {
                 files: Record<string, unknown>;
@@ -2622,7 +2727,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((scm as any).syncConflicts.has('/sample.tex'), true);
     });
 
-    test('allows an intentional same-content restore after a remote delete', async () => {
+    test('allows an intentional same-content restore after the remote-delete conflict window', async () => {
         const remoteRoot = await tempDir('sr-overleaf-remote-');
         const localRoot = await tempDir('sr-overleaf-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -2643,6 +2748,12 @@ suite('Select Project Folder Local Replica', function () {
         await writeText(localSample, 'remote baseline');
         const restoredMtime = new Date(Date.now() + 60_000);
         await fs.utimes(localSample.fsPath, restoredMtime, restoredMtime);
+        const tombstone = (scm as any).remoteDeleteTombstones.get('/sample.tex') as {
+            deletedAt: number;
+        };
+        tombstone.deletedAt = Date.now()
+            -(scm.constructor as any).remoteDeleteConflictWindowMs
+            -1;
         await applySync('push', 'update', '/sample.tex', localSample, remoteSample);
 
         assert.strictEqual(await readText(localSample), 'remote baseline');
@@ -9686,7 +9797,7 @@ suite('Select Project Folder Local Replica', function () {
         );
     });
 
-    test('finishes buffered Overleaf changes before startup watchers report ready', async () => {
+    test('reports startup watchers ready while guarded buffered replay continues', async () => {
         const remoteRoot = await tempDir('sr-overleaf-buffered-remote-ready-');
         const remoteEventRoot = await tempDir('sr-overleaf-buffered-remote-event-');
         const localRoot = await tempDir('sr-overleaf-buffered-local-ready-');
@@ -9707,7 +9818,23 @@ suite('Select Project Folder Local Replica', function () {
             return watcher;
         };
 
+        let signalReplayStarted!: () => void;
+        let releaseReplay!: () => void;
+        const replayStarted = new Promise<void>(resolve => {
+            signalReplayStarted = resolve;
+        });
+        const replayGate = new Promise<void>(resolve => {
+            releaseReplay = resolve;
+        });
+
         const scm = createSCM(remoteRoot, localRoot);
+        const internals = scm as any;
+        const originalReplay = internals.replayBufferedVfsEvents.bind(scm);
+        internals.replayBufferedVfsEvents = async (...args: unknown[]) => {
+            signalReplayStarted();
+            await replayGate;
+            return originalReplay(...args);
+        };
         const originalInitialize = scm.initializeLocalReplica.bind(scm);
         (scm as any).initializeLocalReplica = async (...args: unknown[]) => {
             const initialized = await (originalInitialize as any)(...args);
@@ -9716,13 +9843,71 @@ suite('Select Project Folder Local Replica', function () {
             return initialized;
         };
 
-        const triggers = await scm.triggers;
+        const triggersPromise = scm.triggers;
+        await replayStarted;
+        const triggers = await Promise.race([
+            triggersPromise,
+            new Promise<never>((_, reject) => setTimeout(
+                () => reject(new Error('watcher readiness waited for buffered replay')),
+                500,
+            )),
+        ]);
         try {
+            assert.strictEqual(internals.startupReplayGeneration, internals.syncGeneration);
+            assert.strictEqual(await pathExists(localEventUri), false);
+            // The project UI is already usable, but a compile requested in this
+            // brief handoff window waits for the accepted watcher events rather
+            // than failing immediately. Subscription verification is tested
+            // separately below, so isolate this assertion to replay ordering.
+            internals.pendingInitialDocumentSubscriptions.clear();
+            let flushSettled = false;
+            const startupFlush = internals.waitForStartupReadinessBeforeCompile(
+                internals.syncGeneration,
+            ).finally(() => {
+                flushSettled = true;
+            });
+            await new Promise(resolve => setTimeout(resolve, 75));
+            assert.strictEqual(flushSettled, false);
+            releaseReplay();
+            await startupFlush;
+            await waitUntil(() => internals.startupReplayPromise===undefined, 5_000);
             assert.strictEqual(
                 await readText(localEventUri),
                 'collaborator edit while startup was finishing',
             );
+            assert.strictEqual(internals.startupReplayGeneration, undefined);
+            assert.strictEqual(internals.startupReplayFailure, undefined);
+
+            internals.pendingInitialDocumentSubscriptions.add('/main.tex');
+            const subscriptionFlush = internals.waitForStartupReadinessBeforeCompile(
+                internals.syncGeneration,
+            );
+            await new Promise(resolve => setTimeout(resolve, 75));
+            internals.pendingInitialDocumentSubscriptions.clear();
+            await subscriptionFlush;
+
+            internals.precompileStartupReadinessWaitMs = 20;
+            internals.pendingInitialDocumentSubscriptions.add('/main.tex');
+            await internals.waitForStartupReadinessBeforeCompile(
+                internals.syncGeneration,
+            );
+            assert.strictEqual(
+                internals.pendingInitialDocumentSubscriptions.has('/main.tex'),
+                true,
+            );
+            internals.pendingInitialDocumentSubscriptions.clear();
+
+            internals.startupReplayFailure = {
+                generation: internals.syncGeneration,
+                message: 'simulated retained startup replay failure',
+            };
+            await assert.rejects(
+                () => scm.flushBeforeCompile([]),
+                /startup watcher change reconciliation failed.*simulated retained startup replay failure/,
+            );
+            internals.startupReplayFailure = undefined;
         } finally {
+            releaseReplay();
             triggers.forEach(trigger => trigger.dispose());
         }
     });

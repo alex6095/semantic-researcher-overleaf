@@ -406,4 +406,34 @@ suite('Compile save UX', () => {
             manager.status.dispose();
         }
     });
+
+    test('refreshes a generated PDF while retaining the LaTeX failure verdict', async () => {
+        const origin = vscode.Uri.parse(
+            'semantic-researcher-overleaf://www.overleaf.com/Compile%20UX?user=user-1&project=project-1',
+        );
+        const statuses: string[] = [];
+        let refreshCount = 0;
+        const manager = new CompileManager({
+            prefetch: async () => ({}),
+        } as unknown as RemoteFileSystemProvider);
+        const internals = manager as any;
+        internals.activeCompileId = 7;
+        internals.runCompileErrorCheck = async () => true;
+        internals.refreshPdfViews = async () => {
+            refreshCount += 1;
+            return undefined;
+        };
+        internals.update = async (status: string) => {
+            statuses.push(status);
+            return origin;
+        };
+
+        try {
+            await internals.publishCompileResult(origin, 7, false);
+            assert.strictEqual(refreshCount, 1);
+            assert.deepStrictEqual(statuses, ['failed']);
+        } finally {
+            manager.status.dispose();
+        }
+    });
 });

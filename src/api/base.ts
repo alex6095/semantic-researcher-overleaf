@@ -1,5 +1,6 @@
 /* eslint-disable @typescript-eslint/naming-convention */
 import * as http from 'http';
+import * as http2 from 'http2';
 import * as https from 'https';
 import * as stream from 'stream';
 import FormData = require('form-data');
@@ -15,6 +16,10 @@ const REQUEST_TIMEOUT_MS = 30_000;
 // Compiles and file downloads are legitimately slow, but must still be capped.
 const COMPILE_TIMEOUT_MS = 180_000;
 const DOWNLOAD_TIMEOUT_MS = 180_000;
+// A project with hundreds of documents must not turn bootstrap into hundreds
+// of simultaneous h2 streams. This is deliberately below the usual peer
+// MAX_CONCURRENT_STREAMS limit, leaving capacity for ordinary project traffic.
+const HTTP2_DOCUMENT_SNAPSHOT_CONCURRENCY = 8;
 
 export class SessionExpiredError extends Error {
     constructor(readonly serverUrl: string, readonly status: number) {
@@ -273,6 +278,7 @@ export class BaseAPI {
     private agent: http.Agent | https.Agent;
     private identity?: Identity;
     private sessionExpiryHandler?: (error: SessionExpiredError) => void;
+    private _documentSnapshotTransport: 'h2' | 'http1' = 'http1';
     // A server that answers 206 deterministically would otherwise loop forever,
     // appending the same body until the extension host runs out of memory.
     private static readonly maxDownloadRequests = 64;
@@ -293,6 +299,10 @@ export class BaseAPI {
     setSessionExpiryHandler(handler?: (error: SessionExpiredError) => void) {
         this.sessionExpiryHandler = handler;
         return this;
+    }
+
+    get documentSnapshotTransport(): 'h2' | 'http1' {
+        return this._documentSnapshotTransport;
     }
 
     private detectSessionExpiry(status: number, location: string|null|undefined, body: string): SessionExpiredError|undefined {
@@ -783,6 +793,232 @@ export class BaseAPI {
             type: 'success',
             content: new Uint8Array( content )
         };
+    }
+
+    async getDocumentSnapshot(identity:Identity, projectId:string, docId:string) {
+        this.setIdentity(identity);
+        // This public read endpoint asks document-updater for version -1 (the
+        // latest coherent document) and returns plain text. Unlike joinDoc it
+        // does not mutate the socket's single join/leave epoch, so independent
+        // documents can be read concurrently during Local Replica bootstrap.
+        const content = await this.download(`project/${projectId}/doc/${docId}/download`);
+        return {
+            type: 'success',
+            content: new Uint8Array(content),
+        };
+    }
+
+    private async getDocumentSnapshotsHttp2(
+        identity: Identity,
+        projectId: string,
+        docIds: string[],
+    ): Promise<Map<string, Uint8Array>> {
+        const baseUrl = new URL(this.url);
+        if (baseUrl.protocol!=='https:' && baseUrl.protocol!=='http:') {
+            throw new Error(`HTTP/2 document bootstrap requires HTTP(S), got ${baseUrl.protocol}`);
+        }
+        const client = http2.connect(baseUrl.origin);
+        const activeDownloadFailures = new Set<(error: Error) => void>();
+        let sessionFailure: Error | undefined;
+        let closingSession = false;
+        const abortSession = (error: Error) => {
+            if (sessionFailure===undefined) { sessionFailure = error; }
+            for (const fail of [...activeDownloadFailures]) {
+                fail(sessionFailure);
+            }
+            if (!client.destroyed) { client.destroy(); }
+        };
+        // ClientHttp2Session emits independently of individual stream errors;
+        // retain a listener for the session lifetime so a late GOAWAY/reset is
+        // observed by the streams instead of becoming an uncaught EventEmitter
+        // error in the extension host.
+        client.on('error', () => undefined);
+        client.on('goaway', (errorCode, lastStreamId) => {
+            abortSession(new Error(
+                `Overleaf HTTP/2 session received GOAWAY `
+                + `(code=${errorCode}, lastStreamId=${lastStreamId})`,
+            ));
+        });
+        client.on('close', () => {
+            if (!closingSession && activeDownloadFailures.size>0) {
+                abortSession(new Error('Overleaf HTTP/2 session closed during document bootstrap'));
+            }
+        });
+        try {
+            await new Promise<void>((resolve, reject) => {
+                const timer = setTimeout(() => {
+                    reject(new Error(`Overleaf HTTP/2 connection timed out: ${baseUrl.origin}`));
+                    client.destroy();
+                }, REQUEST_TIMEOUT_MS);
+                const finish = (callback: () => void) => {
+                    clearTimeout(timer);
+                    client.off('error', onError);
+                    callback();
+                };
+                const onError = (error: Error) => finish(() => reject(error));
+                client.once('error', onError);
+                client.once('connect', () => finish(resolve));
+            });
+
+            const download = (docId: string) =>
+                new Promise<[string, Uint8Array]>((resolve, reject) => {
+                    if (sessionFailure) {
+                        reject(sessionFailure);
+                        return;
+                    }
+                    const route = `project/${encodeURIComponent(projectId)}/doc/${encodeURIComponent(docId)}/download`;
+                    const requestUrl = new URL(route, this.url);
+                    let request: http2.ClientHttp2Stream;
+                    try {
+                        request = client.request({
+                            ':method': 'GET',
+                            ':path': `${requestUrl.pathname}${requestUrl.search}`,
+                            'cookie': identity.cookies,
+                        });
+                    } catch (error) {
+                        reject(error);
+                        return;
+                    }
+                    const chunks: Buffer[] = [];
+                    let status = 0;
+                    let location: string | undefined;
+                    let settled = false;
+                    let ended = false;
+                    const fail = (error: Error) => {
+                        if (settled) { return; }
+                        settled = true;
+                        activeDownloadFailures.delete(fail);
+                        reject(error);
+                    };
+                    const finish = () => {
+                        if (settled) { return; }
+                        const content = Buffer.concat(chunks);
+                        const expiry = this.detectSessionExpiry(
+                            status,
+                            location,
+                            content.subarray(0, 8192).toString('utf8'),
+                        );
+                        if (expiry) {
+                            this.sessionExpiryHandler?.(expiry);
+                            fail(expiry);
+                            return;
+                        }
+                        if (status<200 || status>=300) {
+                            fail(new Error(
+                                `Overleaf document download failed (${status}): ${requestUrl.pathname}`,
+                            ));
+                            return;
+                        }
+                        settled = true;
+                        activeDownloadFailures.delete(fail);
+                        resolve([docId, new Uint8Array(content)]);
+                    };
+                    activeDownloadFailures.add(fail);
+                    if (sessionFailure) {
+                        request.close(http2.constants.NGHTTP2_CANCEL);
+                        fail(sessionFailure);
+                        return;
+                    }
+                    request.setTimeout(DOWNLOAD_TIMEOUT_MS, () => {
+                        request.close(http2.constants.NGHTTP2_CANCEL);
+                        fail(new Error(`Overleaf HTTP/2 document download timed out: ${requestUrl.pathname}`));
+                    });
+                    request.on('response', headers => {
+                        status = Number(headers[':status'] ?? 0);
+                        const headerLocation = headers.location;
+                        location = Array.isArray(headerLocation) ? headerLocation[0] : headerLocation;
+                    });
+                    request.on('data', chunk => chunks.push(Buffer.from(chunk)));
+                    request.once('error', fail);
+                    request.once('end', () => {
+                        // A reset stream can emit `end` before `close` exposes
+                        // its RST code. Defer success until close so a partial
+                        // body is never accepted as a coherent document.
+                        ended = true;
+                    });
+                    request.once('close', () => {
+                        if (settled) { return; }
+                        if (request.rstCode!==http2.constants.NGHTTP2_NO_ERROR) {
+                            fail(new Error(
+                                `Overleaf HTTP/2 document stream reset (${request.rstCode}): `
+                                + requestUrl.pathname,
+                            ));
+                        } else if (!ended) {
+                            fail(new Error(`Overleaf HTTP/2 document stream closed: ${requestUrl.pathname}`));
+                        } else {
+                            finish();
+                        }
+                    });
+                    request.end();
+                });
+
+            // Do not create every stream at once. Besides respecting remote
+            // stream limits, this lets a GOAWAY or reset stop the remaining
+            // queue promptly and fall back through getDocumentSnapshots().
+            const downloads: Array<[string, Uint8Array]|undefined> = new Array(docIds.length);
+            let nextIndex = 0;
+            let aborted = false;
+            let firstError: unknown;
+            const workers = Array.from(
+                {length: Math.min(HTTP2_DOCUMENT_SNAPSHOT_CONCURRENCY, docIds.length)},
+                async () => {
+                    while (!aborted) {
+                        const index = nextIndex++;
+                        if (index>=docIds.length) { return; }
+                        try {
+                            downloads[index] = await download(docIds[index]);
+                        } catch (error) {
+                            if (!aborted) {
+                                aborted = true;
+                                firstError = error;
+                                // Abort sibling streams so they cannot hold up
+                                // fallback behind a long per-file timeout.
+                                abortSession(error instanceof Error
+                                    ? error
+                                    : new Error(String(error)));
+                            }
+                            return;
+                        }
+                    }
+                },
+            );
+            await Promise.all(workers);
+            if (aborted) {
+                throw firstError;
+            }
+            return new Map(downloads as Array<[string, Uint8Array]>);
+        } finally {
+            closingSession = true;
+            if (!client.destroyed) {
+                client.close();
+            }
+        }
+    }
+
+    async getDocumentSnapshots(
+        identity: Identity,
+        projectId: string,
+        docIds: string[],
+    ): Promise<Map<string, Uint8Array>> {
+        this.setIdentity(identity);
+        const uniqueDocIds = [...new Set(docIds)];
+        if (uniqueDocIds.length===0) { return new Map(); }
+        try {
+            const snapshots = await this.getDocumentSnapshotsHttp2(identity, projectId, uniqueDocIds);
+            this._documentSnapshotTransport = 'h2';
+            return snapshots;
+        } catch (error) {
+            if (error instanceof SessionExpiredError) { throw error; }
+            // Community/self-hosted deployments and some corporate proxies do
+            // not negotiate h2. Preserve the proven authenticated HTTP/1.1 path
+            // rather than making Local Replica availability depend on ALPN.
+            const snapshots = await Promise.all(uniqueDocIds.map(async docId => {
+                const response = await this.getDocumentSnapshot(identity, projectId, docId);
+                return [docId, response.content!] as const;
+            }));
+            this._documentSnapshotTransport = 'http1';
+            return new Map(snapshots);
+        }
     }
 
     async addDoc(identity:Identity, projectId:string, parentFolderId:string, filename:string) {

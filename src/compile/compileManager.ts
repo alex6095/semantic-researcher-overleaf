@@ -493,10 +493,27 @@ export class CompileManager {
         // Problems panel showing the previous build's diagnostics.
         const hasError = await this.runCompileErrorCheck(uri);
         if (!this.ownsCompile(compileId)) { return; }
-        if (serverRejected || hasError) {
+        if (serverRejected) {
             getOutputChannel().appendLine(
                 `${new Date().toISOString()} [compile result] failed: ` +
-                `${serverRejected ? 'server rejected the compile request' : 'LaTeX errors in output.log'}`,
+                'server rejected the compile request',
+            );
+            await this.update('failed', uri);
+            return;
+        }
+        // A server-accepted compile can produce a useful PDF while output.log
+        // still contains LaTeX errors. Refresh that artifact just like Overleaf
+        // does, but keep the compile verdict red. Previously the early error
+        // return left a newly created .output/output.pdf undiscoverable and the
+        // restored viewer permanently blank.
+        const refreshError = await this.refreshPdfViews(uri);
+        if (!this.ownsCompile(compileId)) { return; }
+        if (hasError) {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [compile result] failed: LaTeX errors in output.log` +
+                (refreshError===undefined
+                    ? '; generated PDF preview refreshed'
+                    : `; generated PDF preview unavailable: ${refreshError}`),
             );
             await this.update('failed', uri);
             return;
@@ -504,8 +521,6 @@ export class CompileManager {
         // Refresh the PDF *before* the success badge, and let a refresh failure
         // veto it: a green badge over a viewer still showing the previous build
         // is exactly the "stale PDF read as current" defect.
-        const refreshError = await this.refreshPdfViews(uri);
-        if (!this.ownsCompile(compileId)) { return; }
         if (refreshError!==undefined) {
             getOutputChannel().appendLine(
                 `${new Date().toISOString()} [compile result] compiled, but the PDF could not be loaded: ${refreshError}`,

@@ -405,10 +405,28 @@ suite('Connection audit fixes', () => {
         internals.root = makeProject([{_id: 'doc-1', name: 'main.tex'}]);
         internals.resolve = async () => undefined;
         internals.notify = () => undefined;
+        internals.outputBuildId = 'old-build';
+        internals.compileGroup = 'old-group';
+        internals.clsiServerId = 'old-clsi';
+        internals.pdfDownloadDomain = 'old-pdf.example.test';
+        const previousOutputs = [{
+            _id: 'output',
+            name: 'output.pdf',
+            path: 'output.pdf',
+            url: '/project/project-1/build/old-build/output/output.pdf',
+            readonly: true,
+        }];
+        internals.lastOutputs = previousOutputs;
         internals.api = {
             compile: async () => ({
                 type: 'success',
-                compile: {status: 'success', compileGroup: 'standard', outputFiles: []},
+                compile: {
+                    status: 'success',
+                    compileGroup: 'new-group',
+                    clsiServerId: 'new-clsi',
+                    pdfDownloadDomain: 'new-pdf.example.test',
+                    outputFiles: [],
+                },
             }),
         };
 
@@ -417,6 +435,11 @@ suite('Connection audit fixes', () => {
             assert.strictEqual(internals.isDirty, true, 'an unusable compile result must not clear the dirty flag');
             assert.strictEqual(errors.length, 1);
             assert.match(errors[0], /without any output files/);
+            assert.strictEqual(internals.outputBuildId, 'old-build');
+            assert.strictEqual(internals.compileGroup, 'old-group');
+            assert.strictEqual(internals.clsiServerId, 'old-clsi');
+            assert.strictEqual(internals.pdfDownloadDomain, 'old-pdf.example.test');
+            assert.strictEqual(internals.lastOutputs, previousOutputs);
 
             // A throwing compile request must not lose the flag either.
             internals.api.compile = async () => { throw new Error('compile transport failed'); };

@@ -27,6 +27,11 @@ type BrowserLoginResponse = {
     cookies: string;
 };
 
+type CommandExecutor = <T = unknown>(
+    command: string,
+    ...rest: unknown[]
+) => Thenable<T | undefined>;
+
 const remotePackLoginCommand = 'semantic-researcher-overleaf-remote-pack.login';
 const remotePackExtensionId = 'alex6095.semantic-researcher-overleaf-remote-pack';
 const remotePackMarketplaceUrl = 'https://marketplace.visualstudio.com/items?itemName=alex6095.semantic-researcher-overleaf-remote-pack';
@@ -148,6 +153,10 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
     constructor(
         private context:vscode.ExtensionContext,
         private remoteFileSystem?: RemoteFileSystemProvider,
+        private readonly executeCommand: CommandExecutor = (
+            command,
+            ...rest
+        ) => vscode.commands.executeCommand(command, ...rest),
     ) {
         this.context = context;
     }
@@ -985,7 +994,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         }
 
         const previousActiveVfs = this.remoteFileSystem?.getActiveVFS();
-        const activatedVfs = await vscode.commands.executeCommand(
+        const activatedVfs = await this.executeCommand(
             `${ROOT_NAME}.remoteFileSystem.activateProject`,
             uri,
             {restorePersistedSCMs: false},
@@ -993,20 +1002,28 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
         let completed = false;
 
         try {
-            const scm = await vscode.commands.executeCommand(
+            const scm = await this.executeCommand(
                 `${ROOT_NAME}.projectSCM.newExactLocalReplicaSCM`,
             ) as LocalReplicaSCMProvider | undefined;
 
             if (scm) {
                 await setActiveReplicaRoot(scm.baseUri, {ensureWorkspaceFolder: true});
-                vscode.commands.executeCommand('workbench.view.explorer');
+                void this.executeCommand('workbench.view.explorer');
                 completed = true;
             }
         } finally {
             if (!completed && previousActiveVfs!==activatedVfs) {
-                await vscode.commands.executeCommand(`${ROOT_NAME}.remoteFileSystem.deactivateProject`, uri);
+                await this.executeCommand(`${ROOT_NAME}.remoteFileSystem.deactivateProject`, uri);
             }
         }
+    }
+
+    registerSelectProjectFolderLocalReplicaCommand(
+        commandId = `${ROOT_NAME}.projectManager.selectProjectFolderLocalReplica`,
+    ): vscode.Disposable {
+        return vscode.commands.registerCommand(commandId, item => {
+            return this.selectProjectFolderLocalReplica(item);
+        });
     }
 
     async disconnectProjectFolderLocalReplica(options?: {
@@ -1229,9 +1246,7 @@ export class ProjectManagerProvider implements vscode.TreeDataProvider<DataItem>
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.openProjectLocalReplica`, (item) => {
                 return this.openProjectLocalReplica(item);
             }),
-            vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.selectProjectFolderLocalReplica`, (item) => {
-                return this.selectProjectFolderLocalReplica(item);
-            }),
+            this.registerSelectProjectFolderLocalReplicaCommand(),
             vscode.commands.registerCommand(`${ROOT_NAME}.projectManager.disconnectProjectFolderLocalReplica`, () => {
                 return this.disconnectProjectFolderLocalReplica();
             }),

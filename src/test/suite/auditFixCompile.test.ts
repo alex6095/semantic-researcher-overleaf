@@ -7,7 +7,7 @@ import { CompileManager } from '../../compile/compileManager';
 import { LatexParser } from '../../compile/compileLogParser';
 import { OUTPUT_FOLDER_NAME, REPLICA_SETTINGS_DIR, REPLICA_SETTINGS_FILE, ROOT_NAME } from '../../consts';
 import { PdfDocument } from '../../core/pdfViewEditorProvider';
-import { RemoteFileSystemProvider } from '../../core/remoteFileSystemProvider';
+import { RemoteFileSystemProvider, vfsProjectKey } from '../../core/remoteFileSystemProvider';
 import { TexDocumentSymbolProvider } from '../../intellisense/texDocumentSymbolProvider';
 import { EventBus } from '../../utils/eventBus';
 import { setActiveReplicaRoot } from '../../utils/localReplicaWorkspace';
@@ -471,7 +471,7 @@ suite('Intellisense audit fixes', () => {
             provider,
             document,
             downloads,
-            record: (provider as any).projectRecordMap.get('Cycle'),
+            record: (provider as any).projectRecordMap.get(vfsProjectKey(projectUri)),
         };
     }
 

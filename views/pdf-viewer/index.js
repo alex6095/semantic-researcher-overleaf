@@ -1742,6 +1742,7 @@
     // driven by `compileStatus` messages from the extension. Decoupled from the
     // status bar so the user sees feedback in the surface they're looking at.
     const compileBadgeState = { element: null, textEl: null, iconEl: null, timeoutId: null };
+    let showingCachedPdf = false;
     function ensureCompileBadge() {
         if (compileBadgeState.element) { return compileBadgeState.element; }
         const el = document.createElement('div');
@@ -1760,6 +1761,9 @@
         return el;
     }
     function updateCompileBadge(status) {
+        if (!status && showingCachedPdf) {
+            status = 'cached';
+        }
         const el = ensureCompileBadge();
         if (compileBadgeState.timeoutId) {
             clearTimeout(compileBadgeState.timeoutId);
@@ -1807,6 +1811,11 @@
                 label = 'Not connected';
                 autoHideMs = 4000;
                 break;
+            case 'cached':
+                el.classList.add('compileBadge--alert');
+                iconChar = '\u26a0';
+                label = 'Cached previous build';
+                break;
             default:
                 el.classList.remove('compileBadge--visible');
                 return;
@@ -1816,8 +1825,12 @@
         el.classList.add('compileBadge--visible');
         if (autoHideMs > 0) {
             compileBadgeState.timeoutId = setTimeout(() => {
-                el.classList.remove('compileBadge--visible');
                 compileBadgeState.timeoutId = null;
+                if (showingCachedPdf) {
+                    updateCompileBadge('cached');
+                } else {
+                    el.classList.remove('compileBadge--visible');
+                }
             }, autoHideMs);
         }
     }
@@ -1912,7 +1925,15 @@
                     // corrupt build output) used to leave the previous page on
                     // screen with no signal at all that it is out of date.
                     try {
+                        const wasShowingCachedPdf = showingCachedPdf;
                         await updatePdf(message.content);
+                        showingCachedPdf = message.cached===true;
+                        if (showingCachedPdf) {
+                            updateCompileBadge('cached');
+                        } else if (wasShowingCachedPdf) {
+                            updateCompileBadge(undefined);
+                        }
+                        vscode.postMessage({type: 'pdfLoadSuccess', content: message.version});
                     } catch (error) {
                         const detail = (error && error.message) || String(error);
                         showViewerError(`Could not render the compiled PDF: ${detail}`);

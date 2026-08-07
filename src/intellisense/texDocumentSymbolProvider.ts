@@ -1,5 +1,5 @@
 import * as vscode from 'vscode';
-import { VirtualFileSystem, parseUri } from '../core/remoteFileSystemProvider';
+import { VirtualFileSystem, parseUri, vfsProjectKey } from '../core/remoteFileSystemProvider';
 import { IntellisenseProvider } from '.';
 import { TeXElement, TeXElementType, genTexElements } from './texDocumentParseUtility';
 import { ROOT_NAME } from '../consts';
@@ -298,13 +298,13 @@ export class TexDocumentSymbolProvider extends IntellisenseProvider implements v
         // Try get fileStruct
         const vfsUri = await toVirtualUri(document.uri);
         if (!vfsUri) { return environmentRange; }
-        const {projectName} = parseUri(vfsUri);
-        let projectRecord = this.projectRecordMap.get(projectName);
+        const projectKey = vfsProjectKey(vfsUri);
+        let projectRecord = this.projectRecordMap.get(projectKey);
         let initializeProjectRecord = false;
         if (projectRecord===undefined) {
             const vfs = await this.vfsm.prefetch(vfsUri);
             projectRecord = new ProjectStructRecord(vfs);
-            this.projectRecordMap.set(projectName, projectRecord);
+            this.projectRecordMap.set(projectKey, projectRecord);
             initializeProjectRecord = true;
         }
         const fileStruct = projectRecord.getTexFileStruct(document) ?? await projectRecord.refreshRecord(document);
@@ -320,14 +320,14 @@ export class TexDocumentSymbolProvider extends IntellisenseProvider implements v
         const vfsUri = await toVirtualUri(document.uri);
         if (!vfsUri) { return []; }
         const vfs = await this.vfsm.prefetch(vfsUri);
-        const {projectName} = parseUri(vfsUri);
+        const projectKey = vfsProjectKey(vfsUri);
 
         // init project record if not exist
-        let projectRecord = this.projectRecordMap.get(projectName);
+        let projectRecord = this.projectRecordMap.get(projectKey);
         let initializeProjectRecord = false;
         if (projectRecord === undefined) {
             projectRecord = new ProjectStructRecord(vfs);
-            this.projectRecordMap.set(projectName, projectRecord);
+            this.projectRecordMap.set(projectKey, projectRecord);
             initializeProjectRecord = true;
         }
 
@@ -345,8 +345,7 @@ export class TexDocumentSymbolProvider extends IntellisenseProvider implements v
         const vfsUri = uri.scheme===ROOT_NAME ? uri : getActiveReplicaOriginUri();
         if (!vfsUri) { return []; }
         // get bib file paths
-        const {projectName} = parseUri(vfsUri);
-        const projectRecord = this.projectRecordMap.get(projectName);
+        const projectRecord = this.projectRecordMap.get(vfsProjectKey(vfsUri));
         return projectRecord?.getAllBibFilePaths() ?? [];
     }
 
@@ -362,8 +361,7 @@ export class TexDocumentSymbolProvider extends IntellisenseProvider implements v
             vscode.workspace.onDidChangeTextDocument(async (e) => {
                 const vfsUri = await toVirtualUri(e.document.uri);
                 if (!vfsUri) { return; }
-                const {projectName} = parseUri(vfsUri);
-                const projectRecord = this.projectRecordMap.get(projectName);
+                const projectRecord = this.projectRecordMap.get(vfsProjectKey(vfsUri));
                 // Fire-and-forget, but never unhandled: this runs on every
                 // keystroke, so a rejected refresh would raise one unhandled
                 // rejection per character typed.

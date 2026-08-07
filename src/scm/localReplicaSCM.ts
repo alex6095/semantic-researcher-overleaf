@@ -196,12 +196,25 @@ interface PendingEvent {
 interface RemoteDeleteTombstone {
     digest: string;
     staleLocalMtime?: number;
+    deletedAt: number;
 }
 
 interface InitializeLocalReplicaOptions {
     preserveExistingLocalFiles?: boolean;
     resetLocalFilesToRemote?: boolean;
 }
+
+interface InitialRemoteBootstrap {
+    files: [string, string][];
+    directories: string[];
+    documentSnapshots?: Map<string, Uint8Array>;
+    remoteTreeElapsedMs: number;
+    documentBatchElapsedMs: number;
+}
+
+type InitialRemoteBootstrapOutcome =
+    | {value: InitialRemoteBootstrap; error?: never}
+    | {value?: never; error: unknown};
 
 interface ValidateExactBaseUriOptions {
     beforeEmpty?: (baseUri: vscode.Uri) => void | Promise<void>;
@@ -389,6 +402,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // them must NEVER propagate to the remote. Cleared by retryFailedInitialPulls
     // or by ignoreFailedInitialPulls.
     private failedInitialPulls: Set<string> = new Set();
+    // Text files bootstrapped through the stateless HTTP snapshot endpoint are
+    // current coherent copies, but their socket rooms are not joined yet. They
+    // are verified and subscribed sequentially after startup so Overleaf's
+    // single join/leave epoch is never raced. Compile remains blocked while a
+    // path is in this set.
+    private pendingInitialDocumentSubscriptions: Set<string> = new Set();
+    // Watcher events accepted while the initial HTTP/manifest snapshot is
+    // being built are replayed after readiness on the ordinary per-path sync
+    // queues. Keeping this state separate lets startup become responsive
+    // without allowing a compile against a tree whose accepted startup events
+    // have not yet been reconciled.
+    private startupReplayGeneration?: number;
+    private startupReplayPromise?: Promise<void>;
+    private startupReplayFailure?: {generation: number; message: string};
+    // Project/UI activation stays responsive while the HTTP snapshot, buffered
+    // watcher replay, and sequential joinDoc subscriptions finish in the
+    // background. A compile requested during that window is queued here at the
+    // barrier instead of failing a few milliseconds before startup becomes
+    // safe. Tests may shorten this bounded wait through the instance seam.
+    private precompileStartupReadinessWaitMs = 60_000;
     // Last synced bytes for paths that were deleted from the remote. If a local
     // create/update for the exact same bytes arrives after the delete, it is a
     // stale watcher echo rather than a new user edit and must not recreate the
@@ -492,8 +525,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // own queued task self-deadlocks. The total (~1.85s) is the ceiling on how
     // long one push holds its path's queue slot.
     private static readonly localReadStabilizeDelays = [100, 250, 500, 1000];
-    private static readonly localReadStabilizeWarnMs = 30_000;
     private static readonly localReadStabilizeRearmMs = 750;
+    // A successful upload proves only that one revision reached Overleaf. Give
+    // agent/shell writers one coalescing window to demonstrate that the local
+    // source has actually gone quiet before allowing a compile to start.
+    private static readonly compileQuiescenceMs = 250;
+    private static readonly remoteDeleteConflictWindowMs = 5_000;
     // How long a watcher-observed update may keep looking for a path that has
     // momentarily vanished before the absence is accepted as a real deletion.
     // An atomic rename replacement closes in microseconds; this only has to
@@ -1738,6 +1775,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             clearTimeout(pending.timer);
         }
         this.pendingLocalEvents.clear();
+        this.pendingInitialDocumentSubscriptions.clear();
+        this.startupReplayGeneration = undefined;
+        this.startupReplayPromise = undefined;
+        this.startupReplayFailure = undefined;
     }
 
     private deactivateSyncSession(
@@ -3151,9 +3192,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
-    private async backupLegacySettings(generation = this.syncGeneration) {
+    private async backupLegacySettings(
+        generation = this.syncGeneration,
+        knownToExist?: boolean,
+    ) {
         this.requireSyncSession(generation);
-        if (!await LocalReplicaSCMProvider.pathExists(this.legacySettingsUri)) {
+        if (
+            knownToExist===false
+            || (
+                knownToExist===undefined
+                && !await LocalReplicaSCMProvider.pathExists(this.legacySettingsUri)
+            )
+        ) {
             return;
         }
         this.requireSyncSession(generation);
@@ -3203,8 +3253,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private async ensureLocalReplicaSettings(generation = this.syncGeneration) {
         this.requireSyncSession(generation);
-        const canonicalSettingsExisted = await this.pathExistsInSession(this.settingsUri, generation);
-        const legacySettingsExisted = await this.pathExistsInSession(this.legacySettingsUri, generation);
+        // These are independent reads of the same local folder. On Remote SSH
+        // every workspace.fs call crosses the extension-host boundary, so doing
+        // them serially adds roughly three round trips to every activation.
+        const [canonicalSettingsExisted, legacySettingsExisted, settingsRead] = await Promise.all([
+            this.pathExistsInSession(this.settingsUri, generation),
+            this.pathExistsInSession(this.legacySettingsUri, generation),
+            this.runSessionIO(
+                generation,
+                () => vscode.workspace.fs.readFile(this.settingsUri),
+            ).then(
+                content => ({content}),
+                error => ({error}),
+            ),
+        ]);
+        this.requireSyncSession(generation);
         this.settingsExistedBeforeInitialization = canonicalSettingsExisted || legacySettingsExisted;
         const canonicalSettings = {
             'uri': stringifyOverleafUri(this.vfs.origin),
@@ -3214,12 +3277,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         };
         let shouldPersist = false;
         try {
-            const content = await this.runSessionIO(
-                generation,
-                () => vscode.workspace.fs.readFile(this.settingsUri),
-            );
-            this.requireSyncSession(generation);
-            const storedSettings = JSON.parse(new TextDecoder().decode(content));
+            if ('error' in settingsRead) { throw settingsRead.error; }
+            const storedSettings = JSON.parse(new TextDecoder().decode(settingsRead.content));
             // `enableAgentReview` is dead metadata from a removed feature.
             // Ignoring it before the comparison keeps replicas written by older
             // builds from being rewritten on every load.
@@ -3238,7 +3297,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (shouldPersist) {
             await this.persistLocalReplicaSettings(generation);
         }
-        await this.backupLegacySettings(generation);
+        // We already paid for the legacy stat above. A missing file cannot need
+        // migration, and ownership prevents another Local Replica from creating
+        // one concurrently in this folder.
+        if (legacySettingsExisted) {
+            await this.backupLegacySettings(generation, true);
+        }
         return this.localReplicaSettings;
     }
 
@@ -4648,10 +4712,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private async recoverInterruptedRemoteDeletes(
         generation = this.syncGeneration,
-    ): Promise<void> {
+    ): Promise<boolean> {
         this.requireSyncSession(generation);
         let records = await this.listRemoteDeleteOperationRecords();
-        if (records.length===0) { return; }
+        if (records.length===0) { return false; }
         await this.refreshRemoteStateForReconciliation(
             '/',
             generation,
@@ -4716,6 +4780,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
             }
         }
+        return true;
     }
 
     private isNodeErrorCode(error: unknown, code: string): boolean {
@@ -5477,28 +5542,52 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         snapshot: LocalReplicaSnapshot = {files: new Set(), directories: new Set()},
         generation?: number,
     ): Promise<LocalReplicaSnapshot> {
-        if (generation!==undefined) { this.requireSyncSession(generation); }
-        const entries = await vscode.workspace.fs.readDirectory(directoryUri);
-        if (generation!==undefined) { this.requireSyncSession(generation); }
-        for (const [name, fileType] of entries) {
-            const relPath = this.normalizeConfinedRelPath(
-                `${directoryRelPath.replace(/\/+$/, '')}/${name}`,
-                'startup local replica scan',
-            );
-            if (
-                relPath===undefined
-                || this.matchIgnorePatterns(relPath)
-                || this.matchIgnorePatterns(`${relPath}/`)
-            ) {
-                continue;
-            }
+        const pendingDirectories: Array<{uri: vscode.Uri; relPath: string}> = [{
+            uri: directoryUri,
+            relPath: directoryRelPath,
+        }];
+        while (pendingDirectories.length>0) {
+            if (generation!==undefined) { this.requireSyncSession(generation); }
+            const batch = pendingDirectories.splice(0, 16);
+            const listings = await Promise.all(batch.map(async ({uri, relPath}) => ({
+                uri,
+                relPath,
+                entries: uri.scheme==='file'
+                    ? (await nodeFs.readdir(uri.fsPath, {withFileTypes: true})).map(entry => [
+                        entry.name,
+                        entry.isDirectory()
+                            ? vscode.FileType.Directory
+                            : entry.isFile()
+                                ? vscode.FileType.File
+                                : entry.isSymbolicLink()
+                                    ? vscode.FileType.SymbolicLink
+                                    : vscode.FileType.Unknown,
+                    ] as [string, vscode.FileType])
+                    : await vscode.workspace.fs.readDirectory(uri),
+            })));
+            if (generation!==undefined) { this.requireSyncSession(generation); }
+            for (const {uri, relPath: parentRelPath, entries} of listings) {
+                for (const [name, fileType] of entries) {
+                    const relPath = this.normalizeConfinedRelPath(
+                        `${parentRelPath.replace(/\/+$/, '')}/${name}`,
+                        'startup local replica scan',
+                    );
+                    if (
+                        relPath===undefined
+                        || this.matchIgnorePatterns(relPath)
+                        || this.matchIgnorePatterns(`${relPath}/`)
+                    ) {
+                        continue;
+                    }
 
-            const uri = vscode.Uri.joinPath(directoryUri, name);
-            if (fileType===vscode.FileType.Directory) {
-                snapshot.directories.add(relPath);
-                await this.collectLocalReplicaSnapshot(uri, relPath, snapshot, generation);
-            } else if (fileType===vscode.FileType.File) {
-                snapshot.files.add(relPath);
+                    const childUri = vscode.Uri.joinPath(uri, name);
+                    if (fileType===vscode.FileType.Directory) {
+                        snapshot.directories.add(relPath);
+                        pendingDirectories.push({uri: childUri, relPath});
+                    } else if (fileType===vscode.FileType.File) {
+                        snapshot.files.add(relPath);
+                    }
+                }
             }
         }
         return snapshot;
@@ -6010,7 +6099,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             `${new Date().toISOString()} [sync conflict] ${relPath}: ${reason}`,
         );
         maybeWarnSyncFailure(relPath, new Error(
-            `Local Replica conflict: ${reason}. Local and Overleaf copies were both preserved.`,
+            `Local Replica conflict: ${reason}. Neither the current local state nor the current Overleaf state was overwritten.`,
         ));
         // Conflict durability is a correctness property: a conflict that only
         // exists in memory stops blocking pushes after a reload, so the next
@@ -6253,6 +6342,46 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     public getSyncConflictPaths(): string[] {
         return [...this.syncConflicts.keys()].sort();
+    }
+
+    private async reconcilePersistedConflictChoicesOnStartup(
+        generation = this.syncGeneration,
+    ): Promise<number> {
+        let resolved = 0;
+        const conflictPaths = [...this.syncConflicts.keys()]
+            .sort((left, right) => right.split('/').length-left.split('/').length);
+        for (const relPath of conflictPaths) {
+            this.requireSyncSession(generation);
+            if (!await this.hasLocalConflictRevision(relPath, generation)) {
+                continue;
+            }
+            const localState = await this.captureLocalPathRevision(relPath, generation);
+            if (localState.kind==='other') {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [startup conflict resolution deferred] ${relPath}: ` +
+                    'the current local path type cannot be synchronized',
+                );
+                continue;
+            }
+            const event = await this.applySync(
+                'push',
+                localState.kind==='missing' ? 'delete' : 'update',
+                relPath,
+                this.localUri(relPath),
+                this.vfs.pathToUri(relPath),
+                {forcePush: true, reason: 'startup-conflict-resolution'},
+                generation,
+            );
+            this.requireSyncSession(generation);
+            if (event.outcome==='success') {
+                resolved += 1;
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [startup conflict resolved] ${relPath}: ` +
+                    'the changed local decision was applied after the recorded Overleaf revision was verified',
+                );
+            }
+        }
+        return resolved;
     }
 
     public async resolveConflictWithLocalState(relPath: string): Promise<boolean> {
@@ -6626,7 +6755,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 if (remainingChange===undefined) {
                     this.locallyDivergedPaths.delete(relPath);
                 } else {
-                    this.locallyDivergedPaths.add(relPath);
+                    // The upload was a legitimate intermediate revision, but
+                    // compiling it would already be stale. Treat a stable newer
+                    // revision exactly like an unstable read: keep retrying and
+                    // block this compile with the same user-facing sentinel.
+                    this.recordUnstableCompileTarget(relPath, localUri, result, generation);
                 }
                 break;
             }
@@ -6655,6 +6788,95 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return true;
         }
         return this.syncManifest?.files[relPath]?.localDigest===contentDigest(content);
+    }
+
+    private recordAdvancedPrecompileTreePath(
+        relPath: string,
+        kind: PathRevision['kind'],
+        result: LocalReplicaPrecompileFlushResult,
+        generation: number,
+        reportedPaths: Set<string>,
+    ): void {
+        if (reportedPaths.has(relPath)) { return; }
+        reportedPaths.add(relPath);
+        result.blockedCount += 1;
+        result.failures.push(
+            `${relPath}: local project changed while the compile barrier was sealing; `
+            + 'synchronization was re-queued',
+        );
+        this.scheduleLocalPushRetry(
+            relPath,
+            this.localUri(relPath),
+            'compile-tree-advanced',
+            generation,
+            kind==='missing' ? 'delete' : 'update',
+        );
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} `
+            + `[compile barrier blocked:local-advanced-during-quiescence] ${relPath}`,
+        );
+    }
+
+    private async verifyPrecompileTreeQuiescent(
+        result: LocalReplicaPrecompileFlushResult,
+        generation: number,
+    ): Promise<void> {
+        if (result.blockedCount>0 || result.failedCount>0) {
+            return;
+        }
+
+        // One whole-tree content scan already ran before the forced pushes.
+        // Give writers a quiet window, then reuse that same proven scanner once
+        // more against the now-current manifest. A second pre-sleep content
+        // snapshot would add a third complete project read without improving
+        // the final invariant: every path at the compile cut must match the
+        // remote baseline, and an unstable read must fail closed.
+        await this.sleepForStabilization(LocalReplicaSCMProvider.compileQuiescenceMs);
+        this.requireSyncSession(generation);
+        const localFilePaths = new Set<string>();
+        const localDirectoryPaths = new Set<string>();
+        const advancedTargets = new Map<string, vscode.Uri>();
+        await this.collectChangedLocalTargets(
+            this.baseUri,
+            '/',
+            localFilePaths,
+            localDirectoryPaths,
+            advancedTargets,
+            result,
+            generation,
+            false,
+        );
+        this.requireSyncSession(generation);
+        if (result.blockedCount>0 || result.failedCount>0) { return; }
+
+        const advancedKinds = new Map<string, PathRevision['kind']>(
+            [...advancedTargets.keys()].map(relPath => [relPath, 'file']),
+        );
+        const trackedFiles = new Set([
+            ...Object.keys(this.baseCache),
+            ...Object.keys(this.syncManifest?.files ?? {}),
+        ]);
+        for (const relPath of trackedFiles) {
+            if (!this.matchIgnorePatterns(relPath) && !localFilePaths.has(relPath)) {
+                advancedKinds.set(relPath, 'missing');
+            }
+        }
+        for (const relPath of Object.keys(this.syncManifest?.directories ?? {})) {
+            if (!this.matchIgnorePatterns(relPath) && !localDirectoryPaths.has(relPath)) {
+                advancedKinds.set(relPath, 'missing');
+            }
+        }
+
+        const reportedPaths = new Set<string>();
+        for (const [relPath, kind] of advancedKinds) {
+            this.recordAdvancedPrecompileTreePath(
+                relPath,
+                kind,
+                result,
+                generation,
+                reportedPaths,
+            );
+        }
     }
 
     private async getLocalRootRealPath(): Promise<string> {
@@ -7171,6 +7393,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     && !this.syncManifest?.directories[relPath]
                     && !(relPath in this.baseCache)
                     && !this.seenLocalEntities.has(relPath)
+                    && !this.touchesSyncConflict(relPath)
                 ) {
                     return undefined;
                 }
@@ -7397,6 +7620,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         forcedTargets: Map<string, vscode.Uri>,
         result: LocalReplicaPrecompileFlushResult,
         generation: number,
+        countSourceScan = true,
     ): Promise<void> {
         this.requireSyncSession(generation);
         let entries: [string, vscode.FileType][];
@@ -7426,7 +7650,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 localDirectoryPaths.add(relPath);
                 if (!this.syncManifest?.directories[relPath]) {
                     forcedTargets.set(relPath, uri);
-                    result.sourceScanCount += 1;
+                    if (countSourceScan) { result.sourceScanCount += 1; }
                 }
                 await this.collectChangedLocalTargets(
                     uri,
@@ -7436,10 +7660,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     forcedTargets,
                     result,
                     generation,
+                    countSourceScan,
                 );
                 continue;
             }
             if (fileType!==vscode.FileType.File) {
+                result.blockedCount += 1;
+                result.failures.push(
+                    `${relPath}: unsupported local filesystem entry cannot be synchronized`,
+                );
                 continue;
             }
 
@@ -7468,7 +7697,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
             if (!this.isContentKnownSynced(relPath, localContent)) {
                 forcedTargets.set(relPath, uri);
-                result.sourceScanCount += 1;
+                if (countSourceScan) { result.sourceScanCount += 1; }
             }
         }
     }
@@ -7522,7 +7751,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     public async flushBeforeCompile(localUris: vscode.Uri[] = []): Promise<LocalReplicaPrecompileFlushResult> {
         const generation = this.syncGeneration;
         this.requireSyncSession(generation);
-        await this.recoverChangedCommittedLocalOperations(generation);
         const result: LocalReplicaPrecompileFlushResult = {
             pendingCount: 0,
             divergedCount: 0,
@@ -7536,6 +7764,46 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             paths: [],
             failures: [],
         };
+        await this.waitForStartupReadinessBeforeCompile(generation);
+        const startupReplayPending = this.startupReplayGeneration===generation;
+        const startupReplayFailure = this.startupReplayFailure?.generation===generation
+            ? this.startupReplayFailure.message
+            : undefined;
+        if (startupReplayPending || startupReplayFailure!==undefined) {
+            const state = startupReplayPending ? 'pending' : 'failed';
+            const reason = startupReplayPending
+                ? 'startup watcher changes are still being reconciled; wait for '
+                    + '[startup buffered sync complete] before compiling'
+                : 'startup watcher change reconciliation failed; reload the window to retry: '
+                    + startupReplayFailure;
+            result.blockedCount = 1;
+            result.failures.push(reason);
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [compile barrier start] base=${this.baseUri.toString()} ` +
+                'pending=0 diverged=0 openDocs=0 sourceScan=0 sourceDeletes=0 ' +
+                `remoteVerify=${this.pendingInitialDocumentSubscriptions.size} startupReplay=${state}`,
+            );
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [compile barrier blocked:startup-replay-${state}] ` +
+                `base=${this.baseUri.toString()} reason=${reason}`,
+            );
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [compile barrier end] base=${this.baseUri.toString()} ` +
+                'attempted=0 suppressed=0 blocked=1 failed=0',
+            );
+            throw new Error(`Local Replica precompile flush failed: ${reason}`);
+        }
+        await this.recoverChangedCommittedLocalOperations(generation);
+        const subscriptionVerificationPaths = [
+            ...this.pendingInitialDocumentSubscriptions,
+        ];
+        for (const relPath of subscriptionVerificationPaths) {
+            result.blockedCount += 1;
+            result.paths.push(relPath);
+            result.failures.push(
+                `${relPath}: initial Overleaf document subscription is still being verified`,
+            );
+        }
 
         const forcedTargets = new Map<string, vscode.Uri>();
         const forcedDeleteTargets = new Map<string, vscode.Uri>();
@@ -7641,7 +7909,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         getOutputChannel().appendLine(
             `${new Date().toISOString()} [compile barrier start] base=${this.baseUri.toString()} ` +
             `pending=${result.pendingCount} diverged=${result.divergedCount} openDocs=${result.openDocCount} ` +
-            `sourceScan=${result.sourceScanCount} sourceDeletes=${result.sourceScanDeleteCount}`,
+            `sourceScan=${result.sourceScanCount} sourceDeletes=${result.sourceScanDeleteCount} ` +
+            `remoteVerify=${subscriptionVerificationPaths.length}`,
         );
 
         for (const [relPath, pending] of pendingEntries) {
@@ -7817,6 +8086,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             );
         }
 
+        await this.verifyPrecompileTreeQuiescent(result, generation);
+        this.requireSyncSession(generation);
+
         for (const [relPath, reason] of this.syncConflicts) {
             result.blockedCount += 1;
             result.failures.push(`${relPath}: ${reason}`);
@@ -7833,6 +8105,48 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
 
         return result;
+    }
+
+    private async waitForStartupReadinessBeforeCompile(generation: number): Promise<void> {
+        const hasPendingStartupWork = () => (
+            this.startupReplayGeneration===generation
+            || this.pendingInitialDocumentSubscriptions.size>0
+        );
+        if (!hasPendingStartupWork()) { return; }
+
+        const startedAt = Date.now();
+        const timeoutMs = Math.max(0, this.precompileStartupReadinessWaitMs);
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [compile barrier waiting:startup-readiness] ` +
+            `base=${this.baseUri.toString()} ` +
+            `startupReplay=${this.startupReplayGeneration===generation ? 'pending' : 'none'} ` +
+            `remoteVerify=${this.pendingInitialDocumentSubscriptions.size} timeout=${timeoutMs}ms`,
+        );
+
+        while (hasPendingStartupWork() && this.isSyncSessionActive(generation)) {
+            if (this.startupReplayFailure?.generation===generation) { break; }
+            const elapsed = Date.now()-startedAt;
+            if (elapsed>=timeoutMs) { break; }
+            const remaining = timeoutMs-elapsed;
+            const replay = this.startupReplayGeneration===generation
+                ? this.startupReplayPromise
+                : undefined;
+            await Promise.race([
+                replay?.catch(() => undefined) ?? new Promise<void>(() => undefined),
+                new Promise<void>(resolve => setTimeout(resolve, Math.min(100, remaining))),
+            ]);
+            this.requireSyncSession(generation);
+        }
+
+        const elapsed = Date.now()-startedAt;
+        const ready = !hasPendingStartupWork()
+            && this.startupReplayFailure?.generation!==generation;
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [compile barrier startup-readiness ${ready ? 'ready' : 'blocked'}] ` +
+            `base=${this.baseUri.toString()} elapsed=${elapsed}ms ` +
+            `startupReplay=${this.startupReplayGeneration===generation ? 'pending' : 'none'} ` +
+            `remoteVerify=${this.pendingInitialDocumentSubscriptions.size}`,
+        );
     }
 
     private matchIgnorePatterns(path: string): boolean {
@@ -8093,6 +8407,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         for (const path of [...this.failedInitialPulls]) {
             if (matches(path)) { this.failedInitialPulls.delete(path); }
         }
+        for (const path of [...this.pendingInitialDocumentSubscriptions]) {
+            if (matches(path)) { this.pendingInitialDocumentSubscriptions.delete(path); }
+        }
         for (const path of [...this.remoteDeleteTombstones.keys()]) {
             if (recursive && path.startsWith(`${relPath}/`)) {
                 this.remoteDeleteTombstones.delete(path);
@@ -8124,6 +8441,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.remoteDeleteTombstones.set(relPath, {
             digest: contentDigest(content),
             staleLocalMtime: staleLocalMtime===undefined ? undefined : normalizeMtimeMs(staleLocalMtime),
+            deletedAt: Date.now(),
         });
     }
 
@@ -8136,6 +8454,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         generation = this.syncGeneration,
     ) {
         this.requireSyncSession(generation);
+        this.pendingInitialDocumentSubscriptions.delete(relPath);
         if (!this.failedInitialPulls.delete(relPath)) { return; }
 
         if (this.failedInitialPulls.size===0) {
@@ -8294,53 +8613,127 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.deferredSyncWork.add(deferred);
     }
 
+    private async prefetchInitialRemoteBootstrap(
+        root: string,
+        generation = this.syncGeneration,
+    ): Promise<InitialRemoteBootstrap> {
+        const startedAt = Date.now();
+        const files: [string, string][] = [];
+        const directories: string[] = [];
+        const queue: string[] = [root];
+        while (queue.length!==0) {
+            this.requireSyncSession(generation);
+            const nextRoot = queue.shift()!;
+            const vfsUri = this.vfs.pathToUri(nextRoot);
+            const items = await this.withFileSystemContext(
+                'Read remote directory',
+                vfsUri,
+                () => typeof this.vfs.list==='function'
+                    ? this.vfs.list(vfsUri)
+                    : vscode.workspace.fs.readDirectory(vfsUri),
+            );
+            this.requireSyncSession(generation);
+            for (const [name, type] of items) {
+                const relPath = this.normalizeConfinedRelPath(nextRoot + name, 'initial pull');
+                if (relPath===undefined || this.matchIgnorePatterns(relPath)) {
+                    continue;
+                }
+                if (type===vscode.FileType.Directory) {
+                    directories.push(relPath);
+                    queue.push(`${relPath}/`);
+                } else {
+                    files.push([name, relPath]);
+                }
+            }
+        }
+        const remoteTreeElapsedMs = Date.now()-startedAt;
+        let documentSnapshots: Map<string, Uint8Array> | undefined;
+        let documentBatchElapsedMs = 0;
+        const downloadDocumentSnapshots = this.vfs.downloadDocumentSnapshots;
+        if (typeof downloadDocumentSnapshots==='function') {
+            const batchStartedAt = Date.now();
+            try {
+                documentSnapshots = await this.withRetry(
+                    'pull',
+                    '/ (initial document batch)',
+                    () => downloadDocumentSnapshots.call(
+                        this.vfs,
+                        files.map(([_name, relPath]) => this.vfs.pathToUri(relPath)),
+                    ),
+                    {
+                        delays: LocalReplicaSCMProvider.pullRetryDelays,
+                        generation,
+                        betweenAttempts: async () => {
+                            await this.waitForConnectedOrTimeout(
+                                LocalReplicaSCMProvider.pullReconnectWaitMs,
+                            );
+                        },
+                    },
+                );
+                this.requireSyncSession(generation);
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [initial document batch complete] ` +
+                    `transport=${this.vfs.documentSnapshotTransport} ` +
+                    `files=${documentSnapshots.size} ` +
+                    `elapsed=${Date.now()-batchStartedAt}ms`,
+                );
+            } catch (error) {
+                if (!this.isSyncSessionActive(generation)) { throw error; }
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [initial document batch fallback] ` +
+                    `${formatUnknownError(error)}`,
+                );
+            } finally {
+                documentBatchElapsedMs = Date.now()-batchStartedAt;
+            }
+        }
+        return {
+            files,
+            directories,
+            documentSnapshots,
+            remoteTreeElapsedMs,
+            documentBatchElapsedMs,
+        };
+    }
+
     private async overwrite(
         root: string='/',
         options: InitializeLocalReplicaOptions = {},
         generation = this.syncGeneration,
+        remoteBootstrapPromise?: Promise<InitialRemoteBootstrapOutcome>,
     ): Promise<boolean|undefined> {
         return await vscode.window.withProgress({
             location: vscode.ProgressLocation.Notification,
             title: vscode.l10n.t('Sync Files'),
             cancellable: true,
         }, async (progress, token) => {
+            const overwriteStartedAt = Date.now();
             const cancelled = () => token.isCancellationRequested || !this.isSyncSessionActive(generation);
             const resetLocalFilesToRemote = options.resetLocalFilesToRemote ?? false;
             const preserveExistingLocalFiles = (options.preserveExistingLocalFiles ?? false)
                 && !resetLocalFilesToRemote;
             const baselineUnavailable = preserveExistingLocalFiles
                 && this.syncManifestBaselineMode==='unavailable';
-            // breadth-first search for the files
-            const files: [string,string][] = [];
-            const directories: string[] = [];
-            const queue: string[] = [root];
-            while (queue.length!==0) {
-                const nextRoot = queue.shift();
-                const vfsUri = this.vfs.pathToUri(nextRoot!);
-                const items = await this.withFileSystemContext(
-                    'Read remote directory',
-                    vfsUri,
-                    () => vscode.workspace.fs.readDirectory(vfsUri),
-                );
-                if (cancelled()) { return undefined; }
-                //
-                for (const [name, type] of items) {
-                    const relPath = this.normalizeConfinedRelPath(nextRoot + name, 'initial pull');
-                    if (relPath===undefined) {
-                        continue;
-                    }
-                    if (this.matchIgnorePatterns(relPath)) {
-                        continue;
-                    }
-                    if (type === vscode.FileType.Directory) {
-                        directories.push(relPath);
-                        queue.push(relPath+'/');
-                    } else {
-                        files.push([name, relPath]);
-                    }
-                }
+            const bootstrapWaitStartedAt = Date.now();
+            let remoteBootstrap: InitialRemoteBootstrap;
+            if (remoteBootstrapPromise) {
+                const outcome = await remoteBootstrapPromise;
+                if ('error' in outcome) { throw outcome.error; }
+                remoteBootstrap = outcome.value;
+            } else {
+                remoteBootstrap = await this.prefetchInitialRemoteBootstrap(root, generation);
             }
+            if (cancelled()) { return undefined; }
+            const bootstrapWaitElapsedMs = Date.now()-bootstrapWaitStartedAt;
+            const {
+                files,
+                directories,
+                documentSnapshots: initialDocumentSnapshots,
+                remoteTreeElapsedMs,
+                documentBatchElapsedMs,
+            } = remoteBootstrap;
 
+            const localSnapshotStartedAt = Date.now();
             const localSnapshot = preserveExistingLocalFiles
                 ? await this.collectLocalReplicaSnapshot(
                     this.baseUri,
@@ -8349,6 +8742,23 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     generation,
                 )
                 : undefined;
+            const localSnapshotElapsedMs = Date.now()-localSnapshotStartedAt;
+            if (initialDocumentSnapshots) {
+                for (const [_name, relPath] of files) {
+                    if (initialDocumentSnapshots.has(
+                        this.vfs.pathToUri(relPath).toString(),
+                    )) {
+                        this.pendingInitialDocumentSubscriptions.add(relPath);
+                    }
+                }
+            }
+            const pullInitialFile = (relPath: string, vfsUri: vscode.Uri) =>
+                this.pullInitialRemoteFile(
+                    relPath,
+                    vfsUri,
+                    generation,
+                    initialDocumentSnapshots,
+                );
             const remoteFilePaths = new Set(files.map(([_name, relPath]) => relPath));
             const remoteDirectoryPaths = new Set(directories);
             const startupPushPaths = new Set<string>();
@@ -8412,10 +8822,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             return false;
                         }
                     } else {
-                        const content = await this.pullRemoteFile(
+                        const content = await pullInitialFile(
                             path,
                             this.vfs.pathToUri(path),
-                            generation,
                         );
                         if (contentDigest(content)!==entry.localDigest) {
                             return false;
@@ -8549,7 +8958,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     localUri,
                     () => this.runSessionIO(
                         generation,
-                        () => vscode.workspace.fs.createDirectory(localUri),
+                        () => localUri.scheme==='file'
+                            ? nodeFs.mkdir(localUri.fsPath, {recursive: true}).then(() => undefined)
+                            : vscode.workspace.fs.createDirectory(localUri),
                     ),
                 );
                 this.requireSyncSession(generation);
@@ -8569,6 +8980,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 16,
                 getConfiguredValue<number>('localReplica.initialPullConcurrency', 6),
             ));
+            const initialPullFilePhaseStartedAt = Date.now();
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [initial pull setup complete] ` +
+                `elapsed=${initialPullFilePhaseStartedAt-overwriteStartedAt}ms ` +
+                `bootstrapWait=${bootstrapWaitElapsedMs}ms ` +
+                `remoteTree=${remoteTreeElapsedMs}ms ` +
+                `documentBatch=${documentBatchElapsedMs}ms ` +
+                `localSnapshot=${localSnapshotElapsedMs}ms ` +
+                `reconcile=${initialPullFilePhaseStartedAt-overwriteStartedAt
+                    -bootstrapWaitElapsedMs-localSnapshotElapsedMs}ms`,
+            );
+            const initialPullTimings: Array<{relPath: string; elapsedMs: number}> = [];
             let initialPullCancelled = false;
             let initialPullError: unknown;
             const pullFileAtIndex = async (index: number): Promise<void> => {
@@ -8602,7 +9025,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             remoteChanged = remoteFingerprint===undefined
                                 || remoteFingerprint!==manifestEntry.remoteFingerprint;
                         } else {
-                            const remoteContent = await this.pullRemoteFile(relPath, vfsUri, generation);
+                            const remoteContent = await pullInitialFile(relPath, vfsUri);
                             remoteChanged = contentDigest(remoteContent)!==manifestEntry.localDigest;
                         }
                     } catch (error) {
@@ -8643,10 +9066,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     if (preservedContent!==undefined) {
                         if (this.isLikelyBinaryRelPath(relPath)) {
                             if (manifestEntry===undefined) {
-                                const remoteContent = await this.pullRemoteFile(
+                                const remoteContent = await pullInitialFile(
                                     relPath,
                                     vfsUri,
-                                    generation,
                                 );
                                 if (bytesEqual(preservedContent, remoteContent)) {
                                     this.baseCache[relPath] = preservedContent;
@@ -8688,7 +9110,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 return;
                             }
                             if (localChanged) {
-                                const remoteBaseContent = await this.pullRemoteFile(relPath, vfsUri, generation);
+                                const remoteBaseContent = await pullInitialFile(relPath, vfsUri);
                                 this.baseCache[relPath] = remoteBaseContent;
                                 this.seenLocalEntities.add(relPath);
                                 this.setBypassCache(relPath, preservedContent);
@@ -8706,7 +9128,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         } else {
                             let remoteContent: Uint8Array;
                             try {
-                                remoteContent = await this.pullRemoteFile(relPath, vfsUri, generation);
+                                remoteContent = await pullInitialFile(relPath, vfsUri);
                             } catch (error) {
                                 if (cancelled()) { initialPullCancelled = true; return; }
                                 getOutputChannel().appendLine(
@@ -8812,7 +9234,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 const localStateBeforePull = await this.captureLocalPathRevision(relPath, generation);
                 let remoteContent: Uint8Array;
                 try {
-                    remoteContent = await this.pullRemoteFile(relPath, vfsUri, generation);
+                    remoteContent = await pullInitialFile(relPath, vfsUri);
                 } catch (error) {
                     if (cancelled()) { initialPullCancelled = true; return; }
                     // Even after Layer 1 retries the read failed. Record the
@@ -8880,17 +9302,50 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         const index = nextFileIndex;
                         nextFileIndex += 1;
                         if (index>=total) { return; }
+                        const relPath = files[index][1];
+                        const startedAt = Date.now();
                         try {
                             await pullFileAtIndex(index);
                         } catch (error) {
                             if (initialPullError===undefined) { initialPullError = error; }
                             return;
+                        } finally {
+                            initialPullTimings.push({
+                                relPath,
+                                elapsedMs: Date.now()-startedAt,
+                            });
                         }
                     }
                 },
             ));
+            const slowestInitialPulls = initialPullTimings
+                .sort((left, right) => right.elapsedMs-left.elapsedMs)
+                .slice(0, 5)
+                .map(entry => `${entry.relPath}:${entry.elapsedMs}ms`)
+                .join(', ');
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [initial pull files complete] ` +
+                `concurrency=${initialPullConcurrency} files=${initialPullTimings.length} ` +
+                `elapsed=${Date.now()-initialPullFilePhaseStartedAt}ms ` +
+                `slowest=${slowestInitialPulls || 'none'}`,
+            );
             if (initialPullError!==undefined) { throw initialPullError; }
             if (initialPullCancelled) { return false; }
+
+            // A conflict can be decided while the extension host is stopped.
+            // In particular, deleting a retained local copy means "accept the
+            // verified Overleaf deletion". The ordinary manifest/base entries
+            // were intentionally removed when the conflict was created, so no
+            // startup file loop can infer this decision. Re-drive only paths
+            // whose local revision changed, and let applySync re-verify the
+            // persisted Overleaf revision before it mutates or clears anything.
+            await this.reconcilePersistedConflictChoicesOnStartup(generation);
+            this.requireSyncSession(generation);
+            for (const relPath of [...blockedDirectoryRoots]) {
+                if (!this.syncConflicts.has(relPath)) {
+                    blockedDirectoryRoots.delete(relPath);
+                }
+            }
 
             if (localSnapshot) {
                 for (const relPath of localSnapshot.files) {
@@ -9375,6 +9830,52 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         });
     }
 
+    private async pullInitialRemoteFile(
+        relPath: string,
+        vfsUri: vscode.Uri,
+        generation = this.syncGeneration,
+        prefetchedSnapshots?: Map<string, Uint8Array>,
+    ): Promise<Uint8Array> {
+        const prefetched = prefetchedSnapshots?.get(vfsUri.toString());
+        if (prefetched!==undefined) {
+            this.requireSyncSession(generation);
+            this.pendingInitialDocumentSubscriptions.add(relPath);
+            return prefetched;
+        }
+        const downloadSnapshot = this.vfs.downloadDocumentSnapshot;
+        if (typeof downloadSnapshot==='function') {
+            try {
+                const {fileType} = await this.vfs._resolveUri(vfsUri);
+                this.requireSyncSession(generation);
+                if (fileType==='doc') {
+                    const content = await this.withRetry('pull', relPath, () =>
+                        downloadSnapshot.call(this.vfs, vfsUri), {
+                        delays: LocalReplicaSCMProvider.pullRetryDelays,
+                        generation,
+                        betweenAttempts: async () => {
+                            await this.waitForConnectedOrTimeout(
+                                LocalReplicaSCMProvider.pullReconnectWaitMs,
+                            );
+                        },
+                    });
+                    this.requireSyncSession(generation);
+                    this.pendingInitialDocumentSubscriptions.add(relPath);
+                    return content;
+                }
+            } catch (error) {
+                if (!this.isSyncSessionActive(generation)) { throw error; }
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [initial document snapshot fallback] ` +
+                    `${relPath}: ${formatUnknownError(error)}`,
+                );
+            }
+        }
+        // Binary/file entities still use their authenticated file endpoint, and
+        // a failed document snapshot falls back to joinDoc. The VFS serializes
+        // that socket RPC, so a fallback cannot race another document join.
+        return this.pullRemoteFile(relPath, vfsUri, generation);
+    }
+
     private retainLocalPushIntentAfterClassificationFailure(
         relPath: string,
         localUri: vscode.Uri,
@@ -9441,7 +9942,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         reason:
             | 'unstable-read'
             | 'local-advanced-during-push'
-            | 'local-advanced-before-echo-delete',
+            | 'local-advanced-before-echo-delete'
+            | 'compile-tree-advanced',
         generation: number,
         observedType: 'update' | 'delete' = 'update',
     ): void {
@@ -9453,18 +9955,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             ?? {firstUnstableAt: Date.now(), attempts: 0};
         state.attempts += 1;
         const unstableForMs = Date.now()-state.firstUnstableAt;
-        if (unstableForMs>=LocalReplicaSCMProvider.localReadStabilizeWarnMs) {
-            // Same policy as recordUnscannableLocalPath: individual deferrals are
-            // normal and silent, but a file that has not been coherent once in
-            // half a minute is not reaching Overleaf and the user must not be
-            // left believing it is. firstUnstableAt is deliberately not reset —
-            // retries continue after the warning, and maybeWarnSyncFailure
-            // already rate-limits to one toast per (path × message) per 60s.
-            maybeWarnSyncFailure(relPath, new Error(
-                'this file is being rewritten continuously, so a consistent '
-                + 'snapshot could not be sent to Overleaf yet; retrying',
-            ));
-        }
+        // Continuous writes are an expected Local Replica workflow: an agent,
+        // formatter, generator, or local compiler may legitimately keep one
+        // path moving for minutes. Keep the path visibly dirty and keep retrying,
+        // but do not report a recoverable stabilization wait as "sync failed".
+        // A compile request still fails closed with LOCAL_SNAPSHOT_UNSTABLE,
+        // which is the point at which the user needs an actionable message.
         this.localStabilizeState.set(relPath, state);
         getOutputChannel().appendLine(
             `${new Date().toISOString()} [push deferred:${reason}] ${relPath} ` +
@@ -9868,7 +10364,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 // Layer 4 — refuse a push-delete without local-write
                 // provenance. If we never wrote this file locally (no entry in
                 // baseCache and no seenLocalEntities trace), the local-watcher
-                // event is an echo, not user intent.
+                // event is an echo, not user intent. A verified conflict
+                // resolution is the exception: markSyncConflict deliberately
+                // removes ordinary tracking, and the changed local revision plus
+                // unchanged remote proof is the provenance for the user's choice.
                 if (action==='push') {
                     if (this.failedInitialPulls.has(relPath)) {
                         getOutputChannel().appendLine(
@@ -9882,7 +10381,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         return;
                     }
                     if (
-                        !this.seenLocalEntities.has(relPath)
+                        !resolveConflict
+                        && !this.seenLocalEntities.has(relPath)
                         && !(relPath in this.baseCache)
                         && this.syncManifest?.files[relPath]===undefined
                         && this.syncManifest?.directories[relPath]===undefined
@@ -10327,16 +10827,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             // tolerance in the other direction: an older timestamp
                             // is even stronger evidence of a restore.
                             //
-                            // Residue, stated rather than implied: a restore that
-                            // does NOT preserve the original timestamp is
-                            // indistinguishable from a fresh creation. That case
-                            // resolves as a new decision and is pushed to
-                            // Overleaf, which is the recoverable direction.
+                            // A restore that does NOT preserve the original
+                            // timestamp is indistinguishable from a fresh
+                            // creation by content metadata alone. The bounded
+                            // prompt-recreation window below covers the observed
+                            // remote-delete/local-guard race and surfaces it as a
+                            // conflict. Once that window has passed, a newer file
+                            // is treated as a fresh local decision and pushed.
                             const staleLocalBytes = tombstone!==undefined
                                 && tombstone.digest===contentDigest(newContent)
                                 && tombstone.staleLocalMtime!==undefined
                                 && normalizeMtimeMs(readStat.mtime)<=tombstone.staleLocalMtime;
-                            if (staleLocalBytes) {
+                            const promptLocalRecreation = tombstone!==undefined
+                                && Date.now()-tombstone.deletedAt
+                                    <= LocalReplicaSCMProvider.remoteDeleteConflictWindowMs;
+                            if (staleLocalBytes || promptLocalRecreation) {
                                 // Both readings of this state fit the evidence: a
                                 // restore tool put the deleted revision back with
                                 // its original timestamp, or a person did.
@@ -10367,9 +10872,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 );
                                 await this.markSyncConflict(
                                     relPath,
-                                    'Overleaf deleted this file and a copy of the deleted contents '
-                                    + 'is present locally again; keep it to restore the file, or '
-                                    + 'delete it to accept the removal',
+                                    promptLocalRecreation
+                                        ? 'Overleaf deleted this file while it was promptly recreated locally; '
+                                            + 'keep the local file to restore it, or delete it to accept the removal'
+                                        : 'Overleaf deleted this file and a copy of the deleted contents '
+                                            + 'is present locally again; keep it to restore the file, or '
+                                            + 'delete it to accept the removal',
                                     newContent,
                                     generation,
                                 );
@@ -10849,13 +11357,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         // A writer holding the local file is not a failure: no
                         // toast, no outcome:'error' event, no raw internal string
                         // in the compile barrier — just a deferral and one re-arm.
-                        if (
-                            action==='push'
-                            && LocalReplicaSCMProvider.isLocalReadUnstable(error)
-                        ) {
+                        if (LocalReplicaSCMProvider.isLocalReadUnstable(error)) {
                             this.scheduleLocalPushRetry(
                                 relPath,
-                                fromUri,
+                                action==='push' ? fromUri : toUri,
                                 'unstable-read',
                                 generation,
                                 type,
@@ -10893,10 +11398,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             // No `return` here: everything below — status restoration and the
             // single terminal scmSyncCompleteEvent this function is declared to
             // resolve with — still has to run.
-            if (action==='push' && LocalReplicaSCMProvider.isLocalReadUnstable(error)) {
+            if (LocalReplicaSCMProvider.isLocalReadUnstable(error)) {
                 this.scheduleLocalPushRetry(
                     relPath,
-                    fromUri,
+                    action==='push' ? fromUri : toUri,
                     'unstable-read',
                     generation,
                     type,
@@ -11326,25 +11831,64 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const activeGeneration = generation
             ?? (this.syncSessionActive ? this.syncGeneration : await this.beginSyncSession());
         if (!this.isSyncSessionActive(activeGeneration)) { return false; }
+        const preflightStartedAt = Date.now();
         const initializationOptions = {
             resetLocalFilesToRemote: false,
             ...definedInitializationOptions(this.initializationOptions),
             ...definedInitializationOptions(options),
         };
+        // Remote document snapshots and local settings/manifest reads are
+        // independent. Start both immediately after watcher registration so
+        // network latency is hidden behind Remote SSH filesystem preflight.
+        let remoteBootstrapPromise: Promise<InitialRemoteBootstrapOutcome> =
+            this.prefetchInitialRemoteBootstrap('/', activeGeneration).then(
+                value => ({value}),
+                error => ({error}),
+            );
         await this.ensureLocalReplicaSettings(activeGeneration);
         if (!this.isSyncSessionActive(activeGeneration)) { return false; }
+        const settingsReadyAt = Date.now();
         await this.loadSyncManifest(activeGeneration);
         if (!this.isSyncSessionActive(activeGeneration)) { return false; }
+        const manifestReadyAt = Date.now();
         this.initialPullStatus = 'pending';
         // Per-file failures accumulate in failedInitialPulls; reset before each
         // attempt so a fresh init starts from a clean slate.
         this.failedInitialPulls.clear();
+        this.pendingInitialDocumentSubscriptions.clear();
         try {
             await this.recoverInterruptedLocalOperations(activeGeneration);
             if (!this.isSyncSessionActive(activeGeneration)) { return false; }
-            await this.recoverInterruptedRemoteDeletes(activeGeneration);
+            const recoveredRemoteOperation = await this.recoverInterruptedRemoteDeletes(
+                activeGeneration,
+            );
+            if (recoveredRemoteOperation) {
+                // The speculative tree/snapshot may describe the staged state
+                // from before crash recovery. Discard it and bootstrap again
+                // from the now-authoritative remote tree.
+                remoteBootstrapPromise = this.prefetchInitialRemoteBootstrap(
+                    '/',
+                    activeGeneration,
+                ).then(
+                    value => ({value}),
+                    error => ({error}),
+                );
+            }
             await this.hydrateMissingConflictRemoteProofs(activeGeneration);
-            const completed = await this.overwrite('/', initializationOptions, activeGeneration);
+            const recoveryReadyAt = Date.now();
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [initial pull preflight complete] ` +
+                `elapsed=${recoveryReadyAt-preflightStartedAt}ms ` +
+                `settings=${settingsReadyAt-preflightStartedAt}ms ` +
+                `manifest=${manifestReadyAt-settingsReadyAt}ms ` +
+                `recovery=${recoveryReadyAt-manifestReadyAt}ms`,
+            );
+            const completed = await this.overwrite(
+                '/',
+                initializationOptions,
+                activeGeneration,
+                remoteBootstrapPromise,
+            );
             if (completed!==true || !this.isSyncSessionActive(activeGeneration)) { return false; }
         } catch (error) {
             if (!this.isSyncSessionActive(activeGeneration)) { return false; }
@@ -11392,6 +11936,83 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             await this.refreshCleanOpenReplicaDocumentsFromDisk(activeGeneration);
         }
         return this.isSyncSessionActive(activeGeneration);
+    }
+
+    private async verifyInitialDocumentSubscriptions(
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        const total = this.pendingInitialDocumentSubscriptions.size;
+        if (total===0) { return; }
+        const startedAt = Date.now();
+        let lastDeferredLogAt = 0;
+        while (
+            this.isSyncSessionActive(generation)
+            && this.pendingInitialDocumentSubscriptions.size>0
+        ) {
+            let progressed = false;
+            let latestError: unknown;
+            const targets = [...this.pendingInitialDocumentSubscriptions];
+            for (const relPath of targets) {
+                if (!this.isSyncSessionActive(generation)) { return; }
+                const vfsUri = this.vfs.pathToUri(relPath);
+                const localUri = this.localUri(relPath);
+                try {
+                    const event = await this.enqueueSync(
+                        relPath,
+                        async () => {
+                            const type = await this.remoteTargetEventType(vfsUri);
+                            this.requireSyncSession(generation);
+                            if (type==='update') {
+                                // The HTTP snapshot made the local tree ready,
+                                // but only joinDoc subscribes this socket to OT
+                                // updates. VFS serializes the call and caches the
+                                // authoritative result; applySync then performs
+                                // the ordinary guarded merge from that cache.
+                                await this.pullRemoteFile(relPath, vfsUri, generation);
+                                this.requireSyncSession(generation);
+                            }
+                            return this.applySync(
+                                'pull',
+                                type,
+                                relPath,
+                                vfsUri,
+                                localUri,
+                                {},
+                                generation,
+                            );
+                        },
+                        generation,
+                    );
+                    this.requireSyncSession(generation);
+                    if (
+                        event
+                        && (event.outcome==='success' || event.outcome==='suppressed')
+                    ) {
+                        this.pendingInitialDocumentSubscriptions.delete(relPath);
+                        progressed = true;
+                    }
+                } catch (error) {
+                    latestError = error;
+                }
+            }
+            if (this.pendingInitialDocumentSubscriptions.size===0) {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [initial document subscriptions live] ` +
+                    `files=${total} elapsed=${Date.now()-startedAt}ms`,
+                );
+                return;
+            }
+            const now = Date.now();
+            if (lastDeferredLogAt===0 || now-lastDeferredLogAt>=30_000) {
+                lastDeferredLogAt = now;
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [initial document subscriptions deferred] ` +
+                    `pending=${this.pendingInitialDocumentSubscriptions.size}` +
+                    (latestError===undefined ? '' : `: ${formatUnknownError(latestError)}`),
+                );
+            }
+            await this.sleepForStabilization(progressed ? 100 : 1_000);
+        }
     }
 
     private surfacePartialPullToast(generation = this.syncGeneration) {
@@ -11540,7 +12161,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private async replayBufferedVfsEvents(
         events: Iterable<{uri: vscode.Uri; type: 'update' | 'delete'}>,
         generation: number,
-    ): Promise<void> {
+    ): Promise<number> {
         const targets: Array<{
             relPath: string;
             uri: vscode.Uri;
@@ -11590,6 +12211,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             );
             this.requireSyncSession(generation);
         }
+        return targets.length;
     }
 
     private recordUnscannableLocalPath(relPath: string, error: unknown): void {
@@ -11670,6 +12292,66 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.requireSyncSession(generation);
         }
         return targets.length;
+    }
+
+    private startBufferedStartupReplay(
+        remoteEvents: ReadonlyArray<{uri: vscode.Uri; type: 'update' | 'delete'}>,
+        localEvents: ReadonlyArray<{uri: vscode.Uri; type: 'update' | 'delete'}>,
+        generation: number,
+    ): boolean {
+        if (remoteEvents.length===0 && localEvents.length===0) {
+            return false;
+        }
+
+        this.startupReplayGeneration = generation;
+        this.startupReplayFailure = undefined;
+        let work!: Promise<void>;
+        work = (async () => {
+            const replayedRemote = await this.replayBufferedVfsEvents(remoteEvents, generation);
+            const replayedLocal = await this.replayBufferedLocalEvents(localEvents, generation);
+            // Pull replay can update clean restored editor models. Dirty
+            // buffers remain authoritative and are deliberately untouched.
+            await this.refreshCleanOpenReplicaDocumentsFromDisk(generation);
+            this.requireSyncSession(generation);
+            if (this.startupReplayGeneration!==generation) { return; }
+            this.startupReplayGeneration = undefined;
+            this.startupReplayFailure = undefined;
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [startup buffered sync complete] ` +
+                `replayedRemote=${replayedRemote} replayedLocal=${replayedLocal}`,
+            );
+            // Subscribe only after buffered events have established their
+            // guarded merge order. The subscription set independently keeps
+            // compilation fail-closed until every text document is verified.
+            void this.verifyInitialDocumentSubscriptions(generation).catch(error => {
+                if (!this.isSyncSessionActive(generation)) { return; }
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [initial document subscription failed] ` +
+                    `${formatUnknownError(error)}`,
+                );
+            });
+        })().catch(error => {
+            if (!this.isSyncSessionActive(generation)) { return; }
+            const message = formatUnknownError(error);
+            if (this.startupReplayGeneration===generation) {
+                this.startupReplayGeneration = undefined;
+            }
+            this.startupReplayFailure = {generation, message};
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [startup buffered sync failed] ${message}`,
+            );
+            maybeWarnSyncFailure('/', new Error(
+                `startup watcher changes could not be reconciled: ${message}`,
+            ));
+        }).finally(() => {
+            this.deferredSyncWork.delete(work);
+            if (this.startupReplayPromise===work) {
+                this.startupReplayPromise = undefined;
+            }
+        });
+        this.startupReplayPromise = work;
+        this.deferredSyncWork.add(work);
+        return true;
     }
 
     private observeLocalWatcherProbe(uri: vscode.Uri): boolean {
@@ -11794,6 +12476,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             ...Object.keys(this.syncManifest?.directories ?? {}),
             ...this.seenLocalEntities,
             ...this.locallyDivergedPaths,
+            ...this.syncConflicts.keys(),
         ]);
         for (const relPath of trackedPaths) {
             if (
@@ -12112,20 +12795,37 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
 
         bufferingStartupEvents = false;
-        await this.replayBufferedVfsEvents(bufferedVfsEvents.values(), generation);
-        await this.replayBufferedLocalEvents(bufferedLocalEvents.values(), generation);
-        getOutputChannel().appendLine(
-            `${new Date().toISOString()} [sync watchers live] ` +
-            `replayedRemote=${bufferedVfsEvents.size} replayedLocal=${bufferedLocalEvents.size} ` +
-            `initialPullStatus=${this.initialPullStatus}`,
-        );
+        const startupRemoteEvents = [...bufferedVfsEvents.values()];
+        const startupLocalEvents = [...bufferedLocalEvents.values()];
         bufferedVfsEvents.clear();
         bufferedLocalEvents.clear();
-
-        // Recheck restored clean editor models after watcher replay. Dirty
-        // buffers remain untouched.
-        await this.refreshCleanOpenReplicaDocumentsFromDisk(generation);
-        this.requireSyncSession(generation);
+        const startupReplayPending = this.startBufferedStartupReplay(
+            startupRemoteEvents,
+            startupLocalEvents,
+            generation,
+        );
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [sync watchers live] ` +
+            `bufferedRemote=${startupRemoteEvents.length} bufferedLocal=${startupLocalEvents.length} ` +
+            `startupReplay=${startupReplayPending ? 'pending' : 'none'} ` +
+            `initialPullStatus=${this.initialPullStatus} ` +
+            `remoteVerify=${this.pendingInitialDocumentSubscriptions.size}`,
+        );
+        // The local tree is already an authoritative HTTP snapshot. Join the
+        // document rooms after readiness, one at a time. When buffered events
+        // exist, the background replay starts this verification after they are
+        // reconciled; otherwise start it immediately.
+        if (!startupReplayPending) {
+            void this.verifyInitialDocumentSubscriptions(generation).catch(error => {
+                if (!this.isSyncSessionActive(generation)) { return; }
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [initial document subscription failed] ` +
+                    `${formatUnknownError(error)}`,
+                );
+            });
+            await this.refreshCleanOpenReplicaDocumentsFromDisk(generation);
+            this.requireSyncSession(generation);
+        }
         if (this.initialPullStatus!=='complete') {
             getOutputChannel().appendLine(
                 `${new Date().toISOString()} [partial pull active] ${this.failedInitialPulls.size} files pending; ` +

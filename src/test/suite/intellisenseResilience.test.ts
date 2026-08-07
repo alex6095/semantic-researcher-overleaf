@@ -1,6 +1,7 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import { ROOT_NAME } from '../../consts';
+import { vfsProjectKey } from '../../core/remoteFileSystemProvider';
 import { TexDocumentSymbolProvider } from '../../intellisense/texDocumentSymbolProvider';
 
 suite('Intellisense resilience', () => {
@@ -37,5 +38,50 @@ suite('Intellisense resilience', () => {
         assert.strictEqual(symbols.length, 1);
         assert.strictEqual(symbols[0].name, 'Local replica content');
         assert.strictEqual(remoteReads, 1);
+    });
+
+    test('isolates symbol records for same-name projects by stable VFS identity', async () => {
+        const firstUri = vscode.Uri.parse(
+            `${ROOT_NAME}://www.overleaf.com/Same%20Name/main.tex`+
+            '?user=user-1&project=project-1',
+        );
+        const secondUri = vscode.Uri.parse(
+            `${ROOT_NAME}://www.overleaf.com/Same%20Name/main.tex`+
+            '?user=user-1&project=project-2',
+        );
+        const vfsByProject = new Map([
+            ['project-1', {
+                getRootDocName: () => 'main.tex',
+                pathToUri: () => firstUri,
+                openFile: async () => Buffer.from('\\section{First remote root}'),
+            }],
+            ['project-2', {
+                getRootDocName: () => 'main.tex',
+                pathToUri: () => secondUri,
+                openFile: async () => Buffer.from('\\section{Second remote root}'),
+            }],
+        ]);
+        const provider = new TexDocumentSymbolProvider({
+            prefetch: async (uri: vscode.Uri) => vfsByProject.get(
+                new URLSearchParams(uri.query).get('project') ?? '',
+            ),
+        } as any);
+        const firstDocument = {
+            uri: firstUri,
+            getText: () => '\\section{First local document}',
+        } as vscode.TextDocument;
+        const secondDocument = {
+            uri: secondUri,
+            getText: () => '\\section{Second local document}',
+        } as vscode.TextDocument;
+
+        await provider.provideDocumentSymbols(firstDocument);
+        await provider.provideDocumentSymbols(secondDocument);
+
+        const records = (provider as any).projectRecordMap as Map<string, unknown>;
+        assert.strictEqual(records.size, 2);
+        assert.ok(records.has(vfsProjectKey(firstUri)));
+        assert.ok(records.has(vfsProjectKey(secondUri)));
+        assert.notStrictEqual(vfsProjectKey(firstUri), vfsProjectKey(secondUri));
     });
 });

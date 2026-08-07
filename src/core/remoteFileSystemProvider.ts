@@ -169,6 +169,10 @@ export class VirtualFileSystem extends vscode.Disposable {
     private userId: string;
     private isDirty: boolean = true;
     private initializing?: Promise<ProjectEntity>;
+    // Overleaf real-time tracks one join/leave epoch per socket client. Two
+    // overlapping joinDoc RPCs make the later call supersede the earlier one,
+    // so every authoritative socket join must pass through this queue.
+    private documentJoinQueue: Promise<void> = Promise.resolve();
     private retryConnection: number = 0;
     private lastConnectionError?: Error;
     private outputBuildId?: string;
@@ -1151,6 +1155,26 @@ export class VirtualFileSystem extends vscode.Disposable {
         uri: vscode.Uri,
         doc: DocumentEntity,
     ): Promise<Uint8Array> {
+        let releaseTurn!: () => void;
+        const previousTurn = this.documentJoinQueue;
+        this.documentJoinQueue = new Promise<void>(resolve => {
+            releaseTurn = resolve;
+        });
+        await previousTurn;
+        try {
+            // This method is also the proof step after an ambiguous OT write.
+            // A populated remoteCache may predate that write, so every caller
+            // must perform the serialized authoritative join.
+            return await this.refreshDocumentFromServerNow(uri, doc);
+        } finally {
+            releaseTurn();
+        }
+    }
+
+    private async refreshDocumentFromServerNow(
+        uri: vscode.Uri,
+        doc: DocumentEntity,
+    ): Promise<Uint8Array> {
         // `joinDoc` is only answered by a socket that has already joined the
         // project. Dispatching it into a socket that is still (re)joining never
         // gets an ack, so it burns three 20s timeouts and then fails the user's
@@ -1186,6 +1210,68 @@ export class VirtualFileSystem extends vscode.Disposable {
         throw new RemoteDocumentWriteAmbiguousError(
             `Could not obtain a current Overleaf revision for ${uri.path}.`,
         );
+    }
+
+    async downloadDocumentSnapshot(uri: vscode.Uri): Promise<Uint8Array> {
+        if (this.initializing) {
+            await this.initializing;
+        } else if (this._connectionState==='disconnected') {
+            await this.reconnect(`download document snapshot ${uri.path}`);
+        }
+        const identity = this.requireCurrentSession();
+        const {fileType, fileEntity} = await this._resolveUri(uri);
+        this.requireCurrentSession();
+        if (fileType!=='doc' || !fileEntity?._id) {
+            throw vscode.FileSystemError.Unavailable(
+                `Overleaf path is not a downloadable document: ${uri.path}`,
+            );
+        }
+        const response = await this.api.getDocumentSnapshot(
+            identity,
+            this.projectId,
+            fileEntity._id,
+        );
+        this.requireCurrentSession();
+        return response.content!;
+    }
+
+    async downloadDocumentSnapshots(
+        uris: vscode.Uri[],
+    ): Promise<Map<string, Uint8Array>> {
+        if (this.initializing) {
+            await this.initializing;
+        } else if (this._connectionState==='disconnected') {
+            await this.reconnect('download document snapshots');
+        }
+        const identity = this.requireCurrentSession();
+        const documents = await Promise.all(uris.map(async uri => {
+            const {fileType, fileEntity} = await this._resolveUri(uri);
+            if (fileType!=='doc' || !fileEntity?._id) { return undefined; }
+            return {uri, docId: fileEntity._id};
+        }));
+        this.requireCurrentSession();
+        const requested = documents.filter(
+            (entry): entry is {uri: vscode.Uri; docId: string} => entry!==undefined,
+        );
+        const snapshots = await this.api.getDocumentSnapshots(
+            identity,
+            this.projectId,
+            requested.map(entry => entry.docId),
+        );
+        this.requireCurrentSession();
+        const result = new Map<string, Uint8Array>();
+        for (const {uri, docId} of requested) {
+            const content = snapshots.get(docId);
+            if (content===undefined) {
+                throw new Error(`Overleaf document snapshot was omitted: ${uri.path}`);
+            }
+            result.set(uri.toString(), content);
+        }
+        return result;
+    }
+
+    get documentSnapshotTransport(): 'h2' | 'http1' {
+        return this.api.documentSnapshotTransport;
     }
 
     private desiredChangeIsPresent(
@@ -1966,16 +2052,16 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.requireCurrentSession();
             }
             if (res.type==='success' && res.compile?.status==='success') {
-                // Store CDN download info from the response for subsequent output file requests
-                this.compileGroup = res.compile.compileGroup;
-                this.clsiServerId = res.compile.clsiServerId;
-                this.pdfDownloadDomain = res.compile.pdfDownloadDomain;
                 try {
                     // Awaited: an unhandled rejection here used to leave this
                     // call returning true while the caller went on to parse the
                     // *previous* build's output.log and refresh the previous
                     // output.pdf.
-                    await this.updateOutputs(res.compile.outputFiles);
+                    await this.updateOutputs(res.compile.outputFiles, {
+                        compileGroup: res.compile.compileGroup,
+                        clsiServerId: res.compile.clsiServerId,
+                        pdfDownloadDomain: res.compile.pdfDownloadDomain,
+                    });
                 } catch (error) {
                     const message = error instanceof Error ? error.message : String(error);
                     console.error('Compile succeeded but its outputs could not be published.', error);
@@ -2023,7 +2109,14 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    async updateOutputs(outputs: Array<OutputFileEntity>) {
+    async updateOutputs(
+        outputs: Array<OutputFileEntity>,
+        metadata?: {
+            compileGroup: string;
+            clsiServerId?: string;
+            pdfDownloadDomain?: string;
+        },
+    ) {
         if (!outputs?.length || !outputs[0]?.url) {
             // A "successful" compile without output files cannot refresh the
             // output folder. Silently keeping the previous build would make the
@@ -2034,14 +2127,26 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
         // update output buildId
         // '/project/65dbfff719ad65b54b9eaed4/user/65094b5fa537faaba0bec01f/build/19620231e54-5372f67292889500/output/output.aux' --> 19620231e54-5372f67292889500'
-        this.outputBuildId = outputs[0].url.match(/\/build\/([^\/]+)/)?.[1];
-        this.lastOutputs = outputs.map((file) => {
-            file._id = __OUTPUTS_ID;
-            file.name=file.path;
-            file.readonly=true;
-            return file;
-        });
-        this.installOutputsEntity(this.lastOutputs);
+        const outputBuildId = outputs[0].url.match(/\/build\/([^\/]+)/)?.[1];
+        const preparedOutputs = outputs.map((file) => ({
+            ...file,
+            _id: __OUTPUTS_ID,
+            name: file.path,
+            readonly: true,
+        }));
+
+        // Publish the build routing metadata and output tree as one validated
+        // snapshot. Otherwise a malformed new response can leave the previous
+        // output.pdf attached to the new build's CDN metadata and make that
+        // known-good artifact download as a 404.
+        this.outputBuildId = outputBuildId;
+        if (metadata) {
+            this.compileGroup = metadata.compileGroup;
+            this.clsiServerId = metadata.clsiServerId;
+            this.pdfDownloadDomain = metadata.pdfDownloadDomain;
+        }
+        this.lastOutputs = preparedOutputs;
+        this.installOutputsEntity(preparedOutputs);
     }
 
     private installOutputsEntity(outputs: Array<OutputFileEntity>) {

@@ -125,13 +125,20 @@ export async function activate(context: vscode.ExtensionContext) {
         }),
     );
 
-    // Register: [core] PdfViewEditorProvider
-    const pdfViewEditorProvider = new PdfViewEditorProvider(context);
-    context.subscriptions.push( ...pdfViewEditorProvider.triggers );
-
     // Register: [compile] CompileManager on Statusbar
     const compileManager = new CompileManager(remoteFileSystemProvider);
     context.subscriptions.push( ...compileManager.triggers );
+
+    // Register: [core] PdfViewEditorProvider. A restored output.pdf editor can
+    // precede the new extension host's in-memory compile artifact. If there is
+    // no render-confirmed cache yet, rebuild only that requested project and
+    // retry the read instead of compiling every project during activation.
+    const pdfViewEditorProvider = new PdfViewEditorProvider(context, {
+        recoverMissingOutput: async uri => {
+            await compileManager.compile(true, [], uri);
+        },
+    });
+    context.subscriptions.push( ...pdfViewEditorProvider.triggers );
 
     // Register: [intellisense] LangIntellisenseProvider
     const langIntellisenseProvider = new LangIntellisenseProvider(context, remoteFileSystemProvider);

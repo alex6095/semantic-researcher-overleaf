@@ -25,7 +25,7 @@ export function run(): Promise<void> {
         mocha.grep(new RegExp(grep));
     }
 
-    for (const file of findTestFiles(__dirname)) {
+    for (const file of findTestFiles(__dirname).sort()) {
         mocha.addFile(file);
     }
 

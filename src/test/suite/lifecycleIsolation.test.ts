@@ -3,7 +3,7 @@ import * as fs from 'fs';
 import * as http from 'http';
 import * as path from 'path';
 import * as vscode from 'vscode';
-import { BaseAPI } from '../../api/base';
+import { BaseAPI, SessionExpiredError } from '../../api/base';
 import { SocketIOAPI } from '../../api/socketio';
 import {
     RemoteDocumentMergeConflictError,
@@ -620,6 +620,42 @@ suite('Extension host and lifecycle isolation', () => {
         } finally {
             (GlobalStateManager as any).logoutServer = originalLogout;
         }
+    });
+
+    test('serializes document joins because one socket has one join/leave epoch', async () => {
+        const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
+        const internals = vfs as any;
+        attachAuthenticatedSession(internals);
+        internals.disposed = false;
+        internals._connectionState = 'connected';
+        internals.documentJoinQueue = Promise.resolve();
+        internals.documentCollaboratorRevisions = new Map();
+        internals.isDirty = false;
+        let activeJoins = 0;
+        let maximumActiveJoins = 0;
+        internals.socket = {
+            joinDoc: async (docId: string) => {
+                activeJoins += 1;
+                maximumActiveJoins = Math.max(maximumActiveJoins, activeJoins);
+                try {
+                    await new Promise(resolve => setTimeout(resolve, 25));
+                    return {docLines: [`content for ${docId}`], version: 1};
+                } finally {
+                    activeJoins -= 1;
+                }
+            },
+        };
+        const first = {_id: 'doc-1', name: 'one.tex'};
+        const second = {_id: 'doc-2', name: 'two.tex'};
+
+        const [firstContent, secondContent] = await Promise.all([
+            internals.refreshDocumentFromServer(vscode.Uri.file('/one.tex'), first),
+            internals.refreshDocumentFromServer(vscode.Uri.file('/two.tex'), second),
+        ]);
+
+        assert.strictEqual(maximumActiveJoins, 1);
+        assert.strictEqual(new TextDecoder().decode(firstContent), 'content for doc-1');
+        assert.strictEqual(new TextDecoder().decode(secondContent), 'content for doc-2');
     });
 
     test('rejects a document response that arrives after session replacement', async () => {
@@ -2503,6 +2539,128 @@ suite('Extension host and lifecycle isolation', () => {
                 server.close(error => error ? reject(error) : resolve());
             });
         }
+    });
+
+    test('downloads a coherent document snapshot through the stateless HTTP endpoint', async function () {
+        this.timeout(10000);
+        let requestedUrl = '';
+        const server = http.createServer((request, response) => {
+            requestedUrl = request.url ?? '';
+            response.statusCode = 200;
+            response.setHeader('Connection', 'close');
+            response.end('first line\nsecond line');
+        });
+        await new Promise<void>((resolve, reject) => {
+            server.once('error', reject);
+            server.listen(0, '127.0.0.1', () => resolve());
+        });
+        const address = server.address();
+        assert.ok(address && typeof address!=='string');
+        const api = new BaseAPI(`http://127.0.0.1:${address.port}/`);
+
+        try {
+            const response = await api.getDocumentSnapshot(
+                {csrfToken: 'test', cookies: 'session=test'},
+                'project-1',
+                'doc-1',
+            );
+            assert.strictEqual(
+                requestedUrl,
+                '/project/project-1/doc/doc-1/download',
+            );
+            assert.strictEqual(
+                new TextDecoder().decode(response.content),
+                'first line\nsecond line',
+            );
+        } finally {
+            (
+                server as http.Server & {closeAllConnections?: () => void}
+            ).closeAllConnections?.();
+            await new Promise<void>((resolve, reject) => {
+                server.close(error => error ? reject(error) : resolve());
+            });
+        }
+    });
+
+    test('deduplicates document ids in one HTTP/2 bootstrap batch', async () => {
+        const api = new BaseAPI('https://example.test/');
+        let requestedDocIds: string[] = [];
+        (api as any).getDocumentSnapshotsHttp2 = async (
+            _identity: unknown,
+            _projectId: string,
+            docIds: string[],
+        ) => {
+            requestedDocIds = docIds;
+            return new Map(docIds.map(docId => [
+                docId,
+                new TextEncoder().encode(`snapshot:${docId}`),
+            ]));
+        };
+
+        const snapshots = await api.getDocumentSnapshots(
+            {csrfToken: 'test', cookies: 'session=test'},
+            'project-1',
+            ['doc-1', 'doc-2', 'doc-1'],
+        );
+
+        assert.deepStrictEqual(requestedDocIds, ['doc-1', 'doc-2']);
+        assert.strictEqual(
+            new TextDecoder().decode(snapshots.get('doc-2')),
+            'snapshot:doc-2',
+        );
+    });
+
+    test('falls back to authenticated per-document downloads when HTTP/2 is unavailable', async () => {
+        const api = new BaseAPI('https://example.test/');
+        (api as any).getDocumentSnapshotsHttp2 = async () => {
+            throw new Error('ALPN did not negotiate h2');
+        };
+        const requested: string[] = [];
+        (api as any).getDocumentSnapshot = async (
+            _identity: unknown,
+            _projectId: string,
+            docId: string,
+        ) => {
+            requested.push(docId);
+            return {
+                type: 'success',
+                content: new TextEncoder().encode(`fallback:${docId}`),
+            };
+        };
+
+        const snapshots = await api.getDocumentSnapshots(
+            {csrfToken: 'test', cookies: 'session=test'},
+            'project-1',
+            ['doc-1', 'doc-2'],
+        );
+
+        assert.deepStrictEqual(requested.sort(), ['doc-1', 'doc-2']);
+        assert.strictEqual(
+            new TextDecoder().decode(snapshots.get('doc-1')),
+            'fallback:doc-1',
+        );
+    });
+
+    test('does not fan out fallback downloads after an HTTP/2 session expiry', async () => {
+        const api = new BaseAPI('https://example.test/');
+        (api as any).getDocumentSnapshotsHttp2 = async () => {
+            throw new SessionExpiredError('https://example.test/', 302);
+        };
+        let fallbackCount = 0;
+        (api as any).getDocumentSnapshot = async () => {
+            fallbackCount += 1;
+            throw new Error('unexpected fallback');
+        };
+
+        await assert.rejects(
+            () => api.getDocumentSnapshots(
+                {csrfToken: 'test', cookies: 'expired'},
+                'project-1',
+                ['doc-1', 'doc-2'],
+            ),
+            SessionExpiredError,
+        );
+        assert.strictEqual(fallbackCount, 0);
     });
 
     test('preserves mutation HTTP status for retry classification', async function () {

@@ -277,8 +277,8 @@ suite('Local Replica stable-snapshot push', function () {
     let originalWatcherHealthIntervalMs: number;
     let originalShouldUseDirectLocalWatcher: () => boolean;
     let originalStabilizeDelays: number[];
-    let originalStabilizeWarnMs: number;
     let originalStabilizeRearmMs: number;
+    let originalCompileQuiescenceMs: number;
     let restoreLocalReplicaWorkspaceContext: vscode.Disposable;
     const localReplicaWorkspaceState = new Map<string, unknown>();
     const localReplicaWorkspaceSubscriptions: vscode.Disposable[] = [];
@@ -313,13 +313,14 @@ suite('Local Replica stable-snapshot push', function () {
         originalWatcherHealthIntervalMs = (LocalReplicaSCMProvider as any).watcherHealthIntervalMs;
         originalShouldUseDirectLocalWatcher = (LocalReplicaSCMProvider as any).shouldUseDirectLocalWatcher;
         originalStabilizeDelays = (LocalReplicaSCMProvider as any).localReadStabilizeDelays;
-        originalStabilizeWarnMs = (LocalReplicaSCMProvider as any).localReadStabilizeWarnMs;
         originalStabilizeRearmMs = (LocalReplicaSCMProvider as any).localReadStabilizeRearmMs;
+        originalCompileQuiescenceMs = (LocalReplicaSCMProvider as any).compileQuiescenceMs;
         (LocalReplicaSCMProvider as any).shouldUseDirectLocalWatcher = () => false;
         (LocalReplicaSCMProvider as any).watcherProbeTimeoutMs = 60_000;
         (LocalReplicaSCMProvider as any).watcherHealthIntervalMs = 60_000;
         (LocalReplicaSCMProvider as any).localReadStabilizeDelays = [5, 10];
         (LocalReplicaSCMProvider as any).localReadStabilizeRearmMs = 20;
+        (LocalReplicaSCMProvider as any).compileQuiescenceMs = 5;
         warnings = [];
         (vscode.window as any).showWarningMessage = async (message: string) => {
             warnings.push(message);
@@ -348,8 +349,8 @@ suite('Local Replica stable-snapshot push', function () {
         (LocalReplicaSCMProvider as any).watcherHealthIntervalMs = originalWatcherHealthIntervalMs;
         (LocalReplicaSCMProvider as any).shouldUseDirectLocalWatcher = originalShouldUseDirectLocalWatcher;
         (LocalReplicaSCMProvider as any).localReadStabilizeDelays = originalStabilizeDelays;
-        (LocalReplicaSCMProvider as any).localReadStabilizeWarnMs = originalStabilizeWarnMs;
         (LocalReplicaSCMProvider as any).localReadStabilizeRearmMs = originalStabilizeRearmMs;
+        (LocalReplicaSCMProvider as any).compileQuiescenceMs = originalCompileQuiescenceMs;
         await Promise.allSettled(
             createdSCMsForTest.splice(0).map(scm => scm.deactivate()),
         );
@@ -442,11 +443,12 @@ suite('Local Replica stable-snapshot push', function () {
             !hasLine('[push update suppressed:remote-delete-echo]'),
             'the recreated file must not be classified as a tombstone echo',
         );
-        assert.strictEqual(event.outcome, 'success');
+        assert.strictEqual(event.outcome, 'blocked');
         assert.strictEqual(await pathExists(localSample), true);
         assert.strictEqual(await readText(localSample), 'restored bytes');
-        assert.strictEqual(await readText(remoteSample), 'restored bytes');
-        assert.strictEqual(vfs.uploadCount, 1);
+        assert.strictEqual(await pathExists(remoteSample), false);
+        assert.strictEqual(vfs.uploadCount, 0);
+        assert.strictEqual(internals.syncConflicts.has('/sample.tex'), true);
         internals.readOpenedLocalFile = originalRead;
     });
 
@@ -501,6 +503,71 @@ suite('Local Replica stable-snapshot push', function () {
         assert.strictEqual(vfs.uploadCount, 0);
         assert.strictEqual(internals.syncConflicts.has('/sample.tex'), true);
         assert.ok(hasLine('[push update blocked:remote-delete-restored]'));
+
+        // Accept the Overleaf deletion by deleting the retained local copy.
+        // Conflict creation deliberately removes the ordinary manifest/base
+        // tracking for this path, so the conflict itself must keep the path in
+        // the fallback scan. Otherwise a missed watcher event leaves a durable
+        // conflict whose own instructions ("delete it to accept") do nothing.
+        await vscode.workspace.fs.delete(localSample);
+        assert.strictEqual(await internals.scanLocalChangesWithoutWatcher(internals.syncGeneration), 0);
+        assert.strictEqual(await internals.scanLocalChangesWithoutWatcher(internals.syncGeneration), 1);
+        assert.strictEqual(
+            internals.syncConflicts.has('/sample.tex'),
+            false,
+            outputLines.join('\n'),
+        );
+        assert.strictEqual(internals.syncManifest.conflicts['/sample.tex'], undefined);
+        assert.strictEqual(await pathExists(localSample), false);
+        assert.strictEqual(await pathExists(remoteSample), false);
+    });
+
+    test('a persisted remote-delete conflict accepts a local deletion made while stopped', async () => {
+        const remoteRoot = await tempDir('sr-stable-offline-conflict-remote-');
+        const localRoot = await tempDir('sr-stable-offline-conflict-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
+        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
+        await writeText(remoteSample, 'tombstoned bytes');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+
+        await vscode.workspace.fs.delete(remoteSample);
+        await internals.applySync('pull', 'delete', '/sample.tex', remoteSample, localSample);
+        const tombstone = internals.remoteDeleteTombstones.get('/sample.tex');
+        assert.ok(tombstone);
+        await writeText(localSample, 'tombstoned bytes');
+        await fs.utimes(
+            localSample.fsPath,
+            new Date(tombstone.staleLocalMtime),
+            new Date(tombstone.staleLocalMtime),
+        );
+        const conflict = await internals.applySync(
+            'push',
+            'update',
+            '/sample.tex',
+            localSample,
+            remoteSample,
+        );
+        assert.strictEqual(conflict.outcome, 'blocked');
+        assert.strictEqual(internals.syncConflicts.has('/sample.tex'), true);
+        await scm.deactivate();
+
+        // No watcher exists now. The choice must be recovered from the persisted
+        // conflict plus the changed local revision on the next initialization.
+        await vscode.workspace.fs.delete(localSample);
+        const resumed = createSCM(remoteRoot, localRoot, vfs);
+        await resumed.initializeLocalReplica({preserveExistingLocalFiles: true});
+        const resumedInternals = resumed as any;
+
+        assert.strictEqual(resumedInternals.syncConflicts.has('/sample.tex'), false);
+        assert.strictEqual(resumedInternals.syncManifest.conflicts['/sample.tex'], undefined);
+        assert.strictEqual(await pathExists(localSample), false);
+        assert.strictEqual(await pathExists(remoteSample), false);
+        assert.ok(hasLine('[startup conflict resolved] /sample.tex'));
     });
 
     test('the pull delete refuses when identity could not be acquired for a live target', async () => {
@@ -625,7 +692,7 @@ suite('Local Replica stable-snapshot push', function () {
         assert.strictEqual(internals.syncConflicts.has('/sample.tex'), true);
     });
 
-    test('P0: a same-byte re-creation moments after the delete is not mistaken for the echo', async () => {
+    test('P0: a same-byte re-creation moments after the delete becomes a conflict', async () => {
         const remoteRoot = await tempDir('sr-stable-echo-window-remote-');
         const localRoot = await tempDir('sr-stable-echo-window-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -685,9 +752,46 @@ suite('Local Replica stable-snapshot push', function () {
         );
         assert.strictEqual(await readText(localSample), 'shared bytes');
         assert.ok(!hasLine('[push update suppressed:remote-delete-echo]'));
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(await pathExists(remoteSample), false);
+        assert.strictEqual(vfs.uploadCount, 0);
+        assert.strictEqual(internals.syncConflicts.has('/sample.tex'), true);
+        assert.ok(hasLine('[push update blocked:remote-delete-restored]'));
+    });
+
+    test('a later fresh local creation is pushed after the delete conflict window', async () => {
+        const remoteRoot = await tempDir('sr-stable-late-recreate-remote-');
+        const localRoot = await tempDir('sr-stable-late-recreate-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteSample = vscode.Uri.joinPath(remoteRoot, 'sample.tex');
+        const localSample = vscode.Uri.joinPath(localRoot, 'sample.tex');
+        await writeText(remoteSample, 'deleted revision');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+
+        await vscode.workspace.fs.delete(remoteSample);
+        await internals.applySync('pull', 'delete', '/sample.tex', remoteSample, localSample);
+        await writeText(localSample, 'deliberate later creation');
+        const tombstone = internals.remoteDeleteTombstones.get('/sample.tex');
+        tombstone.deletedAt = Date.now()
+            -(LocalReplicaSCMProvider as any).remoteDeleteConflictWindowMs
+            -1;
+
+        const event = await internals.applySync(
+            'push',
+            'update',
+            '/sample.tex',
+            localSample,
+            remoteSample,
+        ) as Events['scmSyncCompleteEvent'];
+
         assert.strictEqual(event.outcome, 'success');
-        assert.strictEqual(await readText(remoteSample), 'shared bytes');
+        assert.strictEqual(await readText(remoteSample), 'deliberate later creation');
         assert.strictEqual(vfs.uploadCount, 1);
+        assert.strictEqual(internals.syncConflicts.has('/sample.tex'), false);
     });
 
     test('a short read is refused even when every metadata field matches', async () => {
@@ -1744,6 +1848,212 @@ suite('Local Replica stable-snapshot push', function () {
         }
     });
 
+    test('a stable newer revision after the precompile upload blocks compilation', async () => {
+        const remoteRoot = await tempDir('sr-stable-post-upload-remote-');
+        const localRoot = await tempDir('sr-stable-post-upload-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        (LocalReplicaSCMProvider as any).localReadStabilizeRearmMs = 5_000;
+        await writeText(localMain, 'revision uploaded by the barrier');
+
+        const originalApplySync = internals.applySync.bind(scm);
+        let advanced = false;
+        internals.applySync = async (...args: unknown[]) => {
+            const event = await originalApplySync(...args);
+            if (!advanced && args[0]==='push' && args[2]==='/main.tex') {
+                advanced = true;
+                await writeText(localMain, 'agent advanced after the upload');
+            }
+            return event;
+        };
+
+        try {
+            await assert.rejects(
+                () => scm.flushBeforeCompile([localMain]),
+                /still being written/,
+            );
+            assert.strictEqual(advanced, true);
+            assert.strictEqual(await readText(remoteMain), 'revision uploaded by the barrier');
+            assert.strictEqual(await readText(localMain), 'agent advanced after the upload');
+            assert.strictEqual(internals.pendingLocalEvents.has('/main.tex'), true);
+            assert.strictEqual(internals.locallyDivergedPaths.has('/main.tex'), true);
+        } finally {
+            internals.applySync = originalApplySync;
+        }
+    });
+
+    test('a writer that advances during the compile quiet window blocks compilation', async () => {
+        const remoteRoot = await tempDir('sr-stable-quiescence-remote-');
+        const localRoot = await tempDir('sr-stable-quiescence-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        (LocalReplicaSCMProvider as any).localReadStabilizeRearmMs = 5_000;
+        await writeText(localMain, 'revision uploaded before quiet check');
+
+        const originalSleep = internals.sleepForStabilization.bind(scm);
+        let advanced = false;
+        internals.sleepForStabilization = async (ms: number) => {
+            if (!advanced && ms===(LocalReplicaSCMProvider as any).compileQuiescenceMs) {
+                advanced = true;
+                await writeText(localMain, 'agent advanced inside quiet window');
+                return;
+            }
+            return originalSleep(ms);
+        };
+
+        try {
+            await assert.rejects(
+                () => scm.flushBeforeCompile([localMain]),
+                /compile barrier was sealing/,
+            );
+            assert.strictEqual(advanced, true);
+            assert.ok(hasLine('[compile barrier blocked:local-advanced-during-quiescence]'));
+            assert.strictEqual(await readText(remoteMain), 'revision uploaded before quiet check');
+            assert.strictEqual(internals.pendingLocalEvents.has('/main.tex'), true);
+            assert.strictEqual(internals.locallyDivergedPaths.has('/main.tex'), true);
+        } finally {
+            internals.sleepForStabilization = originalSleep;
+        }
+    });
+
+    test('a clean tracked file changed after the source scan blocks compilation', async () => {
+        const remoteRoot = await tempDir('sr-stable-clean-fence-remote-');
+        const localRoot = await tempDir('sr-stable-clean-fence-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const remoteClean = vscode.Uri.joinPath(remoteRoot, 'clean.tex');
+        const localClean = vscode.Uri.joinPath(localRoot, 'clean.tex');
+        await writeText(remoteMain, 'main baseline');
+        await writeText(remoteClean, 'clean baseline');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        (LocalReplicaSCMProvider as any).localReadStabilizeRearmMs = 5_000;
+
+        const originalSleep = internals.sleepForStabilization.bind(scm);
+        let advanced = false;
+        internals.sleepForStabilization = async (ms: number) => {
+            if (!advanced && ms===(LocalReplicaSCMProvider as any).compileQuiescenceMs) {
+                advanced = true;
+                await writeText(localClean, 'agent edit after the first full-tree fence');
+                return;
+            }
+            return originalSleep(ms);
+        };
+
+        try {
+            await assert.rejects(
+                () => scm.flushBeforeCompile([]),
+                /compile barrier was sealing/,
+            );
+            assert.strictEqual(advanced, true);
+            assert.strictEqual(
+                await readText(remoteClean),
+                'clean baseline',
+                'the stale clean-path revision must not be compiled remotely',
+            );
+            assert.strictEqual(internals.pendingLocalEvents.get('/clean.tex').latestType, 'update');
+            assert.strictEqual(internals.locallyDivergedPaths.has('/clean.tex'), true);
+            assert.ok(hasLine('[compile barrier blocked:local-advanced-during-quiescence] /clean.tex'));
+        } finally {
+            internals.sleepForStabilization = originalSleep;
+        }
+    });
+
+    test('a new file created after the source scan blocks compilation', async () => {
+        const remoteRoot = await tempDir('sr-stable-new-fence-remote-');
+        const localRoot = await tempDir('sr-stable-new-fence-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'main baseline');
+        const localLate = vscode.Uri.joinPath(localRoot, 'late-agent.tex');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        (LocalReplicaSCMProvider as any).localReadStabilizeRearmMs = 5_000;
+
+        const originalSleep = internals.sleepForStabilization.bind(scm);
+        let created = false;
+        internals.sleepForStabilization = async (ms: number) => {
+            if (!created && ms===(LocalReplicaSCMProvider as any).compileQuiescenceMs) {
+                created = true;
+                await writeText(localLate, 'created after the source scan');
+                return;
+            }
+            return originalSleep(ms);
+        };
+
+        try {
+            await assert.rejects(
+                () => scm.flushBeforeCompile([]),
+                /compile barrier was sealing/,
+            );
+            assert.strictEqual(created, true);
+            assert.strictEqual(await pathExists(vscode.Uri.joinPath(remoteRoot, 'late-agent.tex')), false);
+            assert.strictEqual(internals.pendingLocalEvents.get('/late-agent.tex').latestType, 'update');
+            assert.strictEqual(internals.locallyDivergedPaths.has('/late-agent.tex'), true);
+        } finally {
+            internals.sleepForStabilization = originalSleep;
+        }
+    });
+
+    test('a clean tracked deletion after the source scan blocks compilation', async () => {
+        const remoteRoot = await tempDir('sr-stable-delete-fence-remote-');
+        const localRoot = await tempDir('sr-stable-delete-fence-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'main baseline');
+        const remoteGone = vscode.Uri.joinPath(remoteRoot, 'gone.tex');
+        const localGone = vscode.Uri.joinPath(localRoot, 'gone.tex');
+        await writeText(remoteGone, 'tracked baseline');
+
+        const vfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, vfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        (LocalReplicaSCMProvider as any).localReadStabilizeRearmMs = 5_000;
+
+        const originalSleep = internals.sleepForStabilization.bind(scm);
+        let deleted = false;
+        internals.sleepForStabilization = async (ms: number) => {
+            if (!deleted && ms===(LocalReplicaSCMProvider as any).compileQuiescenceMs) {
+                deleted = true;
+                await fs.rm(localGone.fsPath);
+                return;
+            }
+            return originalSleep(ms);
+        };
+
+        try {
+            await assert.rejects(
+                () => scm.flushBeforeCompile([]),
+                /compile barrier was sealing/,
+            );
+            assert.strictEqual(deleted, true);
+            assert.strictEqual(await readText(remoteGone), 'tracked baseline');
+            assert.strictEqual(internals.pendingLocalEvents.get('/gone.tex').latestType, 'delete');
+            assert.strictEqual(internals.locallyDivergedPaths.has('/gone.tex'), true);
+        } finally {
+            internals.sleepForStabilization = originalSleep;
+        }
+    });
+
     test('the queued precompile reclassification reports the sentinel, not a missing event', async () => {
         const remoteRoot = await tempDir('sr-stable-queued-remote-');
         const localRoot = await tempDir('sr-stable-queued-local-');
@@ -1893,6 +2203,54 @@ suite('Local Replica stable-snapshot push', function () {
         }
     });
 
+    test('a pull that meets an unstable local read defers to the guarded push path', async () => {
+        const remoteRoot = await tempDir('sr-stable-pull-defer-remote-');
+        const localRoot = await tempDir('sr-stable-pull-defer-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        (LocalReplicaSCMProvider as any).localReadStabilizeRearmMs = 5_000;
+        await writeText(remoteMain, 'remote collaborator edit');
+
+        const originalCapture = internals.captureLocalPathRevision.bind(scm);
+        internals.captureLocalPathRevision = async (relPath: string) => {
+            if (relPath==='/main.tex') {
+                throw new LocalReadUnstableError(
+                    relPath,
+                    'descriptor-changed',
+                    'simulated local writer during pull reconciliation',
+                );
+            }
+            return originalCapture(relPath);
+        };
+
+        try {
+            const event = await internals.applySync(
+                'pull',
+                'update',
+                '/main.tex',
+                remoteMain,
+                localMain,
+                {},
+                internals.syncGeneration,
+            );
+            assert.strictEqual(event.outcome, 'blocked');
+            assert.strictEqual(event.error, LOCAL_SNAPSHOT_UNSTABLE);
+            assert.strictEqual(hasLine('[pull update] /main.tex:'), false);
+            assert.ok(hasLine('[push deferred:unstable-read]'));
+            assert.strictEqual(internals.pendingLocalEvents.has('/main.tex'), true);
+            assert.strictEqual(internals.locallyDivergedPaths.has('/main.tex'), true);
+            assert.deepStrictEqual(warnings, []);
+        } finally {
+            internals.captureLocalPathRevision = originalCapture;
+        }
+    });
+
     test('a replaced inode between snapshot and open is deferred and the retry reads the replacement', async () => {
         const remoteRoot = await tempDir('sr-stable-inode-remote-');
         const localRoot = await tempDir('sr-stable-inode-local-');
@@ -1940,9 +2298,9 @@ suite('Local Replica stable-snapshot push', function () {
         }
     });
 
-    // ------------------------------------------------------- warn policy ----
+    // --------------------------------------------------- deferral policy ----
 
-    test('warns only after a sustained failure and keeps retrying afterwards', async () => {
+    test('keeps sustained agent writes silently deferred and retries afterwards', async () => {
         const remoteRoot = await tempDir('sr-stable-warn-remote-');
         const localRoot = await tempDir('sr-stable-warn-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -1952,7 +2310,6 @@ suite('Local Replica stable-snapshot push', function () {
         const scm = createSCM(remoteRoot, localRoot);
         await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
         const internals = scm as any;
-        (LocalReplicaSCMProvider as any).localReadStabilizeWarnMs = 60;
         (LocalReplicaSCMProvider as any).localReadStabilizeRearmMs = 5_000;
         const generation = internals.syncGeneration;
 
@@ -1962,8 +2319,11 @@ suite('Local Replica stable-snapshot push', function () {
 
         await new Promise(resolve => setTimeout(resolve, 90));
         internals.scheduleLocalPushRetry('/main.tex', localMain, 'unstable-read', generation);
-        assert.strictEqual(warnings.length, 1, 'a sustained failure must warn once');
-        assert.match(warnings[0], /rewritten continuously/);
+        assert.deepStrictEqual(
+            warnings,
+            [],
+            'a long-running writer is a recoverable deferred state, not a sync failure',
+        );
 
         internals.scheduleLocalPushRetry('/main.tex', localMain, 'unstable-read', generation);
         const state = internals.localStabilizeState.get('/main.tex');
@@ -1975,9 +2335,7 @@ suite('Local Replica stable-snapshot push', function () {
         );
         assert.strictEqual(internals.pendingLocalEvents.has('/main.tex'), true);
         assert.strictEqual(internals.locallyDivergedPaths.has('/main.tex'), true);
-        // maybeWarnSyncFailure rate-limits per (path × message), so the extra
-        // deferral must not produce a second toast.
-        assert.strictEqual(warnings.length, 1);
+        assert.deepStrictEqual(warnings, []);
     });
 
     test('stopping sync inputs cancels the pending stabilization retry', async () => {
