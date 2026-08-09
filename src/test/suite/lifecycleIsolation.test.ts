@@ -2056,6 +2056,9 @@ suite('Extension host and lifecycle isolation', () => {
             internals.disposed = false;
             internals.origin = uri.with({path: '/Project'});
             internals.projectName = 'Project';
+            if (senderEventObserved) {
+                internals.publicId = 'source-before';
+            }
             internals.documentWriteQueues = new Map();
             internals.documentCollaboratorRevisions = new Map();
             internals.pendingDocumentWrites = new Map();
@@ -3506,4 +3509,162 @@ suite('Extension host and lifecycle isolation', () => {
         assert.strictEqual(notifications.some(event => event.type===vscode.FileChangeType.Changed), true);
     });
 
+    test('replays a disconnected in-flight OT with official duplicate source IDs', async () => {
+        const uri = vscode.Uri.parse(
+            'semantic-researcher-overleaf://www.overleaf.com/Project/main.tex' +
+            '?user=user-1&project=project-1',
+        );
+        const desired = 'base\nlocal\n';
+        const document = {
+            _id: 'doc-duplicate-replay',
+            name: 'main.tex',
+            version: 70,
+            lastVersion: 69,
+            localCache: 'base\n',
+            remoteCache: 'base\n',
+        };
+        const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
+        const internals = vfs as any;
+        attachAuthenticatedSession(internals);
+        const attempts: any[] = [];
+        const server = {content: 'base\n', version: 70};
+        let reconnects = 0;
+        internals.disposed = false;
+        internals.origin = uri.with({path: '/Project'});
+        internals.projectName = 'Project';
+        internals.publicId = 'source-before';
+        internals._connectionState = 'connected';
+        internals.documentWriteQueues = new Map();
+        internals.documentCollaboratorRevisions = new Map();
+        internals.pendingDocumentWrites = new Map();
+        internals.documentInDoubtSenderVersions = new Map();
+        internals.ensureConnectedForWrite = async () => undefined;
+        internals.reconnect = async () => {
+            reconnects += 1;
+            internals.publicId = 'source-after';
+            internals._connectionState = 'connected';
+            return {};
+        };
+        internals._resolveUri = async () => ({fileType: 'doc', fileEntity: document});
+        internals._resolveById = () => ({fileEntity: document, path: '/main.tex'});
+        internals.notify = () => undefined;
+        internals.socket = {
+            needsReinit: false,
+            isUsingAlternativeConnectionScheme: false,
+            applyOtUpdate: async (_docId: string, update: any) => {
+                attempts.push(update);
+                if (attempts.length===1) {
+                    internals._connectionState = 'reconnecting';
+                    throw new Error('timeout');
+                }
+                assert.deepStrictEqual(
+                    [...(update.dupIfSource ?? [])].sort(),
+                    ['source-after', 'source-before'],
+                );
+                const appliedVersion = server.version;
+                server.content = desired;
+                server.version += 1;
+                internals.applyRemoteDocumentUpdate({
+                    doc: document._id,
+                    v: appliedVersion,
+                });
+            },
+            joinDoc: async () => assert.fail('A sender acknowledgement should avoid a snapshot read.'),
+        };
+
+        const written = await vfs.writeFileFromRemoteBaseline(
+            uri,
+            new TextEncoder().encode(desired),
+            new TextEncoder().encode('base\n'),
+        );
+
+        assert.strictEqual(new TextDecoder().decode(written), desired);
+        assert.strictEqual(reconnects, 1);
+        assert.strictEqual(attempts.length, 2);
+        assert.strictEqual(attempts[0].dupIfSource, undefined);
+        assert.deepStrictEqual(attempts[0].op, attempts[1].op);
+        assert.strictEqual(document.remoteCache, desired);
+        assert.strictEqual(internals.documentInDoubtSenderVersions.has(document._id), false);
+    });
+    test('confirms a duplicate OT rejection through authoritative readback', async () => {
+        const uri = vscode.Uri.parse(
+            'semantic-researcher-overleaf://www.overleaf.com/Project/main.tex' +
+            '?user=user-1&project=project-1',
+        );
+        const desired = 'base\nlocal\n';
+        const document = {
+            _id: 'doc-duplicate-readback',
+            name: 'main.tex',
+            version: 80,
+            lastVersion: 79,
+            localCache: 'base\n',
+            remoteCache: 'base\n',
+        };
+        const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
+        const internals = vfs as any;
+        attachAuthenticatedSession(internals);
+        const attempts: any[] = [];
+        const server = {content: 'base\n', version: 80};
+        const joinVersions: Array<number | undefined> = [];
+        internals.disposed = false;
+        internals.origin = uri.with({path: '/Project'});
+        internals.projectName = 'Project';
+        internals.publicId = 'source-before';
+        internals._connectionState = 'connected';
+        internals.documentJoinQueue = Promise.resolve();
+        internals.documentWriteQueues = new Map();
+        internals.documentCollaboratorRevisions = new Map();
+        internals.pendingDocumentWrites = new Map();
+        internals.documentInDoubtSenderVersions = new Map();
+        internals.ensureConnectedForWrite = async () => undefined;
+        internals.reconnect = async () => {
+            internals.publicId = 'source-after';
+            internals._connectionState = 'connected';
+            return {};
+        };
+        internals._resolveUri = async () => ({fileType: 'doc', fileEntity: document});
+        internals._resolveById = () => ({fileEntity: document, path: '/main.tex'});
+        internals.notify = () => undefined;
+        internals.socket = {
+            needsReinit: false,
+            isUsingAlternativeConnectionScheme: false,
+            applyOtUpdate: async (_docId: string, update: any) => {
+                attempts.push(update);
+                if (attempts.length===1) {
+                    server.content = desired;
+                    server.version += 1;
+                    internals._connectionState = 'reconnecting';
+                    throw new Error('timeout');
+                }
+                assert.deepStrictEqual(
+                    [...(update.dupIfSource ?? [])].sort(),
+                    ['source-after', 'source-before'],
+                );
+                throw new Error('Op already submitted');
+            },
+            joinDoc: async (_docId: string, fromVersion?: number) => {
+                joinVersions.push(fromVersion);
+                return {
+                    docLines: server.content.split('\n'),
+                    version: server.version,
+                    updates: [],
+                    type: 'sharejs-text-ot',
+                };
+            },
+        };
+
+        const written = await vfs.writeFileFromRemoteBaseline(
+            uri,
+            new TextEncoder().encode(desired),
+            new TextEncoder().encode('base\n'),
+        );
+
+        assert.strictEqual(new TextDecoder().decode(written), desired);
+        assert.strictEqual(attempts.length, 2);
+        assert.deepStrictEqual(joinVersions, [undefined]);
+        assert.strictEqual(document.version, server.version);
+        assert.strictEqual(document.remoteCache, desired);
+        assert.strictEqual(internals.pendingDocumentWrites.has(document._id), false);
+        assert.strictEqual(internals.documentInDoubtSenderVersions.has(document._id), false);
+    });
 });

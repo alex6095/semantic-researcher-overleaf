@@ -29,6 +29,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Treat an official `otUpdateError` as an explicit failed text write: discard
   the cache, verify against a full authoritative snapshot, and retain local
   intent as a conflict rather than report the save as successful.
+- Replay a source-identified OT update once after a timeout or lost transport
+  with Overleaf's `dupIfSource` safeguard. A repeated server rejection is
+  confirmed through an authoritative snapshot; missing source identity,
+  observed sender acknowledgements, and explicit errors are never replayed.
 
 ### Planned
 - Make Overleaf the explicit canonical project state while treating the selected

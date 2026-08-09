@@ -155,6 +155,7 @@ interface PendingDocumentWrite {
     collaboratorRevision: number;
     requiresAuthoritativeReconciliation: boolean;
     appliedVersion?: number;
+    submittedSourceIds: string[];
     rejectedError?: RemoteDocumentWriteAmbiguousError;
     applied: Promise<number | undefined>;
     resolveApplied: (version?: number) => void;
@@ -1182,6 +1183,63 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    private canReplayInFlightDocumentUpdate(
+        acknowledgementError: unknown,
+        pending: PendingDocumentWrite,
+    ): boolean {
+        // `dupIfSource` is proof-based: without the source identity of the
+        // original submission, repeating an uncertain OT could duplicate user
+        // text. Explicit server rejections are never replayed.
+        if (
+            pending.rejectedError!==undefined
+            || pending.appliedVersion!==undefined
+            || pending.submittedSourceIds.length===0
+            || !(acknowledgementError instanceof Error)
+        ) {
+            return false;
+        }
+        return acknowledgementError.message==='timeout'
+            || this.connectionState!=='connected'
+            || this.socket.needsReinit;
+    }
+
+    private async replayInFlightDocumentUpdate(
+        uri: vscode.Uri,
+        update: UpdateSchema,
+        pending: PendingDocumentWrite,
+    ): Promise<unknown | undefined> {
+        try {
+            if (pending.rejectedError!==undefined) {
+                return pending.rejectedError;
+            }
+            // A fresh project join supplies the new public id. The original
+            // id remains in the set so the server can recognize an update it
+            // accepted just before the old transport disappeared.
+            if (this.connectionState!=='connected' || this.socket.needsReinit) {
+                await this.reconnect(`retry in-flight document update ${uri.path}`);
+            }
+            this.requireCurrentSession();
+            const duplicateSources = Array.from(new Set([
+                ...pending.submittedSourceIds,
+                ...(this.publicId ? [this.publicId] : []),
+            ]));
+            if (duplicateSources.length===0) {
+                return new RemoteDocumentWriteAmbiguousError(
+                    `Overleaf did not provide a source identity for ${uri.path}.`,
+                );
+            }
+            pending.submittedSourceIds = duplicateSources;
+            await this.socket.applyOtUpdate(update.doc, {
+                ...update,
+                dupIfSource: duplicateSources,
+            });
+            this.requireCurrentSession();
+            return undefined;
+        } catch (error) {
+            return error;
+        }
+    }
+
     private documentRefreshTargets(doc: DocumentEntity): DocumentEntity[] {
         const live = this._resolveById(doc._id)?.fileEntity as DocumentEntity | undefined;
         // A rejoin swaps the whole entity graph, so the caller may be holding a
@@ -1780,6 +1838,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             collaboratorRevision: this.documentCollaboratorRevisions.get(doc._id) ?? 0,
             requiresAuthoritativeReconciliation:
                 (this.documentInDoubtSenderVersions.get(doc._id)?.length ?? 0)>0,
+            submittedSourceIds: this.publicId ? [this.publicId] : [],
             applied: new Promise<number | undefined>(resolve => {
                 resolveApplied = resolve;
             }),
@@ -1804,6 +1863,13 @@ export class VirtualFileSystem extends vscode.Disposable {
                 acknowledgementError = error;
             }
 
+            if (this.canReplayInFlightDocumentUpdate(acknowledgementError, pending)) {
+                acknowledgementError = await this.replayInFlightDocumentUpdate(
+                    uri,
+                    update,
+                    pending,
+                );
+            }
             alternativeWriteAccepted = acknowledgementError===undefined
                 && this.socket.isUsingAlternativeConnectionScheme;
             const appliedVersion = alternativeWriteAccepted

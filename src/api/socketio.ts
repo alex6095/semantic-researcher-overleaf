@@ -49,6 +49,9 @@ export interface UpdateSchema {
     v: number, //doc version number
     lastV?: number, //last version number
     hash?: string, //(not needed if lastV is provided)
+    // Official ShareJS server-side duplicate suppression. This lists source
+    // IDs that may already have submitted the same logical operation.
+    dupIfSource?: string[],
     meta?: {
         source: string, //socketio client id
         ts: number, //unix timestamp
