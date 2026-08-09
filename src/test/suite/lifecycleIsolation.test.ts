@@ -3275,4 +3275,127 @@ suite('Extension host and lifecycle isolation', () => {
         );
         assert.strictEqual(parse([{unexpected: true}]), undefined);
     });
+
+    test('uses the official versioned joinDoc protocol when a document cache exists', async () => {
+        const socket = Object.create(SocketIOAPI.prototype) as SocketIOAPI;
+        const calls: unknown[][] = [];
+        (socket as any).emit = async (...args: unknown[]) => {
+            calls.push(args);
+            return [['plain'], 8, [], {}, 'sharejs-text-ot'];
+        };
+
+        const caughtUp = await socket.joinDoc('doc-1', 6);
+        assert.strictEqual(caughtUp.version, 8);
+        assert.deepStrictEqual(caughtUp.docLines, ['plain']);
+        assert.deepStrictEqual(calls, [[
+            'joinDoc',
+            'doc-1',
+            6,
+            {encodeRanges: true},
+        ]]);
+
+        await socket.joinDoc('doc-1');
+        assert.deepStrictEqual(calls[1], [
+            'joinDoc',
+            'doc-1',
+            {encodeRanges: true},
+        ]);
+    });
+
+    test('applies a verified versioned joinDoc catch-up to the authoritative cache', async () => {
+        const uri = vscode.Uri.parse(
+            'semantic-researcher-overleaf://www.overleaf.com/Project/main.tex?user=user-1&project=project-1',
+        );
+        const document = {
+            _id: 'doc-catch-up',
+            name: 'main.tex',
+            version: 4,
+            localCache: 'Hello',
+            remoteCache: 'Hello',
+        };
+        const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
+        const internals = vfs as any;
+        internals.disposed = false;
+        internals.documentJoinQueue = Promise.resolve();
+        internals.documentCollaboratorRevisions = new Map();
+        internals._connectionState = 'connected';
+        internals.requireCurrentSession = () => ({});
+        internals._resolveById = () => ({fileEntity: document});
+        const notifications: vscode.FileChangeEvent[] = [];
+        internals.notify = (events: vscode.FileChangeEvent[]) => notifications.push(...events);
+        internals.isDirty = false;
+        const joinVersions: Array<number | undefined> = [];
+        internals.socket = {
+            joinDoc: async (_docId: string, fromVersion?: number) => {
+                joinVersions.push(fromVersion);
+                return {
+                    docLines: ['ignored full snapshot'],
+                    version: 6,
+                    updates: [
+                        {doc: document._id, v: 4, op: [{p: 5, i: ' world'}]},
+                        {doc: document._id, v: 5, op: [{p: 6, d: 'world'}, {p: 6, i: 'Overleaf'}]},
+                    ],
+                    type: 'sharejs-text-ot',
+                };
+            },
+        };
+
+        const content = await internals.refreshDocumentFromServer(uri, document);
+        assert.strictEqual(new TextDecoder().decode(content), 'Hello Overleaf');
+        assert.strictEqual(document.version, 6);
+        assert.strictEqual(document.remoteCache, 'Hello Overleaf');
+        assert.deepStrictEqual(joinVersions, [4]);
+        assert.strictEqual(notifications.length, 1);
+    });
+
+    test('falls back to a full joinDoc snapshot when catch-up operations are incomplete', async () => {
+        const uri = vscode.Uri.parse(
+            'semantic-researcher-overleaf://www.overleaf.com/Project/main.tex?user=user-1&project=project-1',
+        );
+        const document = {
+            _id: 'doc-catch-up-fallback',
+            name: 'main.tex',
+            version: 7,
+            localCache: 'base',
+            remoteCache: 'base',
+        };
+        const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
+        const internals = vfs as any;
+        internals.disposed = false;
+        internals.documentJoinQueue = Promise.resolve();
+        internals.documentCollaboratorRevisions = new Map();
+        internals._connectionState = 'connected';
+        internals.requireCurrentSession = () => ({});
+        internals._resolveById = () => ({fileEntity: document});
+        internals.notify = () => undefined;
+        const joinVersions: Array<number | undefined> = [];
+        internals.socket = {
+            joinDoc: async (_docId: string, fromVersion?: number) => {
+                joinVersions.push(fromVersion);
+                if (fromVersion!==undefined) {
+                    return {
+                        docLines: ['stale full snapshot'],
+                        version: 9,
+                        updates: [
+                            {doc: document._id, v: 7, op: [{p: 4, i: ' remote'}]},
+                        ],
+                        type: 'sharejs-text-ot',
+                    };
+                }
+                return {
+                    docLines: ['canonical', 'snapshot'],
+                    version: 9,
+                    updates: [],
+                    type: 'sharejs-text-ot',
+                };
+            },
+        };
+
+        const content = await internals.refreshDocumentFromServer(uri, document);
+        assert.strictEqual(new TextDecoder().decode(content), 'canonical\nsnapshot');
+        assert.strictEqual(document.version, 9);
+        assert.strictEqual(document.remoteCache, 'canonical\nsnapshot');
+        assert.deepStrictEqual(joinVersions, [7, undefined]);
+    });
+
 });

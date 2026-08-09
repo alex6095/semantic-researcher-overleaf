@@ -1154,6 +1154,7 @@ export class VirtualFileSystem extends vscode.Disposable {
     private async refreshDocumentFromServer(
         uri: vscode.Uri,
         doc: DocumentEntity,
+        forceFullSnapshot = false,
     ): Promise<Uint8Array> {
         let releaseTurn!: () => void;
         const previousTurn = this.documentJoinQueue;
@@ -1162,18 +1163,85 @@ export class VirtualFileSystem extends vscode.Disposable {
         });
         await previousTurn;
         try {
-            // This method is also the proof step after an ambiguous OT write.
-            // A populated remoteCache may predate that write, so every caller
-            // must perform the serialized authoritative join.
-            return await this.refreshDocumentFromServerNow(uri, doc);
+            // A proof step after an ambiguous OT write cannot trust the cached
+            // revision even when its version matches the server. Ordinary
+            // subscribed refreshes may safely use the versioned OT catch-up.
+            return await this.refreshDocumentFromServerNow(uri, doc, forceFullSnapshot);
         } finally {
             releaseTurn();
         }
     }
 
+    private applyJoinDocCatchUp(
+        uri: vscode.Uri,
+        doc: DocumentEntity,
+        response: {version: number; updates?: UpdateSchema[]; type?: string},
+    ): Uint8Array | undefined {
+        const startingVersion = doc.version;
+        const startingContent = doc.remoteCache;
+        const updates = response.updates ?? [];
+        if (
+            startingVersion===undefined
+            || startingContent===undefined
+            || response.version<startingVersion
+            || (response.type!==undefined && response.type!=='sharejs-text-ot')
+        ) {
+            return undefined;
+        }
+
+        let content = startingContent;
+        let expectedVersion = startingVersion;
+        for (const update of updates) {
+            if (
+                (update.doc!==undefined && update.doc!==doc._id)
+                || (update.v!==undefined && update.v!==expectedVersion)
+                || !Array.isArray(update.op)
+                || update.op.length===0
+            ) {
+                return undefined;
+            }
+            for (const operation of update.op) {
+                if (
+                    !Number.isSafeInteger(operation.p)
+                    || operation.p<0
+                    || operation.p>content.length
+                    || (operation.i!==undefined && operation.d!==undefined)
+                ) {
+                    return undefined;
+                }
+                if (typeof operation.i==='string') {
+                    content = content.slice(0, operation.p) + operation.i + content.slice(operation.p);
+                } else if (typeof operation.d==='string') {
+                    const deleted = Buffer.from(operation.d, 'ascii').toString('utf-8');
+                    if (content.slice(operation.p, operation.p+deleted.length)!==deleted) {
+                        return undefined;
+                    }
+                    content = content.slice(0, operation.p) + content.slice(operation.p+deleted.length);
+                } else {
+                    return undefined;
+                }
+            }
+            expectedVersion += 1;
+        }
+        if (expectedVersion!==response.version) {
+            return undefined;
+        }
+        for (const target of this.documentRefreshTargets(doc)) {
+            target.version = response.version;
+            target.remoteCache = content;
+            target.localCache = content;
+        }
+        this.isDirty = true;
+        if (content!==startingContent) {
+            this.notify([{type: vscode.FileChangeType.Changed, uri}]);
+        }
+        return new TextEncoder().encode(content);
+    }
+
     private async refreshDocumentFromServerNow(
         uri: vscode.Uri,
         doc: DocumentEntity,
+        forceFullSnapshot = false,
     ): Promise<Uint8Array> {
         // `joinDoc` is only answered by a socket that has already joined the
         // project. Dispatching it into a socket that is still (re)joining never
@@ -1185,9 +1253,19 @@ export class VirtualFileSystem extends vscode.Disposable {
             await this.reconnect(`join document ${uri.path}`);
         }
         this.requireCurrentSession();
+        // Match the official editor: when we still hold a subscribed text
+        // revision, ask the real-time service for the exact operations since
+        // that revision. A malformed, unavailable, or non-text catch-up is
+        // never applied speculatively; retry once with a full snapshot.
+        let requireFullSnapshot = forceFullSnapshot;
         for (let attempt = 0; attempt<3; attempt++) {
             const collaboratorRevision = this.documentCollaboratorRevisions.get(doc._id) ?? 0;
-            const response = await this.socket.joinDoc(doc._id);
+            const fromVersion = !requireFullSnapshot
+                && doc.version!==undefined
+                && doc.remoteCache!==undefined
+                ? doc.version
+                : undefined;
+            const response = await this.socket.joinDoc(doc._id, fromVersion);
             this.requireCurrentSession();
             if (
                 (this.documentCollaboratorRevisions.get(doc._id) ?? 0)
@@ -1196,6 +1274,15 @@ export class VirtualFileSystem extends vscode.Disposable {
                 continue;
             }
             if (doc.version!==undefined && doc.version>response.version) {
+                requireFullSnapshot = true;
+                continue;
+            }
+            if (fromVersion!==undefined) {
+                const caughtUp = this.applyJoinDocCatchUp(uri, doc, response);
+                if (caughtUp!==undefined) {
+                    return caughtUp;
+                }
+                requireFullSnapshot = true;
                 continue;
             }
             const content = response.docLines.join('\n');
@@ -1710,7 +1797,7 @@ export class VirtualFileSystem extends vscode.Disposable {
             } else {
                 let authoritative: Uint8Array;
                 try {
-                    authoritative = await this.refreshDocumentFromServer(uri, doc);
+                    authoritative = await this.refreshDocumentFromServer(uri, doc, true);
                 } catch (error) {
                     doc.remoteCache = undefined;
                     doc.localCache = undefined;

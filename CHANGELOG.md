@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   indicator and tooltip. A known unavailable connection retains local intent
   quietly instead of presenting a sync-failure notification.
 
+- Match Overleaf's versioned `joinDoc` catch-up protocol for cached subscribed
+  text. A returned operation sequence must validate exactly; otherwise the
+  extension discards it and obtains a full authoritative snapshot.
+
 ### Planned
 - Make Overleaf the explicit canonical project state while treating the selected
   local folder as a durable working copy and queue of pending local intent.

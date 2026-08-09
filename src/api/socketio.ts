@@ -56,6 +56,14 @@ export interface UpdateSchema {
     }
 }
 
+export interface JoinDocumentResponse {
+    docLines: string[],
+    version: number,
+    updates: UpdateSchema[],
+    ranges: any,
+    type?: string,
+}
+
 export interface EventsHandler {
     onFileCreated?: (parentFolderId:string, type:FileType, entity:FileEntity) => void,
     onFileRenamed?: (entityId:string, newName:string) => void,
@@ -596,12 +604,26 @@ export class SocketIOAPI {
      * @param {string} docId - The document id.
      * @returns {Promise}
      */
-    async joinDoc(docId:string) {
-        return this.emit('joinDoc', docId, { encodeRanges: true })
-            .then((returns: [Array<string>, number, Array<any>, any]) => {
-                const [docLinesAscii, version, updates, ranges] = returns;
+    async joinDoc(
+        docId:string,
+        fromVersion?: number,
+    ): Promise<JoinDocumentResponse> {
+        // The official editor requests the known document version when it has
+        // a subscribed cache. The server then returns only the retained OT
+        // operations necessary to catch up, while a first join remains the
+        // legacy two-argument request for full compatibility.
+        // Do not advertise history OT support: this extension validates only
+        // sharejs-text-ot operations, so the server must reject an unsupported
+        // history document instead of sending an unsafe wire representation.
+        const options = {encodeRanges: true};
+        const request = fromVersion===undefined || fromVersion<0
+            ? this.emit('joinDoc', docId, options)
+            : this.emit('joinDoc', docId, fromVersion, options);
+        return request
+            .then((returns: [Array<string>, number, Array<UpdateSchema>?, any?, string?]) => {
+                const [docLinesAscii, version, updates = [], ranges, type] = returns;
                 const docLines = docLinesAscii.map((line) => decodePackedUtf8(line));
-                return {docLines, version, updates, ranges};
+                return {docLines, version, updates, ranges, type};
             });
     }
 
