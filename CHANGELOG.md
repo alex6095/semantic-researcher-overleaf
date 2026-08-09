@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.1] - Unreleased
+
+### Planned
+- Make Overleaf the explicit canonical project state while treating the selected
+  local folder as a durable working copy and queue of pending local intent.
+- Reconcile text through current-revision OT and file/tree changes through
+  guarded project-entity transactions, with a human-reviewable conflict path
+  whenever a safe automatic result cannot be proven.
+- Add an offline queue status and conflict-resolution UX that preserves both
+  copies rather than relying on event timing or a last-writer-wins policy.
+
 ## [0.16.0] - 2026-08-06
 
 First release published to the VS Marketplace since 0.15.28 (Remote Pack
