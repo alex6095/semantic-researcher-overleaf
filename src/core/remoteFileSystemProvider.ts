@@ -2,7 +2,7 @@
 import * as vscode from 'vscode';
 import DiffMatchPatch = require('diff-match-patch');
 import { BaseAPI, Identity, MemberEntity, ProjectSettingsSchema } from '../api/base';
-import { SocketIOAPI, UpdateSchema } from '../api/socketio';
+import { OtUpdateErrorSchema, SocketIOAPI, UpdateSchema } from '../api/socketio';
 import { OUTPUT_FOLDER_NAME, PREFETCH_COMMAND, ROOT_NAME } from '../consts';
 import { GlobalStateManager } from '../utils/globalStateManager';
 import { ClientManager } from '../collaboration/clientManager';
@@ -155,6 +155,7 @@ interface PendingDocumentWrite {
     collaboratorRevision: number;
     requiresAuthoritativeReconciliation: boolean;
     appliedVersion?: number;
+    rejectedError?: RemoteDocumentWriteAmbiguousError;
     applied: Promise<number | undefined>;
     resolveApplied: (version?: number) => void;
 }
@@ -895,6 +896,10 @@ export class VirtualFileSystem extends vscode.Disposable {
                 if (!this.acceptRemoteEvent()) { return; }
                 this.applyRemoteDocumentUpdate(update);
             },
+            onOtUpdateError: (error, message) => {
+                if (!this.acceptRemoteEvent()) { return; }
+                this.applyRemoteDocumentUpdateError(error, message);
+            },
             onSpellCheckLanguageUpdated: (language:string) => {
                 if (!this.acceptRemoteEvent()) { return; }
                 if (this.root) {
@@ -1100,6 +1105,40 @@ export class VirtualFileSystem extends vscode.Disposable {
                 uri: this.pathToUri(res.path),
             }]);
         }
+    }
+
+    private applyRemoteDocumentUpdateError(
+        error: unknown,
+        message?: OtUpdateErrorSchema,
+    ): void {
+        const docId = message?.doc_id;
+        if (typeof docId!=='string' || docId==='') { return; }
+        const res = this._resolveById(docId);
+        if (res===undefined || res.fileType!=='doc') { return; }
+
+        const detail = error instanceof Error
+            ? error.message
+            : typeof error==='string'
+                ? error
+                : message?.error ?? 'unknown Overleaf OT update error';
+        const rejection = new RemoteDocumentWriteAmbiguousError(
+            `Overleaf rejected the document update for ${res.path}: ${detail}`,
+        );
+        const doc = res.fileEntity as DocumentEntity;
+        const pending = this.pendingDocumentWrites.get(docId);
+        if (pending) {
+            pending.rejectedError = rejection;
+            pending.resolveApplied();
+        }
+
+        this.preserveDocumentBaseline(doc);
+        doc.remoteCache = undefined;
+        doc.localCache = undefined;
+        this.isDirty = true;
+        this.notify([{
+            type: vscode.FileChangeType.Changed,
+            uri: this.pathToUri(res.path),
+        }]);
     }
 
     private async enqueueDocumentWrite<T>(docId: string, task: () => Promise<T>): Promise<T> {
@@ -1767,8 +1806,6 @@ export class VirtualFileSystem extends vscode.Disposable {
 
             alternativeWriteAccepted = acknowledgementError===undefined
                 && this.socket.isUsingAlternativeConnectionScheme;
-            acknowledgementWasExplicitlyRejected = acknowledgementError instanceof Error
-                && acknowledgementError.message!=='timeout';
             const appliedVersion = alternativeWriteAccepted
                 ? submittedVersion
                 : await this.waitForDocumentApplied(
@@ -1778,6 +1815,11 @@ export class VirtualFileSystem extends vscode.Disposable {
                         ? VirtualFileSystem.documentAppliedTimeoutMs
                         : 0,
                 );
+            if (pending.rejectedError!==undefined) {
+                acknowledgementError = pending.rejectedError;
+            }
+            acknowledgementWasExplicitlyRejected = acknowledgementError instanceof Error
+                && acknowledgementError.message!=='timeout';
             const collaboratorRevision = this.documentCollaboratorRevisions.get(doc._id) ?? 0;
             const canUseSubmittedResult = alternativeWriteAccepted
                 || (

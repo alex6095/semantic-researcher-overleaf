@@ -3398,4 +3398,112 @@ suite('Extension host and lifecycle isolation', () => {
         assert.deepStrictEqual(joinVersions, [7, undefined]);
     });
 
+    test('routes otUpdateError document metadata through SocketIO listeners', () => {
+        const socket = Object.create(SocketIOAPI.prototype) as SocketIOAPI;
+        const internals = socket as any;
+        const listeners = new Map<string, (...args: any[]) => void>();
+        internals._handlers = [];
+        internals.addSocketListener = (event: string, listener: (...args: any[]) => void) => {
+            listeners.set(event, listener);
+        };
+        internals.removeSocketListener = (event: string, listener: (...args: any[]) => void) => {
+            if (listeners.get(event)===listener) { listeners.delete(event); }
+        };
+
+        let receivedError: unknown;
+        let receivedDocId: string | undefined;
+        const disposable = socket.updateEventHandlers({
+            onOtUpdateError: (error, metadata) => {
+                receivedError = error;
+                receivedDocId = metadata?.doc_id;
+            },
+        });
+        const listener = listeners.get('otUpdateError');
+        assert.ok(listener);
+        // Overleaf's socket payload uses this snake_case wire key.
+        // eslint-disable-next-line @typescript-eslint/naming-convention
+        listener!('update is too large', {doc_id: 'doc-error'});
+
+        assert.strictEqual(receivedError, 'update is too large');
+        assert.strictEqual(receivedDocId, 'doc-error');
+        disposable.dispose();
+        assert.strictEqual(listeners.has('otUpdateError'), false);
+    });
+
+    test('fails closed when Overleaf emits otUpdateError for a pending text write', async () => {
+        const uri = vscode.Uri.parse(
+            'semantic-researcher-overleaf://www.overleaf.com/Project/main.tex?user=user-1&project=project-1',
+        );
+        const document = {
+            _id: 'doc-ot-update-error',
+            name: 'main.tex',
+            version: 30,
+            lastVersion: 29,
+            localCache: 'title: base\n',
+            remoteCache: 'title: base\n',
+        };
+        const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
+        const internals = vfs as any;
+        attachAuthenticatedSession(internals);
+        internals.disposed = false;
+        internals.origin = uri.with({path: '/Project'});
+        internals.projectName = 'Project';
+        internals.documentWriteQueues = new Map();
+        internals.documentCollaboratorRevisions = new Map();
+        internals.pendingDocumentWrites = new Map();
+        internals.documentInDoubtSenderVersions = new Map();
+        internals.ensureConnectedForWrite = async () => undefined;
+        internals._resolveUri = async () => ({fileType: 'doc', fileEntity: document});
+        internals._resolveById = (id: string) => id===document._id
+            ? {fileEntity: document, fileType: 'doc', path: '/main.tex'}
+            : undefined;
+        const notifications: vscode.FileChangeEvent[] = [];
+        internals.notify = (events: vscode.FileChangeEvent[]) => notifications.push(...events);
+
+        // Overleaf's socket metadata retains its public snake_case field name.
+        // eslint-disable-next-line @typescript-eslint/naming-convention
+        let onOtUpdateError: ((error: unknown, message?: {doc_id?: string; error?: string}) => void) | undefined;
+        let joinCount = 0;
+        internals.socket = {
+            updateEventHandlers: (handlers: any) => {
+                onOtUpdateError = handlers.onOtUpdateError;
+                return new vscode.Disposable(() => undefined);
+            },
+            applyOtUpdate: async () => {
+                if (!onOtUpdateError) { throw new Error('otUpdateError listener was not registered'); }
+                onOtUpdateError('update is too large', {
+                    // eslint-disable-next-line @typescript-eslint/naming-convention
+                    doc_id: document._id,
+                    error: 'update is too large',
+                });
+            },
+            joinDoc: async () => {
+                joinCount += 1;
+                return {
+                    docLines: ['title: base', ''],
+                    version: 30,
+                    updates: [],
+                    type: 'sharejs-text-ot',
+                };
+            },
+        };
+        internals.remoteWatch();
+
+        await assert.rejects(
+            () => vfs.writeFileFromRemoteBaseline(
+                uri,
+                new TextEncoder().encode('title: local\n'),
+                new TextEncoder().encode('title: base\n'),
+            ),
+            RemoteDocumentWriteAmbiguousError,
+        );
+
+        assert.strictEqual(joinCount, 1);
+        assert.strictEqual(document.remoteCache, 'title: base\n');
+        assert.strictEqual(document.localCache, 'title: base\n');
+        assert.strictEqual(internals.pendingDocumentWrites.has(document._id), false);
+        assert.strictEqual(internals.documentInDoubtSenderVersions.has(document._id), false);
+        assert.strictEqual(notifications.some(event => event.type===vscode.FileChangeType.Changed), true);
+    });
+
 });

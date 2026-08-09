@@ -56,6 +56,12 @@ export interface UpdateSchema {
     }
 }
 
+export interface OtUpdateErrorSchema {
+    doc_id?: string,
+    project_id?: string,
+    error?: string,
+}
+
 export interface JoinDocumentResponse {
     docLines: string[],
     version: number,
@@ -70,6 +76,7 @@ export interface EventsHandler {
     onFileRemoved?: (entityId:string) => void,
     onFileMoved?: (entityId:string, newParentFolderId:string) => void,
     onFileChanged?: (update:UpdateSchema) => void,
+    onOtUpdateError?: (error: unknown, message?: OtUpdateErrorSchema) => void,
     //
     onDisconnected?: () => void,
     onConnectionAccepted?: (publicId:string) => void,
@@ -471,6 +478,11 @@ export class SocketIOAPI {
                 case handlers.onFileChanged:
                     addSocketListener('otUpdateApplied', (update: UpdateSchema) => {
                         handler(update);
+                    });
+                    break;
+                case handlers.onOtUpdateError:
+                    addSocketListener('otUpdateError', (error: unknown, message?: OtUpdateErrorSchema) => {
+                        handler(error, message);
                     });
                     break;
                 case handlers.onDisconnected:

@@ -26,6 +26,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Match Overleaf's versioned `joinDoc` catch-up protocol for cached subscribed
   text. A returned operation sequence must validate exactly; otherwise the
   extension discards it and obtains a full authoritative snapshot.
+- Treat an official `otUpdateError` as an explicit failed text write: discard
+  the cache, verify against a full authoritative snapshot, and retain local
+  intent as a conflict rather than report the save as successful.
 
 ### Planned
 - Make Overleaf the explicit canonical project state while treating the selected
