@@ -189,11 +189,19 @@ export class VirtualFileSystem extends vscode.Disposable {
     private readonly documentCollaboratorRevisions = new Map<string, number>();
     private readonly pendingDocumentWrites = new Map<string, PendingDocumentWrite>();
     private readonly documentInDoubtSenderVersions = new Map<string, number[]>();
+    // Real-time delivery may briefly reorder operations for one document. Keep
+    // only bounded, unapplied operation messages; acknowledgements are never
+    // inferred from this queue.
+    private queuedRemoteDocumentUpdates?: Map<string, UpdateSchema[]>;
+    private queuedRemoteDocumentUpdateTimers?: Map<string, ReturnType<typeof setTimeout>>;
     private readonly sessionIdentity: Identity;
     private disposed = false;
     private restorePersistedSCMsOnManagerCreation = true;
     private static readonly documentAppliedTimeoutMs = 5000;
+    private static readonly maxQueuedRemoteDocumentVersionGap = 4;
     private static readonly maxInDoubtSenderVersions = 8;
+    private static readonly maxQueuedRemoteDocumentUpdates = 32;
+    private static readonly queuedRemoteDocumentUpdateTimeoutMs = 5000;
     // Real pauses between reconnect attempts: without them a two second blip
     // burns the whole 3-strike budget in milliseconds and pops a modal, while a
     // failing project join hammers the server with no pause at all.
@@ -258,6 +266,11 @@ export class VirtualFileSystem extends vscode.Disposable {
             // leaks and, on a reused entity id, steals a later write's ack.
             this.documentInDoubtSenderVersions.clear();
             this.documentMergeBaselines?.clear();
+            for (const timer of this.queuedRemoteDocumentUpdateTimers?.values() ?? []) {
+                clearTimeout(timer);
+            }
+            this.queuedRemoteDocumentUpdateTimers?.clear();
+            this.queuedRemoteDocumentUpdates?.clear();
             // disconnect socketio
             try {
                 this.socket.dispose();
@@ -1011,19 +1024,142 @@ export class VirtualFileSystem extends vscode.Disposable {
         return results;
     }
 
+    private invalidateRemoteDocumentCache(
+        doc: DocumentEntity,
+        path: string,
+    ): void {
+        this.preserveDocumentBaseline(doc);
+        doc.remoteCache = undefined;
+        doc.localCache = undefined;
+        this.isDirty = true;
+        this.notify([{
+            type: vscode.FileChangeType.Changed,
+            uri: this.pathToUri(path),
+        }]);
+    }
+
+    private discardQueuedRemoteDocumentUpdates(docId: string): void {
+        this.queuedRemoteDocumentUpdates?.delete(docId);
+        const timer = this.queuedRemoteDocumentUpdateTimers?.get(docId);
+        if (timer) {
+            clearTimeout(timer);
+        }
+        this.queuedRemoteDocumentUpdateTimers?.delete(docId);
+    }
+
+    private queueRemoteDocumentUpdate(
+        doc: DocumentEntity,
+        path: string,
+        update: UpdateSchema,
+    ): void {
+        const queuedByDocument = this.queuedRemoteDocumentUpdates ?? new Map<string, UpdateSchema[]>();
+        this.queuedRemoteDocumentUpdates = queuedByDocument;
+        const queued = queuedByDocument.get(doc._id) ?? [];
+        queuedByDocument.set(doc._id, queued);
+
+        // A ShareJS revision can have only one operation. Treat a repeat at
+        // the same base version as a duplicate rather than extending the
+        // timeout or applying it twice.
+        if (!queued.some(candidate => candidate.v===update.v)) {
+            queued.push(update);
+            queued.sort((left, right) => left.v-right.v);
+        }
+        if (queued.length>VirtualFileSystem.maxQueuedRemoteDocumentUpdates) {
+            this.discardQueuedRemoteDocumentUpdates(doc._id);
+            this.invalidateRemoteDocumentCache(doc, path);
+            return;
+        }
+
+        const timers = this.queuedRemoteDocumentUpdateTimers ?? new Map<string, ReturnType<typeof setTimeout>>();
+        this.queuedRemoteDocumentUpdateTimers = timers;
+        if (timers.has(doc._id)) { return; }
+        timers.set(doc._id, setTimeout(() => {
+            const timedOut = this.queuedRemoteDocumentUpdates?.get(doc._id);
+            this.discardQueuedRemoteDocumentUpdates(doc._id);
+            if (this.disposed || !timedOut?.length) { return; }
+            const current = this._resolveById(doc._id);
+            if (current===undefined) { return; }
+            this.invalidateRemoteDocumentCache(
+                current.fileEntity as DocumentEntity,
+                current.path,
+            );
+        }, VirtualFileSystem.queuedRemoteDocumentUpdateTimeoutMs));
+    }
+
+    private drainQueuedRemoteDocumentUpdates(docId: string): boolean {
+        const queued = this.queuedRemoteDocumentUpdates?.get(docId);
+        if (!queued?.length) {
+            this.discardQueuedRemoteDocumentUpdates(docId);
+            return true;
+        }
+        const res = this._resolveById(docId);
+        if (res===undefined) {
+            this.discardQueuedRemoteDocumentUpdates(docId);
+            return false;
+        }
+        const doc = res.fileEntity as DocumentEntity;
+        if (doc.version===undefined || doc.remoteCache===undefined) {
+            return false;
+        }
+        while (queued.length>0) {
+            const next = queued[0];
+            if (next.v<doc.version) {
+                // The current authoritative cache/rejoin already includes it.
+                queued.shift();
+                continue;
+            }
+            if (next.v>doc.version) {
+                return false;
+            }
+            queued.shift();
+            this.applyRemoteDocumentUpdateInOrder(next, res, true);
+            if (doc.remoteCache===undefined) {
+                this.discardQueuedRemoteDocumentUpdates(docId);
+                return false;
+            }
+        }
+        this.discardQueuedRemoteDocumentUpdates(docId);
+        return true;
+    }
+
     private applyRemoteDocumentUpdate(update: UpdateSchema): void {
         const res = this._resolveById(update.doc);
         if (res===undefined) { return; }
-
         const doc = res.fileEntity as DocumentEntity;
         const hasOperation = Boolean(update.op?.length);
+        // Queue only a small delivery inversion. A larger gap means this
+        // subscription missed state, so the fail-closed path below preserves
+        // the merge base and triggers an authoritative rejoin.
+        if (
+            hasOperation
+            && doc.version!==undefined
+            && doc.remoteCache!==undefined
+            && update.v>doc.version
+            && update.v-doc.version<=VirtualFileSystem.maxQueuedRemoteDocumentVersionGap
+        ) {
+            this.documentCollaboratorRevisions.set(
+                doc._id,
+                (this.documentCollaboratorRevisions.get(doc._id) ?? 0) + 1,
+            );
+            this.queueRemoteDocumentUpdate(doc, res.path, update);
+            return;
+        }
         if (hasOperation) {
             this.documentCollaboratorRevisions.set(
                 doc._id,
                 (this.documentCollaboratorRevisions.get(doc._id) ?? 0) + 1,
             );
         }
+        this.applyRemoteDocumentUpdateInOrder(update, res, hasOperation);
+        this.drainQueuedRemoteDocumentUpdates(doc._id);
+    }
 
+    private applyRemoteDocumentUpdateInOrder(
+        update: UpdateSchema,
+        res: {fileEntity: FileEntity, path: string},
+        hasOperation: boolean,
+    ): void {
+        const doc = res.fileEntity as DocumentEntity;
         const pending = this.pendingDocumentWrites.get(doc._id);
         const inDoubtVersions = this.documentInDoubtSenderVersions.get(doc._id);
         let consumedInDoubtSenderEvent = false;
@@ -1048,25 +1184,45 @@ export class VirtualFileSystem extends vscode.Disposable {
             pending.resolveApplied(update.v);
         }
 
-        if (!hasOperation && doc.version!==undefined && update.v<doc.version) {
-            // An authoritative rejoin can overtake the sender-only applied
-            // event. It carries no operation, so an older version is only a
-            // delayed acknowledgement and cannot change document content.
+        if (doc.version!==undefined && update.v<doc.version) {
+            // An authoritative rejoin can overtake a delayed sender ack. An
+            // older operation is likewise already represented by this cache.
             return;
         }
 
         if (update.v===doc.version) {
-            doc.version += 1;
             if (hasOperation && doc.remoteCache!==undefined) {
                 let content = doc.remoteCache;
-                update.op!.forEach((op) => {
-                    if (op.i) {
-                        content = content.slice(0, op.p) + op.i + content.slice(op.p);
-                    } else if (op.d) {
-                        const deleteUtf8 = Buffer.from(op.d, 'ascii').toString('utf-8');
-                        content = content.slice(0, op.p) + content.slice(op.p+deleteUtf8.length);
+                let valid = true;
+                for (const op of update.op ?? []) {
+                    if (
+                        !Number.isSafeInteger(op.p)
+                        || op.p<0
+                        || op.p>content.length
+                        || (op.i!==undefined && op.d!==undefined)
+                    ) {
+                        valid = false;
+                        break;
                     }
-                });
+                    if (typeof op.i==='string') {
+                        content = content.slice(0, op.p) + op.i + content.slice(op.p);
+                    } else if (typeof op.d==='string') {
+                        const deleted = Buffer.from(op.d, 'ascii').toString('utf-8');
+                        if (content.slice(op.p, op.p+deleted.length)!==deleted) {
+                            valid = false;
+                            break;
+                        }
+                        content = content.slice(0, op.p) + content.slice(op.p+deleted.length);
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+                if (!valid) {
+                    this.invalidateRemoteDocumentCache(doc, res.path);
+                    return;
+                }
+                doc.version += 1;
                 const remoteUri = this.pathToUri(res.path);
                 const openDocument = vscode.workspace.textDocuments.find(
                     candidate => candidate.uri.toString()===remoteUri.toString(),
@@ -1080,31 +1236,19 @@ export class VirtualFileSystem extends vscode.Disposable {
                 doc.remoteCache = content;
                 this.isDirty = true;
                 this.notify([{type: vscode.FileChangeType.Changed, uri: remoteUri}]);
-            } else if (!hasOperation && !pending) {
-                // A sender acknowledgement without its pending write context
-                // proves that the version advanced, but not what text the
-                // server accepted. Force the next read to rejoin.
-                this.preserveDocumentBaseline(doc);
-                doc.remoteCache = undefined;
-                doc.localCache = undefined;
-                this.isDirty = true;
-                this.notify([{
-                    type: vscode.FileChangeType.Changed,
-                    uri: this.pathToUri(res.path),
-                }]);
+            } else {
+                doc.version += 1;
+                if (!hasOperation && !pending) {
+                    // A sender acknowledgement without its pending write
+                    // context proves a version advance, not accepted content.
+                    this.invalidateRemoteDocumentCache(doc, res.path);
+                }
             }
         } else {
-            this.preserveDocumentBaseline(doc);
-            doc.remoteCache = undefined;
-            doc.localCache = undefined;
-            // A missed or out-of-order OT update invalidates the cache, but
-            // Local Replica still needs a file event so its pull path joins
-            // the document again and reads the authoritative server text.
-            this.isDirty = true;
-            this.notify([{
-                type: vscode.FileChangeType.Changed,
-                uri: this.pathToUri(res.path),
-            }]);
+            // A missing (rather than merely delayed) OT update invalidates the
+            // cache. Local Replica receives a change event and rejoins before
+            // it can use this document as a write baseline.
+            this.invalidateRemoteDocumentCache(doc, res.path);
         }
     }
 
@@ -1132,14 +1276,8 @@ export class VirtualFileSystem extends vscode.Disposable {
             pending.resolveApplied();
         }
 
-        this.preserveDocumentBaseline(doc);
-        doc.remoteCache = undefined;
-        doc.localCache = undefined;
-        this.isDirty = true;
-        this.notify([{
-            type: vscode.FileChangeType.Changed,
-            uri: this.pathToUri(res.path),
-        }]);
+        this.discardQueuedRemoteDocumentUpdates(docId);
+        this.invalidateRemoteDocumentCache(doc, res.path);
     }
 
     private async enqueueDocumentWrite<T>(docId: string, task: () => Promise<T>): Promise<T> {
@@ -1332,7 +1470,10 @@ export class VirtualFileSystem extends vscode.Disposable {
         if (content!==startingContent) {
             this.notify([{type: vscode.FileChangeType.Changed, uri}]);
         }
-        return new TextEncoder().encode(content);
+        if (!this.drainQueuedRemoteDocumentUpdates(doc._id)) {
+            return undefined;
+        }
+        return new TextEncoder().encode(doc.remoteCache ?? content);
     }
 
     private async refreshDocumentFromServerNow(
@@ -1389,7 +1530,11 @@ export class VirtualFileSystem extends vscode.Disposable {
                 target.localCache = content;
             }
             this.isDirty = true;
-            return new TextEncoder().encode(content);
+            if (!this.drainQueuedRemoteDocumentUpdates(doc._id)) {
+                requireFullSnapshot = true;
+                continue;
+            }
+            return new TextEncoder().encode(doc.remoteCache ?? content);
         }
         throw new RemoteDocumentWriteAmbiguousError(
             `Could not obtain a current Overleaf revision for ${uri.path}.`,

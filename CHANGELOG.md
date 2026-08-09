@@ -36,6 +36,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Replace the direct VFS text-write fuzzy patch with an exact three-way merge.
   An overlapping collaborator edit now remains a conflict instead of being
   applied at a nearby, unproven location.
+- Buffer out-of-order collaborator OT events per document, matching the
+  official client’s revision-order behavior. Only the exact next operation is
+  applied; a missing predecessor triggers authoritative snapshot recovery, and
+  malformed operations cannot mutate the cached document.
 
 ### Planned
 - Make Overleaf the explicit canonical project state while treating the selected

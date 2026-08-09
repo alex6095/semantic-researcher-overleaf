@@ -1484,7 +1484,7 @@ suite('Extension host and lifecycle isolation', () => {
         assert.strictEqual(disposeCount, 1);
     });
 
-    test('emits a change event when an out-of-order OT update invalidates the document cache', () => {
+    test('reorders delayed OT operations before updating the document cache', () => {
         const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
         const internals = vfs as any;
         attachAuthenticatedSession(internals);
@@ -1492,8 +1492,8 @@ suite('Extension host and lifecycle isolation', () => {
             _id: 'doc-1',
             name: 'main.tex',
             version: 4,
-            localCache: 'baseline',
-            remoteCache: 'baseline',
+            localCache: 'base',
+            remoteCache: 'base',
         };
         const notifications: vscode.FileChangeEvent[] = [];
         let onFileChanged: ((update: any) => void) | undefined;
@@ -1519,13 +1519,68 @@ suite('Extension host and lifecycle isolation', () => {
 
         internals.remoteWatch();
         assert.ok(onFileChanged);
-        onFileChanged!({doc: 'doc-1', v: 7, op: [{p: 0, i: 'remote'}]});
+        // Redis/socket delivery may hand us v+1 first. It must wait, not
+        // invalidate a clean cache or apply at a fuzzy location.
+        onFileChanged!({doc: 'doc-1', v: 5, op: [{p: 10, i: '\nsecond'}]});
+        assert.strictEqual(document.remoteCache, 'base');
+        assert.strictEqual(notifications.length, 0);
 
-        assert.strictEqual(document.localCache, undefined);
-        assert.strictEqual(document.remoteCache, undefined);
-        assert.strictEqual(notifications.length, 1);
-        assert.strictEqual(notifications[0].type, vscode.FileChangeType.Changed);
-        assert.strictEqual(notifications[0].uri.path, '/Project/main.tex');
+        onFileChanged!({doc: 'doc-1', v: 4, op: [{p: 0, i: 'first\n'}]});
+        assert.strictEqual(document.localCache, 'first\nbase\nsecond');
+        assert.strictEqual(document.remoteCache, 'first\nbase\nsecond');
+        assert.strictEqual(document.version, 6);
+        assert.strictEqual(notifications.length, 2);
+        assert.strictEqual(internals.queuedRemoteDocumentUpdates?.has('doc-1'), false);
+    });
+
+    test('fails closed when a delayed OT predecessor never arrives', async () => {
+        const previousTimeout = (VirtualFileSystem as any)
+            .queuedRemoteDocumentUpdateTimeoutMs;
+        (VirtualFileSystem as any).queuedRemoteDocumentUpdateTimeoutMs = 5;
+        try {
+            const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
+            const internals = vfs as any;
+            attachAuthenticatedSession(internals);
+            const document = {
+                _id: 'doc-timeout',
+                name: 'main.tex',
+                version: 4,
+                localCache: 'base',
+                remoteCache: 'base',
+            };
+            const notifications: vscode.FileChangeEvent[] = [];
+            let onFileChanged: ((update: any) => void) | undefined;
+
+            internals.disposed = false;
+            internals.origin = vscode.Uri.parse(
+                'semantic-researcher-overleaf://www.overleaf.com/Project?user=user-1&project=project-1',
+            );
+            internals.documentCollaboratorRevisions = new Map();
+            internals.pendingDocumentWrites = new Map();
+            internals.documentInDoubtSenderVersions = new Map();
+            internals.socket = {
+                updateEventHandlers: (handlers: {onFileChanged: (update: any) => void}) => {
+                    onFileChanged = handlers.onFileChanged;
+                    return new vscode.Disposable(() => undefined);
+                },
+            };
+            internals.notify = (events: vscode.FileChangeEvent[]) => notifications.push(...events);
+            internals._resolveById = () => ({
+                fileEntity: document,
+                path: '/main.tex',
+            });
+
+            internals.remoteWatch();
+            onFileChanged!({doc: 'doc-timeout', v: 5, op: [{p: 0, i: 'remote'}]});
+            await new Promise(resolve => setTimeout(resolve, 20));
+
+            assert.strictEqual(document.localCache, undefined);
+            assert.strictEqual(document.remoteCache, undefined);
+            assert.strictEqual(notifications.length, 1);
+            assert.strictEqual(notifications[0].type, vscode.FileChangeType.Changed);
+        } finally {
+            (VirtualFileSystem as any).queuedRemoteDocumentUpdateTimeoutMs = previousTimeout;
+        }
     });
 
     test('emits the complete subtree at the exact path after remote rename and move', () => {
