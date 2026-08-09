@@ -7,7 +7,7 @@ export interface SettingItem extends vscode.QuickPickItem {
 }
 
 export interface StatusInfo {
-    status: 'push' | 'pull' | 'idle' | 'need-attention',
+    status: 'push' | 'pull' | 'pending' | 'offline' | 'idle' | 'need-attention',
     message?: string,
 }
 

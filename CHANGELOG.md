@@ -12,14 +12,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleared only after an accepted or verified-equal Overleaf state, and replayed
   through guarded reconciliation after reload; a concurrent same-path edit
   remains a conflict instead of silently overwriting the canonical project.
+
+### Changed
+- Replay pending regular-file updates and deletes automatically after a live
+  Remote SSH/Overleaf reconnection. Repeated connection notifications share a
+  single replay, and an authoritative pull clears a pending record only when
+  both local and remote state exactly match that recorded intent.
+- Make Local Replica status explicit: `Synced`, pending upload, offline queued,
+  reconciling, and needs-attention states include a count in the status-bar
+  indicator and tooltip. A known unavailable connection retains local intent
+  quietly instead of presenting a sync-failure notification.
+
 ### Planned
 - Make Overleaf the explicit canonical project state while treating the selected
   local folder as a durable working copy and queue of pending local intent.
 - Reconcile text through current-revision OT and file/tree changes through
   guarded project-entity transactions, with a human-reviewable conflict path
   whenever a safe automatic result cannot be proven.
-- Add an offline queue status and conflict-resolution UX that preserves both
-  copies rather than relying on event timing or a last-writer-wins policy.
+- Add conflict-resolution UX that preserves both copies rather than relying on
+  event timing or a last-writer-wins policy.
 
 ## [0.16.0] - 2026-08-06
 

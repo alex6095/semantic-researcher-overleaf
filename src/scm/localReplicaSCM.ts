@@ -406,6 +406,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private syncManifestDirty = false;
     private syncManifestRevision = 0;
     private syncManifestPersistQueue: Promise<void> = Promise.resolve();
+    private pendingOperationReplay?: {
+        generation: number;
+        started: boolean;
+        promise: Promise<void>;
+    };
     // Files we have written locally at least once. A push-delete arriving for a
     // relPath that isn't in here AND isn't in baseCache is treated as an echo,
     // not a user-driven delete, and is refused in the delete-guard layer.
@@ -8515,6 +8520,127 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.markSyncManifestDirty();
     }
 
+    private refreshDerivedSyncStatus(): void {
+        if (this.syncConflicts.size>0) {
+            this.status = {
+                status: 'need-attention',
+                message: vscode.l10n.t('{count} sync conflicts', {
+                    count: this.syncConflicts.size,
+                }),
+            };
+            return;
+        }
+        if (this.failedInitialPulls.size>0) {
+            this.status = {
+                status: 'need-attention',
+                message: vscode.l10n.t('{count} files failed to download', {
+                    count: this.failedInitialPulls.size,
+                }),
+            };
+            return;
+        }
+        const pendingCount = Object.keys(
+            this.syncManifest?.pendingOperations ?? {},
+        ).length;
+        if (pendingCount===0) {
+            this.status = {status: 'idle', message: ''};
+            return;
+        }
+        if (this.vfs.connectionState==='disconnected') {
+            this.status = {
+                status: 'offline',
+                message: vscode.l10n.t(
+                    '{count} local changes queued for Overleaf',
+                    {count: pendingCount},
+                ),
+            };
+            return;
+        }
+        if (
+            this.vfs.connectionState==='initial'
+            || this.vfs.connectionState==='reconnecting'
+        ) {
+            this.status = {
+                status: 'pending',
+                message: vscode.l10n.t(
+                    'Reconciling {count} local changes with Overleaf',
+                    {count: pendingCount},
+                ),
+            };
+            return;
+        }
+        this.status = {
+            status: 'pending',
+            message: vscode.l10n.t(
+                '{count} local changes pending upload to Overleaf',
+                {count: pendingCount},
+            ),
+        };
+    }
+
+    private reportPushFailure(relPath: string, error: unknown): void {
+        if (
+            this.vfs.connectionState==='disconnected'
+            || this.vfs.connectionState==='reconnecting'
+            || this.vfs.connectionState==='initial'
+        ) {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [push queued:connection] ` +
+                `${relPath}: ${formatUnknownError(error)}`,
+            );
+            return;
+        }
+        maybeWarnSyncFailure(relPath, error);
+    }
+
+    private async acknowledgePendingFilePushOperationFromAuthoritativeState(
+        relPath: string,
+        expected: Pick<SyncManifestPendingOperation, 'kind' | 'localRevision'>,
+        generation = this.syncGeneration,
+    ): Promise<boolean> {
+        this.requireSyncSession(generation);
+        const entry = this.syncManifest?.pendingOperations[relPath];
+        if (
+            !entry
+            || entry.kind!==expected.kind
+            || entry.localRevision!==expected.localRevision
+        ) {
+            return false;
+        }
+        try {
+            const [localState, remoteState] = await Promise.all([
+                this.captureLocalPathRevision(relPath, generation),
+                this.captureRemotePathRevision(relPath, generation),
+            ]);
+            this.requireSyncSession(generation);
+            const acknowledgedUpdate = expected.kind==='update'
+                && localState.kind==='file'
+                && remoteState.kind==='file'
+                && localState.revision===expected.localRevision
+                && remoteState.revision===expected.localRevision;
+            const acknowledgedDelete = expected.kind==='delete'
+                && localState.kind==='missing'
+                && remoteState.kind==='missing';
+            if (!acknowledgedUpdate && !acknowledgedDelete) {
+                return false;
+            }
+            return await this.removePendingFilePushOperation(
+                relPath,
+                'authoritative Overleaf state matches the pending local intent',
+                generation,
+                expected,
+            );
+        } catch (error) {
+            if (this.isSyncSessionActive(generation)) {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [pending operation acknowledgement deferred] ` +
+                    `${relPath}: ${formatUnknownError(error)}`,
+                );
+            }
+            return false;
+        }
+    }
+
     private removeSyncManifestEntry(relPath: string) {
         if (this.syncManifest?.files[relPath]) {
             delete this.syncManifest.files[relPath];
@@ -8600,7 +8726,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
-    private async reconcilePendingFilePushOperationsOnStartup(
+    private async reconcilePendingFilePushOperations(
         generation = this.syncGeneration,
     ): Promise<void> {
         const pending = Object.entries(this.syncManifest?.pendingOperations ?? {})
@@ -8704,6 +8830,51 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             ).length}`,
         );
     }
+    private requestPendingFilePushOperationReplay(
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        const existing = this.pendingOperationReplay;
+        if (existing?.generation===generation) {
+            return existing.promise;
+        }
+        const record: {
+            generation: number;
+            started: boolean;
+            promise: Promise<void>;
+        } = {
+            generation,
+            started: false,
+            promise: Promise.resolve(),
+        };
+        const replay = (async () => {
+            // Drain operations accepted before the connection transition. Once
+            // `started` is true, enqueueSync fences later watcher work behind
+            // this replay so one path cannot race its own durable intent.
+            await this.drainPendingSyncWork();
+            if (!this.isSyncSessionActive(generation)) { return; }
+            record.started = true;
+            await this.reconcilePendingFilePushOperations(generation);
+        })().catch(error => {
+            if (this.isSyncSessionActive(generation)) {
+                getOutputChannel().appendLine(
+                    new Date().toISOString() +
+                    ' [pending operation replay failed] ' +
+                    formatUnknownError(error),
+                );
+            }
+        }).finally(() => {
+            if (this.pendingOperationReplay===record) {
+                this.pendingOperationReplay = undefined;
+            }
+            if (this.isSyncSessionActive(generation)) {
+                this.refreshDerivedSyncStatus();
+            }
+        });
+        record.promise = replay;
+        this.pendingOperationReplay = record;
+        return replay;
+    }
+
 
     private rememberRemoteDelete(relPath: string, content?: Uint8Array, staleLocalMtime?: number) {
         if (content===undefined) {
@@ -8822,10 +8993,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         ) {
             return Promise.resolve(undefined);
         }
+        const pendingOperationReplay = this.pendingOperationReplay;
+        const replayFence = (
+            pendingOperationReplay?.generation===generation
+            && pendingOperationReplay.started
+        )
+            ? pendingOperationReplay.promise
+            : undefined;
         const previous = this.syncQueues.get(relPath) ?? Promise.resolve();
         const next = previous
             .catch(() => undefined)
-            .then(() => {
+            .then(async () => {
+                if (replayFence) { await replayFence; }
                 this.requireSyncSession(generation);
                 return task();
             })
@@ -8846,7 +9025,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     // it; toasting here would turn a normal mid-write read into
                     // a user-visible sync failure.
                     if (!LocalReplicaSCMProvider.isLocalReadUnstable(error)) {
-                        maybeWarnSyncFailure(relPath, error);
+                        this.reportPushFailure(relPath, error);
                     }
                 }
                 return undefined;
@@ -10535,6 +10714,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         this.clearFailedInitialPullAfterAuthoritativeSync(relPath, generation);
                         this.clearReplicaState(relPath, directoryDelete);
                         await this.persistSyncManifest(false, generation);
+                        authoritativePullCompleted = true;
                         return;
                     }
                     if (!everReplicated || this.failedInitialPulls.has(relPath)) {
@@ -10938,6 +11118,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     directoryDelete,
                     action==='push',
                 );
+                if (action==='pull') {
+                    authoritativePullCompleted = true;
+                }
                 if (action==='push' && !directoryDelete) {
                     acknowledgedPendingFilePush = {
                         kind: 'delete',
@@ -11709,7 +11892,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         );
                         if (action==='push' && this.isSyncSessionActive(generation)) {
                             this.locallyDivergedPaths.add(relPath);
-                            maybeWarnSyncFailure(relPath, error);
+                            this.reportPushFailure(relPath, error);
                         }
                         console.error(error);
                         outcome = 'error';
@@ -11743,7 +11926,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
                 if (action==='push' && this.isSyncSessionActive(generation)) {
                     this.locallyDivergedPaths.add(relPath);
-                    maybeWarnSyncFailure(relPath, error);
+                    this.reportPushFailure(relPath, error);
                 }
                 console.error(error);
                 outcome = 'error';
@@ -11778,6 +11961,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && this.isSyncSessionActive(generation)
         ) {
             try {
+                const pendingOperation = this.syncManifest?.pendingOperations[relPath];
+                if (pendingOperation) {
+                    await this.acknowledgePendingFilePushOperationFromAuthoritativeState(
+                        relPath,
+                        pendingOperation,
+                        generation,
+                    );
+                }
+                this.requireSyncSession(generation);
                 this.clearFailedInitialPullAfterAuthoritativeSync(relPath, generation);
                 await this.persistSyncManifest(false, generation);
             } catch (error) {
@@ -11821,12 +12013,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     this.locallyDivergedPaths.add(relPath);
                 }
             }
-            this.status = this.syncConflicts.size>0
-                ? {
-                    status: 'need-attention',
-                    message: vscode.l10n.t('{count} sync conflicts', {count: this.syncConflicts.size}),
-                }
-                : {status: 'idle', message: ''};
+            this.refreshDerivedSyncStatus();
         }
         const event: Events['scmSyncCompleteEvent'] = {
             rootUri: this.baseUri,
@@ -12239,7 +12426,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 remoteBootstrapPromise,
             );
             if (completed!==true || !this.isSyncSessionActive(activeGeneration)) { return false; }
-            await this.reconcilePendingFilePushOperationsOnStartup(activeGeneration);
+            await this.reconcilePendingFilePushOperations(activeGeneration);
             if (!this.isSyncSessionActive(activeGeneration)) { return false; }
         } catch (error) {
             if (!this.isSyncSessionActive(activeGeneration)) { return false; }
@@ -12285,6 +12472,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         await this.persistSyncManifest(false, activeGeneration);
         if (this.isSyncSessionActive(activeGeneration)) {
             await this.refreshCleanOpenReplicaDocumentsFromDisk(activeGeneration);
+            this.refreshDerivedSyncStatus();
         }
         return this.isSyncSessionActive(activeGeneration);
     }
@@ -13194,16 +13382,37 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // in failedInitialPulls is the typical case, and the connection is now
         // available again. Try once per (re)connect.
         const connSub = this.vfs.onDidChangeConnection(state => {
-            if (
-                this.isSyncSessionActive(generation)
-                && state==='connected'
-                && this.failedInitialPulls.size>0
-            ) {
-                getOutputChannel().appendLine(
-                    `${new Date().toISOString()} [pull retry on reconnect] ${this.failedInitialPulls.size} files`,
-                );
-                void this.retryFailedInitialPulls();
-            }
+            if (!this.isSyncSessionActive(generation)) { return; }
+            this.refreshDerivedSyncStatus();
+            if (state!=='connected') { return; }
+            void (async () => {
+                const pendingCount = Object.keys(
+                    this.syncManifest?.pendingOperations ?? {},
+                ).length;
+                if (pendingCount>0) {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [pending operation replay on reconnect] ` +
+                        `${pendingCount} file changes`,
+                    );
+                    await this.requestPendingFilePushOperationReplay(generation);
+                }
+                if (
+                    this.isSyncSessionActive(generation)
+                    && this.failedInitialPulls.size>0
+                ) {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [pull retry on reconnect] ${this.failedInitialPulls.size} files`,
+                    );
+                    await this.retryFailedInitialPulls();
+                }
+            })().catch(error => {
+                if (this.isSyncSessionActive(generation)) {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [reconnect recovery failed] ` +
+                        formatUnknownError(error),
+                    );
+                }
+            });
         });
         disposables.push(connSub);
 

@@ -247,7 +247,7 @@ export class SCMCollectionProvider extends vscode.Disposable {
     private updateStatus() {
         if (!this.statusBarItem) { return; }
 
-        let numPush = 0, numPull = 0;
+        let numPush = 0, numPull = 0, numPending = 0, numOffline = 0, numAttention = 0;
         let tooltip = new vscode.MarkdownString(`**${vscode.l10n.t('Project Source Control')}**\n\n`);
         tooltip.supportHtml = true;
         tooltip.supportThemeIcons = true;
@@ -274,6 +274,9 @@ export class SCMCollectionProvider extends vscode.Disposable {
                     switch (scm.status.status) {
                         case 'push': numPush++; break;
                         case 'pull': numPull++; break;
+                        case 'pending': numPending++; break;
+                        case 'offline': numOffline++; break;
+                        case 'need-attention': numAttention++; break;
                     }
                 }
             }   
@@ -285,6 +288,10 @@ export class SCMCollectionProvider extends vscode.Disposable {
             this.statusBarItem.text = `$(cloud-upload)`;
         } else if (numPull!==0) {
             this.statusBarItem.text = `$(cloud-download)`;
+        } else if (numOffline!==0 || numAttention!==0) {
+            this.statusBarItem.text = `$(warning) ${numOffline + numAttention}`;
+        } else if (numPending!==0) {
+            this.statusBarItem.text = `$(cloud-upload) ${numPending}`;
         } else {
             this.statusBarItem.text = `$(cloud)`;
         }

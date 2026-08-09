@@ -18,6 +18,7 @@ import { ProjectManagerProvider } from '../../core/projectManagerProvider';
 import {
     RemoteDocumentMergeConflictError,
     RemoteDocumentWriteAmbiguousError,
+    VFSConnectionState,
     VirtualFileSystem,
 } from '../../core/remoteFileSystemProvider';
 import {
@@ -42,11 +43,15 @@ class FakeVirtualFileSystem {
     public readonly serverName = 'test-server';
     public readonly _userId = 'test-user';
     public readonly projectId = 'test-project';
-    public readonly connectionState = 'connected';
-    private readonly connectionEmitter = new vscode.EventEmitter<string>();
+    public connectionState: VFSConnectionState = 'connected';
+    private readonly connectionEmitter = new vscode.EventEmitter<VFSConnectionState>();
     public readonly onDidChangeConnection = this.connectionEmitter.event;
     private readonly persists = new Map<string, PersistRecord>();
     private readonly entityIds = new Map<string, string>();
+    setConnectionState(state: VFSConnectionState) {
+        this.connectionState = state;
+        this.connectionEmitter.fire(state);
+    }
 
     constructor(
         private readonly remoteRoot: vscode.Uri,
@@ -3019,6 +3024,191 @@ suite('Select Project Folder Local Replica', function () {
         const migratedManifest = JSON.parse(await readText(manifestUri));
         assert.strictEqual(migratedManifest.version, 3);
         assert.deepStrictEqual(migratedManifest.pendingOperations, {});
+    });
+
+    test('replays a journaled local update after a live reconnect without another watcher event', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-live-reconnect-update-remote-');
+        const localRoot = await tempDir('sr-overleaf-live-reconnect-update-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        const triggers = await scm.triggers;
+        try {
+            let offlineWarnings = 0;
+            (vscode.window as any).showWarningMessage = () => {
+                offlineWarnings += 1;
+                return Promise.resolve(undefined);
+            };
+            const internals = scm as any;
+            await writeText(localMain, 'offline local update');
+            let pushAttempts = 0;
+            const originalPushWithRetry = internals.pushWithRetry.bind(scm);
+            internals.pushWithRetry = async () => {
+                pushAttempts += 1;
+                throw new Error('simulated offline write');
+            };
+            fakeVfs.setConnectionState('disconnected');
+            const interrupted = await internals.applySync(
+                'push', 'update', '/main.tex', localMain, remoteMain,
+            ) as Events['scmSyncCompleteEvent'];
+            assert.strictEqual(interrupted.outcome, 'error');
+            assert.strictEqual(scm.status.status, 'offline');
+            assert.strictEqual(offlineWarnings, 0);
+            assert.strictEqual(
+                internals.syncManifest.pendingOperations['/main.tex'].kind,
+                'update',
+            );
+
+            fakeVfs.setConnectionState('reconnecting');
+            assert.strictEqual(scm.status.status, 'pending');
+            assert.match(scm.status.message ?? '', /Reconciling/);
+
+            internals.pushWithRetry = async (...args: unknown[]) => {
+                pushAttempts += 1;
+                return originalPushWithRetry(...args);
+            };
+            const replay = waitForSyncComplete(localRoot, '/main.tex', 'push', 'update');
+            fakeVfs.setConnectionState('connected');
+            // A second connection notification while replay is in flight must
+            // share the same single-flight upload.
+            fakeVfs.setConnectionState('connected');
+            const recovered = await replay;
+            assert.strictEqual(recovered.outcome, 'success');
+            await waitUntil(() => internals.syncManifest.pendingOperations['/main.tex']===undefined);
+            assert.strictEqual(await readText(remoteMain), 'offline local update');
+            assert.strictEqual(scm.status.status, 'idle');
+            assert.strictEqual(pushAttempts, 2);
+        } finally {
+            triggers.forEach(trigger => trigger.dispose());
+        }
+    });
+
+    test('replays a journaled local delete after a live reconnect without another watcher event', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-live-reconnect-delete-remote-');
+        const localRoot = await tempDir('sr-overleaf-live-reconnect-delete-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        const triggers = await scm.triggers;
+        const originalPushRetryDelays = (LocalReplicaSCMProvider as any).pushRetryDelays;
+        try {
+            const internals = scm as any;
+            let deleteAttempts = 0;
+            const originalAtomicDelete = internals.atomicDeleteRemotePathIfRevision.bind(scm);
+            (LocalReplicaSCMProvider as any).pushRetryDelays = [0];
+            internals.atomicDeleteRemotePathIfRevision = async () => {
+                deleteAttempts += 1;
+                throw new Error('simulated offline delete');
+            };
+            await vscode.workspace.fs.delete(localMain);
+            fakeVfs.setConnectionState('disconnected');
+            const interrupted = await internals.applySync(
+                'push', 'delete', '/main.tex', localMain, remoteMain,
+            ) as Events['scmSyncCompleteEvent'];
+            assert.strictEqual(interrupted.outcome, 'error');
+            assert.strictEqual(scm.status.status, 'offline');
+            assert.strictEqual(
+                internals.syncManifest.pendingOperations['/main.tex'].kind,
+                'delete',
+            );
+
+            internals.atomicDeleteRemotePathIfRevision = async (...args: unknown[]) => {
+                deleteAttempts += 1;
+                return originalAtomicDelete(...args);
+            };
+            const replay = waitForSyncComplete(localRoot, '/main.tex', 'push', 'delete');
+            fakeVfs.setConnectionState('connected');
+            const recovered = await replay;
+            assert.strictEqual(recovered.outcome, 'success');
+            await waitUntil(() => internals.syncManifest.pendingOperations['/main.tex']===undefined);
+            assert.strictEqual(await pathExists(remoteMain), false);
+            assert.strictEqual(scm.status.status, 'idle');
+            assert.strictEqual(deleteAttempts, 2);
+        } finally {
+            (LocalReplicaSCMProvider as any).pushRetryDelays = originalPushRetryDelays;
+            triggers.forEach(trigger => trigger.dispose());
+        }
+    });
+
+    test('keeps a live-reconnect journal and surfaces a conflict when Overleaf advanced', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-live-reconnect-conflict-remote-');
+        const localRoot = await tempDir('sr-overleaf-live-reconnect-conflict-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'section: baseline\n');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        const triggers = await scm.triggers;
+        try {
+            const internals = scm as any;
+            await writeText(localMain, 'section: local\n');
+            internals.pushWithRetry = async () => {
+                throw new Error('simulated offline write');
+            };
+            fakeVfs.setConnectionState('disconnected');
+            const interrupted = await internals.applySync(
+                'push', 'update', '/main.tex', localMain, remoteMain,
+            ) as Events['scmSyncCompleteEvent'];
+            assert.strictEqual(interrupted.outcome, 'error');
+            await writeText(remoteMain, 'section: Overleaf collaborator\n');
+
+            const originalPushWithRetry = LocalReplicaSCMProvider.prototype['pushWithRetry'];
+            internals.pushWithRetry = originalPushWithRetry.bind(scm);
+            const replay = waitForSyncComplete(localRoot, '/main.tex', 'push', 'update');
+            fakeVfs.setConnectionState('connected');
+            const recovered = await replay;
+            assert.strictEqual(recovered.outcome, 'blocked');
+            assert.strictEqual(await readText(localMain), 'section: local\n');
+            assert.strictEqual(await readText(remoteMain), 'section: Overleaf collaborator\n');
+            assert.strictEqual(internals.syncConflicts.has('/main.tex'), true);
+            assert.strictEqual(
+                internals.syncManifest.pendingOperations['/main.tex'].kind,
+                'update',
+            );
+            assert.strictEqual(scm.status.status, 'need-attention');
+        } finally {
+            triggers.forEach(trigger => trigger.dispose());
+        }
+    });
+
+    test('acknowledges a journal only after an authoritative pull confirms its exact intent', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-pull-ack-remote-');
+        const localRoot = await tempDir('sr-overleaf-pull-ack-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        const generation = internals.syncGeneration as number;
+        const remoteBeforeAcknowledgement = await internals.captureRemotePathRevision(
+            '/main.tex',
+            generation,
+        );
+        await writeText(localMain, 'accepted but response lost');
+        await internals.journalPendingFilePushOperation(
+            '/main.tex',
+            'update',
+            sha1('accepted but response lost'),
+            remoteBeforeAcknowledgement,
+            generation,
+        );
+        await writeText(remoteMain, 'accepted but response lost');
+
+        const pulled = await internals.applySync(
+            'pull', 'update', '/main.tex', remoteMain, localMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(pulled.outcome, 'success');
+        assert.strictEqual(internals.syncManifest.pendingOperations['/main.tex'], undefined);
+        assert.strictEqual(scm.status.status, 'idle');
     });
 
     test('quarantines one-sided legacy replica files, media, and folders without a manifest', async () => {
