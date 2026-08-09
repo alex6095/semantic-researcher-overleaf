@@ -3667,4 +3667,87 @@ suite('Extension host and lifecycle isolation', () => {
         assert.strictEqual(internals.pendingDocumentWrites.has(document._id), false);
         assert.strictEqual(internals.documentInDoubtSenderVersions.has(document._id), false);
     });
+    test('uses three-way merge rather than fuzzy patching direct VFS writes', async () => {
+        const uri = vscode.Uri.parse(
+            'semantic-researcher-overleaf://www.overleaf.com/Project/main.tex' +
+            '?user=user-1&project=project-1',
+        );
+        const makeVfs = (document: {
+            _id: string;
+            name: string;
+            version: number;
+            lastVersion: number;
+            localCache: string;
+            remoteCache: string;
+        }) => {
+            const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
+            const internals = vfs as any;
+            attachAuthenticatedSession(internals);
+            const updates: any[] = [];
+            internals.disposed = false;
+            internals.origin = uri.with({path: '/Project'});
+            internals.projectName = 'Project';
+            internals.documentWriteQueues = new Map();
+            internals.documentCollaboratorRevisions = new Map();
+            internals.pendingDocumentWrites = new Map();
+            internals.documentInDoubtSenderVersions = new Map();
+            internals.ensureConnectedForWrite = async () => undefined;
+            internals._resolveUri = async () => ({fileType: 'doc', fileEntity: document});
+            internals._resolveById = () => ({fileEntity: document, path: '/main.tex'});
+            internals.notify = () => undefined;
+            internals.socket = {
+                isUsingAlternativeConnectionScheme: false,
+                applyOtUpdate: async (_docId: string, update: any) => {
+                    updates.push(update);
+                    const appliedVersion = document.version;
+                    internals.applyRemoteDocumentUpdate({
+                        doc: document._id,
+                        v: appliedVersion,
+                    });
+                },
+            };
+            return {vfs, internals, updates};
+        };
+
+        const mergedDocument = {
+            _id: 'doc-direct-merge',
+            name: 'main.tex',
+            version: 90,
+            lastVersion: 89,
+            localCache: 'title: base\nmiddle: base\nbody: base\n',
+            remoteCache: 'title: remote\nmiddle: base\nbody: base\n',
+        };
+        const merged = makeVfs(mergedDocument);
+        await merged.vfs.writeFile(
+            uri,
+            new TextEncoder().encode('title: base\nmiddle: base\nbody: local\n'),
+            false,
+            true,
+        );
+        assert.strictEqual(merged.updates.length, 1);
+        assert.strictEqual(
+            mergedDocument.remoteCache,
+            'title: remote\nmiddle: base\nbody: local\n',
+        );
+
+        const conflictDocument = {
+            _id: 'doc-direct-conflict',
+            name: 'main.tex',
+            version: 100,
+            lastVersion: 99,
+            localCache: 'title: base\n',
+            remoteCache: 'title: remote\n',
+        };
+        const conflict = makeVfs(conflictDocument);
+        await assert.rejects(
+            () => conflict.vfs.writeFile(
+                uri,
+                new TextEncoder().encode('title: local\n'),
+                false,
+                true,
+            ),
+            RemoteDocumentMergeConflictError,
+        );
+        assert.strictEqual(conflict.updates.length, 0);
+    });
 });

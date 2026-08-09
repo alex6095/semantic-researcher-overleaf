@@ -33,6 +33,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with Overleaf's `dupIfSource` safeguard. A repeated server rejection is
   confirmed through an authoritative snapshot; missing source identity,
   observed sender acknowledgements, and explicit errors are never replayed.
+- Replace the direct VFS text-write fuzzy patch with an exact three-way merge.
+  An overlapping collaborator edit now remains a conflict instead of being
+  applied at a nearby, unproven location.
 
 ### Planned
 - Make Overleaf the explicit canonical project state while treating the selected

@@ -1778,8 +1778,25 @@ export class VirtualFileSystem extends vscode.Disposable {
                 mergeRes = new TextDecoder().decode(merged);
             }
         } else {
-            const patches = dmp.patch_make(doc.localCache, doc.remoteCache);
-            mergeRes = dmp.patch_apply(patches, desiredText)[0] as string;
+            // Direct VFS writes do not carry a Local Replica manifest
+            // baseline. When a collaborator has advanced the subscribed cache,
+            // do an explicit three-way merge from the last local cache rather
+            // than letting diff-match-patch choose a fuzzy nearby match.
+            if (doc.localCache===doc.remoteCache) {
+                mergeRes = desiredText;
+            } else {
+                const merged = mergeUtf8Text(
+                    new TextEncoder().encode(doc.localCache),
+                    content,
+                    new TextEncoder().encode(doc.remoteCache),
+                );
+                if (merged===undefined) {
+                    throw new RemoteDocumentMergeConflictError(
+                        `Overleaf changed ${uri.path} in an overlapping direct editor write.`,
+                    );
+                }
+                mergeRes = new TextDecoder().decode(merged);
+            }
         }
 
         let writtenContent = new TextEncoder().encode(mergeRes);
