@@ -6,6 +6,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [0.16.1] - Unreleased
 
+### Added
+- Add manifest schema v3 with a durable pending-operation journal for stable
+  regular-file updates and deletes. The journal is persisted before remote I/O,
+  cleared only after an accepted or verified-equal Overleaf state, and replayed
+  through guarded reconciliation after reload; a concurrent same-path edit
+  remains a conflict instead of silently overwriting the canonical project.
 ### Planned
 - Make Overleaf the explicit canonical project state while treating the selected
   local folder as a durable working copy and queue of pending local intent.

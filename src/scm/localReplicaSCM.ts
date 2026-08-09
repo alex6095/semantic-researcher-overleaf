@@ -139,12 +139,13 @@ interface SyncManifestConflictEntry {
 }
 
 interface SyncManifest {
-    version: 2;
+    version: 3;
     projectUri: string;
     baselineComplete: boolean;
     files: Record<string, SyncManifestEntry>;
     directories: Record<string, SyncManifestDirectoryEntry>;
     conflicts: Record<string, SyncManifestConflictEntry>;
+    pendingOperations: Record<string, SyncManifestPendingOperation>;
 }
 
 type SyncManifestBaselineMode = 'trusted' | 'fresh-replica' | 'unavailable';
@@ -158,6 +159,18 @@ interface PathRevision {
     kind: 'missing' | 'file' | 'directory' | 'other';
     revision: string;
     content?: Uint8Array;
+}
+
+interface SyncManifestPendingOperation {
+    version: 1;
+    id: string;
+    kind: 'update' | 'delete';
+    localKind: 'file' | 'missing';
+    localRevision: string;
+    remoteKind?: PathRevision['kind'];
+    remoteRevision?: string;
+    createdAt: string;
+    updatedAt: string;
 }
 
 interface LocalReplicaOperationRecord {
@@ -3333,12 +3346,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private emptySyncManifest(baselineComplete = true): SyncManifest {
         return {
-            version: 2,
+            version: 3,
             projectUri: stringifyOverleafUri(this.vfs.origin),
             baselineComplete,
             files: {},
             directories: {},
             conflicts: {},
+            pendingOperations: {},
         };
     }
 
@@ -3430,6 +3444,45 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && Number.isFinite(Date.parse(entry.updatedAt));
     }
 
+    private isValidSyncManifestPendingOperation(
+        value: unknown,
+    ): value is SyncManifestPendingOperation {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const entry = value as Partial<SyncManifestPendingOperation>;
+        const validRemoteProof = (
+            entry.remoteKind===undefined
+            && entry.remoteRevision===undefined
+        ) || (
+            (
+                entry.remoteKind==='missing'
+                || entry.remoteKind==='file'
+                || entry.remoteKind==='directory'
+                || entry.remoteKind==='other'
+            )
+            && this.isValidRecordedPathRevision(entry.remoteRevision)
+        );
+        return entry.version===1
+            && typeof entry.id==='string'
+            && /^[a-f0-9]{32}$/.test(entry.id)
+            && (entry.kind==='update' || entry.kind==='delete')
+            && (
+                entry.localKind==='file'
+                || entry.localKind==='missing'
+            )
+            && (
+                entry.kind==='update'
+                    ? entry.localKind==='file' && /^[a-f0-9]{40}$/.test(entry.localRevision ?? '')
+                    : entry.localKind==='missing' && entry.localRevision===DELETE_DIGEST
+            )
+            && validRemoteProof
+            && typeof entry.createdAt==='string'
+            && Number.isFinite(Date.parse(entry.createdAt))
+            && typeof entry.updatedAt==='string'
+            && Number.isFinite(Date.parse(entry.updatedAt));
+    }
+
     private isCanonicalReplicaRelPath(relPath: string): boolean {
         return relPath.length>1
             && relPath.startsWith('/')
@@ -3492,6 +3545,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 files?: Record<string, SyncManifestEntry>;
                 directories?: Record<string, SyncManifestDirectoryEntry>;
                 conflicts?: Record<string, SyncManifestConflictEntry>;
+                pendingOperations?: Record<string, SyncManifestPendingOperation>;
             };
             let sameProject = false;
             try {
@@ -3500,7 +3554,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } catch {
                 sameProject = false;
             }
-            const validShape = (manifest.version===1 || manifest.version===2)
+            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3)
                 && sameProject
                 && (manifest.baselineComplete===undefined || typeof manifest.baselineComplete==='boolean')
                 && this.isValidSyncManifestRecord<SyncManifestEntry>(
@@ -3524,6 +3578,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             this.isValidSyncManifestConflictEntry(value),
                     )
                 )
+                && (
+                    manifest.version!==3
+                    || this.isValidSyncManifestRecord<SyncManifestPendingOperation>(
+                        manifest.pendingOperations,
+                        (value): value is SyncManifestPendingOperation =>
+                            this.isValidSyncManifestPendingOperation(value),
+                    )
+                )
                 && this.hasValidSyncManifestTree(
                     manifest.files!,
                     manifest.directories ?? {},
@@ -3531,14 +3593,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (validShape) {
                 this.requireSyncSession(generation);
                 this.syncManifest = {
-                    version: 2,
+                    version: 3,
                     projectUri,
                     baselineComplete: manifest.baselineComplete!==false,
                     files: manifest.files!,
-                    directories: manifest.version===2 && manifest.directories
+                    directories: manifest.version!==1 && manifest.directories
                         ? manifest.directories
                         : {},
                     conflicts: manifest.conflicts ?? {},
+                    pendingOperations: manifest.version===3
+                        ? manifest.pendingOperations!
+                        : {},
                 };
                 this.syncConflicts = new Map(
                     Object.entries(this.syncManifest.conflicts)
@@ -3548,11 +3613,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     Object.entries(this.syncManifest.conflicts)
                         .map(([relPath, entry]) => [relPath, entry.localDigest]),
                 );
+                for (const relPath of Object.keys(this.syncManifest.pendingOperations)) {
+                    // A pending operation is a durable local intent that did not
+                    // yet receive an acknowledged terminal outcome. Keep it in
+                    // the compile barrier until startup reconciliation proves it
+                    // accepted, superseded, or conflicted.
+                    this.locallyDivergedPaths.add(relPath);
+                }
                 this.syncManifestBaselineMode = manifest.baselineComplete===false
                     ? 'unavailable'
                     : 'trusted';
                 this.syncManifestRevision += 1;
-                this.syncManifestDirty = manifest.version!==2
+                this.syncManifestDirty = manifest.version!==3
                     || manifest.directories===undefined
                     || manifest.conflicts===undefined
                     || manifest.baselineComplete===undefined
@@ -8340,6 +8412,101 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return true;
     }
 
+    // A watcher event is only an observation. Once a stable local file snapshot
+    // is available, retain that intent before any remote I/O so a restart can
+    // re-check the authoritative Overleaf state instead of forgetting it.
+    private async journalPendingFilePushOperation(
+        relPath: string,
+        kind: 'update' | 'delete',
+        localRevision: string,
+        remoteState: PathRevision | undefined,
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        if (!this.syncManifest) { return; }
+        const localKind = kind==='update' ? 'file' : 'missing';
+        if (
+            (kind==='update' && !/^[a-f0-9]{40}$/.test(localRevision))
+            || (kind==='delete' && localRevision!==DELETE_DIGEST)
+        ) {
+            throw new Error(`Invalid stable local revision for pending ${kind}: ${relPath}`);
+        }
+        const existing = this.syncManifest.pendingOperations[relPath];
+        const sameLocalIntent = existing?.kind===kind
+            && existing.localKind===localKind
+            && existing.localRevision===localRevision;
+        // Keep an already-observed precondition when this retry has not yet
+        // reached remote inspection. A changed local intent intentionally drops
+        // the old precondition: it described a different source snapshot.
+        const remoteKind = remoteState?.kind
+            ?? (sameLocalIntent ? existing?.remoteKind : undefined);
+        const remoteRevision = remoteState?.revision
+            ?? (sameLocalIntent ? existing?.remoteRevision : undefined);
+        const unchanged = sameLocalIntent
+            && existing?.remoteKind===remoteKind
+            && existing?.remoteRevision===remoteRevision;
+        if (unchanged) {
+            this.locallyDivergedPaths.add(relPath);
+            return;
+        }
+        const now = new Date().toISOString();
+        this.syncManifest.pendingOperations[relPath] = {
+            version: 1,
+            id: sameLocalIntent && existing
+                ? existing.id
+                : crypto.randomBytes(16).toString('hex'),
+            kind,
+            localKind,
+            localRevision,
+            remoteKind,
+            remoteRevision,
+            createdAt: sameLocalIntent && existing
+                ? existing.createdAt
+                : now,
+            updatedAt: now,
+        };
+        this.locallyDivergedPaths.add(relPath);
+        this.markSyncManifestDirty();
+        // This write is deliberately before a possible socket/HTTP mutation.
+        // If it cannot be persisted, fail closed rather than making the remote
+        // change impossible to recover after a process crash.
+        await this.persistSyncManifest(false, generation);
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [pending operation journaled] ${relPath} ` +
+            `kind=${kind} local=${localRevision.slice(0, 12)} ` +
+            `remote=${remoteKind ?? 'unobserved'}`,
+        );
+    }
+
+    private async removePendingFilePushOperation(
+        relPath: string,
+        reason: string,
+        generation = this.syncGeneration,
+        expected?: Pick<SyncManifestPendingOperation, 'kind' | 'localRevision'>,
+    ): Promise<boolean> {
+        this.requireSyncSession(generation);
+        const entry = this.syncManifest?.pendingOperations[relPath];
+        if (
+            !entry
+            || (
+                expected!==undefined
+                && (
+                    entry.kind!==expected.kind
+                    || entry.localRevision!==expected.localRevision
+                )
+            )
+        ) {
+            return false;
+        }
+        delete this.syncManifest!.pendingOperations[relPath];
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [pending operation acknowledged] ${relPath}: ${reason}`,
+        );
+        return true;
+    }
+
     private recordSyncManifestDirectory(relPath: string) {
         if (!this.syncManifest) { return; }
         this.syncManifest.directories[relPath] = {
@@ -8431,6 +8598,111 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.initialPullStatus = 'complete';
             this.partialPullToastGeneration = undefined;
         }
+    }
+
+    private async reconcilePendingFilePushOperationsOnStartup(
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        const pending = Object.entries(this.syncManifest?.pendingOperations ?? {})
+            .sort(([left], [right]) => left.localeCompare(right));
+        if (pending.length===0) { return; }
+        let recovered = 0;
+        for (const [relPath, recorded] of pending) {
+            if (!this.isSyncSessionActive(generation)) { return; }
+            if (this.touchesSyncConflict(relPath)) {
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [pending operation blocked:conflict] ${relPath}`,
+                );
+                continue;
+            }
+            try {
+                const localState = await this.captureLocalPathRevision(relPath, generation);
+                if (localState.kind!=='file' && localState.kind!=='missing') {
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [pending operation deferred:local-type] ${relPath} ` +
+                        `kind=${localState.kind}`,
+                    );
+                    continue;
+                }
+                const remoteState = await this.captureRemotePathRevision(relPath, generation);
+                this.requireSyncSession(generation);
+                const statesMatch = (
+                    localState.kind==='missing'
+                    && remoteState.kind==='missing'
+                ) || (
+                    localState.kind==='file'
+                    && remoteState.kind==='file'
+                    && localState.revision===remoteState.revision
+                );
+                if (statesMatch) {
+                    if (localState.kind==='file') {
+                        const stable = await this.recordSyncManifestEntry(
+                            relPath,
+                            this.vfs.pathToUri(relPath),
+                            localState.content!,
+                            generation,
+                        );
+                        if (!stable) { continue; }
+                        this.baseCache[relPath] = localState.content!;
+                        this.seenLocalEntities.add(relPath);
+                    } else {
+                        delete this.baseCache[relPath];
+                        this.seenLocalEntities.delete(relPath);
+                        this.removeSyncManifestEntry(relPath);
+                        this.removeSyncManifestDirectory(relPath);
+                    }
+                    this.clearRemoteDelete(relPath);
+                    this.locallyDivergedPaths.delete(relPath);
+                    if (await this.removePendingFilePushOperation(
+                        relPath,
+                        'current local state already matches authoritative Overleaf',
+                        generation,
+                    )) {
+                        recovered += 1;
+                    }
+                    continue;
+                }
+
+                const remotePreconditionChanged = recorded.remoteKind!==undefined
+                    && (
+                        recorded.remoteKind!==remoteState.kind
+                        || recorded.remoteRevision!==remoteState.revision
+                    );
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [pending operation replay] ${relPath} ` +
+                    `kind=${localState.kind==='missing' ? 'delete' : 'update'} ` +
+                    `remotePrecondition=${remotePreconditionChanged ? 'advanced' : 'current'}`,
+                );
+                const event = await this.applySync(
+                    'push',
+                    localState.kind==='missing' ? 'delete' : 'update',
+                    relPath,
+                    this.localUri(relPath),
+                    this.vfs.pathToUri(relPath),
+                    {forcePush: true, reason: 'pending-operation-recovery'},
+                    generation,
+                );
+                if (
+                    (event.outcome==='success' || event.outcome==='suppressed')
+                    && this.syncManifest?.pendingOperations[relPath]===undefined
+                ) {
+                    recovered += 1;
+                }
+            } catch (error) {
+                if (!this.isSyncSessionActive(generation)) { return; }
+                this.locallyDivergedPaths.add(relPath);
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [pending operation replay deferred] ${relPath}: ` +
+                    formatUnknownError(error),
+                );
+            }
+        }
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [pending operation replay complete] ` +
+            `recovered=${recovered} remaining=${Object.keys(
+                this.syncManifest?.pendingOperations ?? {},
+            ).length}`,
+        );
     }
 
     private rememberRemoteDelete(relPath: string, content?: Uint8Array, staleLocalMtime?: number) {
@@ -10164,6 +10436,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         let errorMessage: string | undefined;
         let authoritativePullCompleted = false;
         let resolveConflict = false;
+        let acknowledgedPendingFilePush: Pick<SyncManifestPendingOperation, 'kind' | 'localRevision'> | undefined;
         let conflictResolutionProof: ConflictResolutionProof | undefined;
 
         try {
@@ -10393,6 +10666,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         outcome = 'suppressed';
                         return;
                     }
+                    if (!directoryDelete) {
+                        const localDeleteSnapshot = await this.captureLocalPathRevision(
+                            relPath,
+                            generation,
+                        );
+                        if (localDeleteSnapshot.kind==='missing') {
+                            await this.journalPendingFilePushOperation(
+                                relPath, 'delete', DELETE_DIGEST, undefined, generation,
+                            );
+                        }
+                    }
                     remoteDeleteState = resolveConflict
                         ? conflictResolutionProof?.remoteState
                         : await this.captureRemotePathRevision(relPath, generation);
@@ -10400,6 +10684,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         outcome = 'blocked';
                         errorMessage = 'missing verified remote conflict revision';
                         return;
+                    }
+                    if (!directoryDelete) {
+                        await this.journalPendingFilePushOperation(
+                            relPath, 'delete', DELETE_DIGEST, remoteDeleteState, generation,
+                        );
                     }
                     if (remoteDeleteState.kind==='missing') {
                         targetAlreadyMissing = true;
@@ -10649,6 +10938,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     directoryDelete,
                     action==='push',
                 );
+                if (action==='push' && !directoryDelete) {
+                    acknowledgedPendingFilePush = {
+                        kind: 'delete',
+                        localRevision: DELETE_DIGEST,
+                    };
+                }
                 await this.persistSyncManifest(false, generation);
                 this.requireSyncSession(generation);
                 if (
@@ -10792,6 +11087,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         if (action==='pull') {
                             authoritativePullCompleted = true;
                         }
+                        if (action==='push') {
+                            await this.journalPendingFilePushOperation(
+                                relPath, 'update', contentDigest(newContent), undefined, generation,
+                            );
+                        }
                         let writeMergedContentBackToLocal = false;
                         let remoteBaselineForPush: Uint8Array | undefined;
                         let expectedRemoteMissingForPush = false;
@@ -10928,6 +11228,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                         newContent,
                                         generation,
                                     );
+                                    await this.removePendingFilePushOperation(
+                                        relPath,
+                                        'current local state already matches authoritative Overleaf',
+                                        generation,
+                                        {kind: 'update', localRevision: contentDigest(newContent)},
+                                    );
                                     await this.persistSyncManifest(false, generation);
                                     this.requireSyncSession(generation);
                                     getOutputChannel().appendLine(
@@ -10965,6 +11271,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                         toUri,
                                         fromUri,
                                         remoteContent,
+                                        generation,
+                                    );
+                                    await this.removePendingFilePushOperation(
+                                        relPath,
+                                        'local intent was superseded by an authoritative Overleaf update',
                                         generation,
                                     );
                                     await this.persistSyncManifest(false, generation);
@@ -11010,6 +11321,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                             fromUri,
                                             newContent,
                                             generation,
+                                        );
+                                        await this.removePendingFilePushOperation(
+                                            relPath,
+                                            'current local state already matches authoritative Overleaf',
+                                            generation,
+                                            {kind: 'update', localRevision: contentDigest(newContent)},
                                         );
                                         await this.persistSyncManifest(false, generation);
                                         getOutputChannel().appendLine(
@@ -11234,6 +11551,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             // await disk and network I/O that can outlive the
                             // sync session.
                             this.requireSyncSession(generation);
+                            const pendingPushRevision = contentDigest(newContent);
+                            const pendingRemoteState = await this.captureRemotePathRevision(
+                                relPath,
+                                generation,
+                            );
+                            await this.journalPendingFilePushOperation(
+                                relPath, 'update', pendingPushRevision, pendingRemoteState, generation,
+                            );
                             // Push with bounded retry so a transient socket blip doesn't
                             // silently lose the accepted edit.
                             try {
@@ -11301,6 +11626,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 }
                                 this.setBypassCache(relPath, newContent, 'pull');
                             }
+                            acknowledgedPendingFilePush = {
+                                kind: 'update',
+                                localRevision: pendingPushRevision,
+                            };
                         } else {
                             const wroteRemoteContent = await this.writeLocalFileIfRevision(
                                 relPath,
@@ -11422,6 +11751,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
         }
 
+        if (
+            action==='push'
+            && outcome==='success'
+            && acknowledgedPendingFilePush!==undefined
+            && this.isSyncSessionActive(generation)
+        ) {
+            try {
+                await this.removePendingFilePushOperation(
+                    relPath,
+                    'Overleaf accepted the local operation',
+                    generation,
+                    acknowledgedPendingFilePush,
+                );
+            } catch (error) {
+                getOutputChannel().appendLine(
+                    new Date().toISOString() + ' [pending operation acknowledgement deferred] '
+                    + relPath + ': ' + formatUnknownError(error),
+                );
+            }
+        }
         if (
             new Set<string>(['success', 'suppressed']).has(outcome)
             && action==='pull'
@@ -11890,6 +12239,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 remoteBootstrapPromise,
             );
             if (completed!==true || !this.isSyncSessionActive(activeGeneration)) { return false; }
+            await this.reconcilePendingFilePushOperationsOnStartup(activeGeneration);
+            if (!this.isSyncSessionActive(activeGeneration)) { return false; }
         } catch (error) {
             if (!this.isSyncSessionActive(activeGeneration)) { return false; }
             this.initialPullStatus = 'partial';

@@ -2848,6 +2848,179 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(flush.blockedCount, 0);
     });
 
+    test('journals an interrupted local update until restart reconciliation receives an acknowledgement', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-pending-update-remote-');
+        const localRoot = await tempDir('sr-overleaf-pending-update-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeText(localMain, 'offline local update');
+        (firstScm as any).pushWithRetry = async () => {
+            throw new Error('simulated offline write');
+        };
+
+        const event = await (firstScm as any).applySync(
+            'push', 'update', '/main.tex', localMain, remoteMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(event.outcome, 'error');
+        assert.strictEqual(await readText(remoteMain), 'baseline');
+
+        const manifestUri = vscode.Uri.joinPath(
+            localRoot, REPLICA_SETTINGS_DIR, 'sync-manifest.json',
+        );
+        const interruptedManifest = JSON.parse(await readText(manifestUri));
+        const pending = interruptedManifest.pendingOperations['/main.tex'];
+        assert.strictEqual(interruptedManifest.version, 3);
+        assert.strictEqual(pending.kind, 'update');
+        assert.strictEqual(pending.localKind, 'file');
+        assert.strictEqual(pending.localRevision, sha1('offline local update'));
+        assert.strictEqual(pending.remoteKind, 'file');
+        assert.strictEqual(pending.remoteRevision, sha1('baseline'));
+
+        await firstScm.deactivate();
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.strictEqual(await readText(localMain), 'offline local update');
+        assert.strictEqual(await readText(remoteMain), 'offline local update');
+        const recoveredManifest = JSON.parse(await readText(manifestUri));
+        assert.deepStrictEqual(recoveredManifest.pendingOperations, {});
+        assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), false);
+    });
+
+    test('keeps a journaled offline update unresolved when Overleaf changed the same text', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-pending-conflict-remote-');
+        const localRoot = await tempDir('sr-overleaf-pending-conflict-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'title: baseline\nbody: baseline\n');
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeText(localMain, 'title: local\nbody: baseline\n');
+        (firstScm as any).pushWithRetry = async () => {
+            throw new Error('simulated offline write');
+        };
+
+        const interrupted = await (firstScm as any).applySync(
+            'push', 'update', '/main.tex', localMain, remoteMain,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(interrupted.outcome, 'error');
+        await firstScm.deactivate();
+        await writeText(remoteMain, 'title: Overleaf collaborator\nbody: baseline\n');
+
+        const manifestUri = vscode.Uri.joinPath(
+            localRoot, REPLICA_SETTINGS_DIR, 'sync-manifest.json',
+        );
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+
+        assert.strictEqual(
+            await readText(localMain),
+            'title: local\nbody: baseline\n',
+        );
+        assert.strictEqual(
+            await readText(remoteMain),
+            'title: Overleaf collaborator\nbody: baseline\n',
+        );
+        await assert.rejects(
+            () => restartedScm.flushBeforeCompile([]),
+            /both changed|sync conflict|concurrent edits/i,
+        );
+        const conflictManifest = JSON.parse(await readText(manifestUri));
+        assert.strictEqual(
+            conflictManifest.pendingOperations['/main.tex'].kind,
+            'update',
+        );
+        assert.strictEqual(
+            conflictManifest.pendingOperations['/main.tex'].localRevision,
+            sha1('title: local\nbody: baseline\n'),
+        );
+        assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), true);
+    });
+
+    test('journals an interrupted local delete until restart reconciliation applies it', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-pending-delete-remote-');
+        const localRoot = await tempDir('sr-overleaf-pending-delete-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeText(remoteMain, 'baseline');
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.delete(localMain);
+        const originalPushRetryDelays = (LocalReplicaSCMProvider as any).pushRetryDelays;
+        (LocalReplicaSCMProvider as any).pushRetryDelays = [0];
+        (firstScm as any).atomicDeleteRemotePathIfRevision = async () => {
+            throw new Error('simulated offline delete');
+        };
+        let event: Events['scmSyncCompleteEvent'];
+        try {
+            event = await (firstScm as any).applySync(
+                'push', 'delete', '/main.tex', localMain, remoteMain,
+            ) as Events['scmSyncCompleteEvent'];
+        } finally {
+            (LocalReplicaSCMProvider as any).pushRetryDelays = originalPushRetryDelays;
+        }
+        assert.strictEqual(event.outcome, 'error');
+        assert.strictEqual(await readText(remoteMain), 'baseline');
+
+        const manifestUri = vscode.Uri.joinPath(
+            localRoot, REPLICA_SETTINGS_DIR, 'sync-manifest.json',
+        );
+        const interruptedManifest = JSON.parse(await readText(manifestUri));
+        const pending = interruptedManifest.pendingOperations['/main.tex'];
+        assert.strictEqual(pending.kind, 'delete');
+        assert.strictEqual(pending.localKind, 'missing');
+        assert.strictEqual(pending.localRevision, '\0');
+        assert.strictEqual(pending.remoteKind, 'file');
+
+        await firstScm.deactivate();
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.strictEqual(await pathExists(remoteMain), false);
+        const recoveredManifest = JSON.parse(await readText(manifestUri));
+        assert.deepStrictEqual(recoveredManifest.pendingOperations, {});
+        assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), false);
+    });
+
+    test('migrates a version 2 manifest to the version 3 journal schema', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-manifest-v3-remote-');
+        const localRoot = await tempDir('sr-overleaf-manifest-v3-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'baseline');
+        const firstScm = createSCM(remoteRoot, localRoot);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const manifestUri = vscode.Uri.joinPath(
+            localRoot, REPLICA_SETTINGS_DIR, 'sync-manifest.json',
+        );
+        const legacyManifest = JSON.parse(await readText(manifestUri));
+        legacyManifest.version = 2;
+        delete legacyManifest.pendingOperations;
+        await writeText(manifestUri, JSON.stringify(legacyManifest));
+
+        await firstScm.deactivate();
+        const restartedScm = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        const migratedManifest = JSON.parse(await readText(manifestUri));
+        assert.strictEqual(migratedManifest.version, 3);
+        assert.deepStrictEqual(migratedManifest.pendingOperations, {});
+    });
+
     test('quarantines one-sided legacy replica files, media, and folders without a manifest', async () => {
         const remoteRoot = await tempDir('sr-overleaf-legacy-baseline-remote-');
         const localRoot = await tempDir('sr-overleaf-legacy-baseline-local-');
