@@ -19042,6 +19042,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
             }
             await this.hydrateMissingConflictRemoteProofs(activeGeneration);
+            // A persisted folder decision can have staged the authoritative tree
+            // just before its phase write was interrupted. Resume it before the
+            // ordinary initial overwrite inspects that same divergent local
+            // folder; otherwise the bootstrap can mistake it for an unrelated
+            // local create/update and prevent its guarded recovery.
+            const pendingFolderResolutionCount = Object.values(
+                this.syncManifest?.folderConflictResolutions ?? {},
+            ).filter(record => record.phase!=='blocked').length;
+            if (pendingFolderResolutionCount>0) {
+                getOutputChannel().appendLine(
+                    new Date().toISOString()
+                    + ' [folder conflict resolution preflight] '
+                    + pendingFolderResolutionCount
+                    + ' persisted decision(s)',
+                );
+                await this.reconcilePersistedFolderConflictResolutionTransactions(
+                    activeGeneration,
+                );
+                this.requireSyncSession(activeGeneration);
+            }
             const recoveryReadyAt = Date.now();
             getOutputChannel().appendLine(
                 `${new Date().toISOString()} [initial pull preflight complete] ` +

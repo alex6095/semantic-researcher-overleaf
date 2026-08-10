@@ -6113,6 +6113,67 @@ suite('Select Project Folder Local Replica', function () {
         );
     });
 
+    test('recovers a folder replacement when remote-stage phase persistence is interrupted', async () => {
+        const fixture = await createFolderReplacementConflictFixture(
+            'folder-replacement-stage-phase-persist',
+        );
+        const originalPersist = (fixture.scm as any)
+            .persistSyncManifest.bind(fixture.scm);
+        let interrupted = false;
+        (fixture.scm as any).persistSyncManifest = async (...args: unknown[]) => {
+            const record = (fixture.scm as any).syncManifest
+                .folderConflictResolutions['/chapter'];
+            if (!interrupted && record?.phase==='remote-staged') {
+                interrupted = true;
+                throw new Error('simulated remote-stage phase persistence interruption');
+            }
+            return originalPersist(...args);
+        };
+
+        try {
+            const result = await fixture.scm.resolveFolderConflictWithOverleafState(
+                '/chapter',
+                true,
+            );
+            assert.strictEqual(result.resolved, false);
+        } finally {
+            (fixture.scm as any).persistSyncManifest = originalPersist;
+        }
+
+        assert.strictEqual(interrupted, true);
+        const interruptedRecord = (fixture.scm as any).syncManifest
+            .folderConflictResolutions['/chapter'];
+        assert.strictEqual(interruptedRecord.phase, 'remote-staged');
+        assert.strictEqual(await pathExists(fixture.localFolder), true);
+        assert.deepStrictEqual(await readBytes(fixture.localPdf), fixture.localPdfContent);
+        await fixture.scm.deactivate();
+        const restarted = createSCM(
+            fixture.remoteRoot,
+            fixture.localRoot,
+            fixture.fakeVfs,
+        );
+        assert.strictEqual(
+            await restarted.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.strictEqual(
+            await readText(vscode.Uri.joinPath(fixture.localFolder, 'remote.tex')),
+            fixture.replacementTexContent,
+        );
+        assert.deepStrictEqual(
+            await readBytes(uriForRelPath(
+                fixture.localRoot,
+                interruptedRecord.artifactRelPath + '/paper.pdf',
+            )),
+            fixture.localPdfContent,
+        );
+        assert.strictEqual((restarted as any).syncConflicts.has('/chapter'), false);
+        assert.strictEqual(
+            (restarted as any).syncManifest.folderConflictResolutions['/chapter'],
+            undefined,
+        );
+    });
+
     test('defers a persisted folder replacement during a transient reconciliation failure', async () => {
         const fixture = await createFolderReplacementConflictFixture(
             'folder-replacement-reconcile-deferred',
