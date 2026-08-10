@@ -3099,6 +3099,70 @@ suite('Select Project Folder Local Replica', function () {
         assert.deepStrictEqual((restartedScm as any).syncManifest.pendingOperations, {});
     });
 
+    test('resumes a cross-folder move after only its remote rename half was applied', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-local-move-intermediate-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-move-intermediate-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteOld = vscode.Uri.joinPath(remoteRoot, 'figures', 'draft.pdf');
+        const remoteIntermediate = vscode.Uri.joinPath(remoteRoot, 'figures', 'final.pdf');
+        const remoteNew = vscode.Uri.joinPath(remoteRoot, 'archive', 'final.pdf');
+        const localOld = vscode.Uri.joinPath(localRoot, 'figures', 'draft.pdf');
+        const localNew = vscode.Uri.joinPath(localRoot, 'archive', 'final.pdf');
+        const pdf = Buffer.from('%PDF-1.7 two step replay\n', 'utf-8');
+        await writeBytes(remoteOld, pdf);
+        await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(remoteRoot, 'archive'));
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('figures/draft.pdf', 'file-two-step-entity');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let interruptedAfterRename = true;
+        fakeVfs.rename = async (
+            oldUri: vscode.Uri,
+            newUri: vscode.Uri,
+            force: boolean,
+            expectedEntity?: {id: string; type: 'doc' | 'file'},
+        ) => {
+            if (interruptedAfterRename) {
+                interruptedAfterRename = false;
+                await originalRename(oldUri, remoteIntermediate, force, expectedEntity);
+                throw new Error('simulated transport loss after remote rename');
+            }
+            await originalRename(oldUri, newUri, force, expectedEntity);
+        };
+
+        await vscode.workspace.fs.rename(localOld, localNew, {overwrite: false});
+        await (scm as any).syncToVFS(localOld, 'delete');
+        await (scm as any).syncToVFS(localNew, 'update');
+        await new Promise<void>(resolve => setTimeout(resolve, 400));
+        await (scm as any).drainPendingSyncWork();
+
+        assert.strictEqual(await pathExists(remoteOld), false);
+        assert.deepStrictEqual(await readBytes(remoteIntermediate), pdf);
+        assert.strictEqual(await pathExists(remoteNew), false);
+        assert.strictEqual((scm as any).syncConflicts.get('/archive/final.pdf'), undefined);
+        assert.strictEqual(
+            (scm as any).syncManifest.pendingOperations['/figures/draft.pdf'].kind,
+            'move',
+        );
+
+        fakeVfs.rename = originalRename;
+        await scm.deactivate();
+        const restartedScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true});
+
+        assert.strictEqual(await pathExists(remoteOld), false);
+        assert.strictEqual(await pathExists(remoteIntermediate), false);
+        assert.deepStrictEqual(await readBytes(remoteNew), pdf);
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(remoteNew)).fileEntity._id,
+            'file-two-step-entity',
+        );
+        assert.deepStrictEqual((restartedScm as any).syncManifest.pendingOperations, {});
+    });
+
     test('preserves both sides when a local move destination is occupied remotely', async () => {
         const remoteRoot = await tempDir('sr-overleaf-local-move-conflict-remote-');
         const localRoot = await tempDir('sr-overleaf-local-move-conflict-local-');

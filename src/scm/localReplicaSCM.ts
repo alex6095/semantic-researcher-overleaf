@@ -238,6 +238,7 @@ type PendingLocalMoveInspection = {
     destinationState: PathRevision;
     accepted: boolean;
     ready: boolean;
+    resumeSourceRelPath?: string;
 };
 
 interface LocalReplicaOperationRecord {
@@ -8892,6 +8893,30 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return actual?.id===expected.id && actual.type===expected.type;
     }
 
+    // A cross-parent basename change is two server mutations. The current VFS
+    // performs rename first, then move. Older builds could leave the inverse
+    // intermediate (moved under its old basename), so recognize both entity-
+    // proven states when replaying an already durable local move intent.
+    private pendingLocalMoveIntermediateRelPaths(
+        sourceRelPath: string,
+        destinationRelPath: string,
+    ): string[] {
+        const sourceParent = nodePath.posix.dirname(sourceRelPath);
+        const destinationParent = nodePath.posix.dirname(destinationRelPath);
+        const sourceName = nodePath.posix.basename(sourceRelPath);
+        const destinationName = nodePath.posix.basename(destinationRelPath);
+        if (sourceParent===destinationParent || sourceName===destinationName) {
+            return [];
+        }
+        return [
+            nodePath.posix.join(sourceParent, destinationName),
+            nodePath.posix.join(destinationParent, sourceName),
+        ].filter((relPath, index, candidates) =>
+            this.isCanonicalReplicaRelPath(relPath)
+            && candidates.indexOf(relPath)===index,
+        );
+    }
+
     private async inspectPendingLocalFileMove(
         sourceRelPath: string,
         record: SyncManifestPendingMoveOperation,
@@ -8906,6 +8931,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.requireSyncSession(generation);
         let accepted = false;
         let ready = false;
+        let resumeSourceRelPath: string | undefined;
         if (
             sourceState.kind==='missing'
             && destinationState.kind==='file'
@@ -8932,7 +8958,39 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.requireSyncSession(generation);
             ready = this.remoteMoveEntityMatches(sourceEntity, record.sourceEntity);
         }
-        return {sourceState, destinationState, accepted, ready};
+        if (
+            !accepted
+            && !ready
+            && sourceState.kind==='missing'
+            && destinationState.kind==='missing'
+        ) {
+            for (const intermediateRelPath of this.pendingLocalMoveIntermediateRelPaths(
+                sourceRelPath,
+                destinationRelPath,
+            )) {
+                const intermediateState = await this.captureRemotePathRevision(
+                    intermediateRelPath,
+                    generation,
+                );
+                this.requireSyncSession(generation);
+                if (
+                    intermediateState.kind!=='file'
+                    || intermediateState.revision!==record.localRevision
+                ) {
+                    continue;
+                }
+                const intermediateEntity = await this.resolveRemoteEntityIdentity(
+                    this.vfs.pathToUri(intermediateRelPath),
+                );
+                this.requireSyncSession(generation);
+                if (this.remoteMoveEntityMatches(intermediateEntity, record.sourceEntity)) {
+                    ready = true;
+                    resumeSourceRelPath = intermediateRelPath;
+                    break;
+                }
+            }
+        }
+        return {sourceState, destinationState, accepted, ready, resumeSourceRelPath};
     }
 
     private async finalizeAcceptedLocalFileMove(
@@ -9035,11 +9093,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         let mutationError: unknown;
         try {
             await this.vfs.ensureConnectedForWrite();
+            const mutationSourceRelPath = inspection.resumeSourceRelPath ?? sourceRelPath;
             this.requireSyncSession(generation);
             await this.runSessionIO(
                 generation,
                 () => this.vfs.rename(
-                    this.vfs.pathToUri(sourceRelPath),
+                    this.vfs.pathToUri(mutationSourceRelPath),
                     this.vfs.pathToUri(record.destinationRelPath),
                     false,
                     record.sourceEntity,

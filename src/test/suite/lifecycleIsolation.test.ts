@@ -3119,6 +3119,104 @@ suite('Extension host and lifecycle isolation', () => {
         }
     });
 
+    test('uses entity-preserving rename then move for a cross-folder basename change', async () => {
+        const originalAuthenticate = (GlobalStateManager as any).authenticate;
+        (GlobalStateManager as any).authenticate = async () => ({csrfToken: 'test-token'});
+
+        const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
+        const internals = vfs as any;
+        const sourceParent = {_id: 'figures-folder'};
+        const destinationParent = {_id: 'archive-folder'};
+        const entity = {_id: 'file-1', name: 'draft.pdf'};
+        const oldUri = vscode.Uri.file('/tmp/figures/draft.pdf');
+        const intermediateUri = vscode.Uri.file('/tmp/figures/final.pdf');
+        const newUri = vscode.Uri.file('/tmp/archive/final.pdf');
+        const apiCalls: Array<{operation: string; args: unknown[]}> = [];
+        const removed: Array<{parent: unknown; type: string; entity: unknown}> = [];
+        const inserted: Array<{parent: unknown; type: string; entity: unknown}> = [];
+        const notifications: vscode.FileChangeEvent[][] = [];
+        attachAuthenticatedSession(internals);
+        internals.disposed = false;
+        internals.projectId = 'project-1';
+        internals.api = {
+            renameEntity: async (...args: unknown[]) => {
+                apiCalls.push({operation: 'rename', args});
+                return {type: 'success'};
+            },
+            moveEntity: async (...args: unknown[]) => {
+                apiCalls.push({operation: 'move', args});
+                return {type: 'success'};
+            },
+        };
+        internals._resolveUri = async (uri: vscode.Uri) => {
+            if (uri.toString()===oldUri.toString()) {
+                return {
+                    parentFolder: sourceParent,
+                    fileName: 'draft.pdf',
+                    fileType: 'file',
+                    fileEntity: entity,
+                };
+            }
+            if (uri.toString()===intermediateUri.toString()) {
+                return {
+                    parentFolder: sourceParent,
+                    fileName: 'final.pdf',
+                    fileType: undefined,
+                    fileEntity: undefined,
+                };
+            }
+            if (uri.toString()===newUri.toString()) {
+                return {
+                    parentFolder: destinationParent,
+                    fileName: 'final.pdf',
+                    fileType: undefined,
+                    fileEntity: undefined,
+                };
+            }
+            throw new Error(`Unexpected VFS URI: ${uri.toString()}`);
+        };
+        internals.removeEntity = (parent: unknown, type: string, removedEntity: unknown) => {
+            removed.push({parent, type, entity: removedEntity});
+        };
+        internals.insertEntity = (parent: unknown, type: string, insertedEntity: unknown) => {
+            inserted.push({parent, type, entity: insertedEntity});
+        };
+        internals.notify = (events: vscode.FileChangeEvent[]) => notifications.push(events);
+
+        try {
+            await internals.rename(
+                oldUri,
+                newUri,
+                false,
+                {id: 'file-1', type: 'file'},
+            );
+            assert.deepStrictEqual(
+                apiCalls.map(call => [call.operation, ...call.args.slice(2)]),
+                [
+                    ['rename', 'file', 'file-1', 'final.pdf'],
+                    ['move', 'file', 'file-1', 'archive-folder'],
+                ],
+            );
+            assert.strictEqual(entity.name, 'final.pdf');
+            assert.deepStrictEqual(removed, [{
+                parent: sourceParent,
+                type: 'file',
+                entity,
+            }]);
+            assert.deepStrictEqual(inserted, [{
+                parent: destinationParent,
+                type: 'file',
+                entity,
+            }]);
+            assert.deepStrictEqual(notifications, [[
+                {type: vscode.FileChangeType.Deleted, uri: oldUri},
+                {type: vscode.FileChangeType.Created, uri: newUri},
+            ]]);
+        } finally {
+            (GlobalStateManager as any).authenticate = originalAuthenticate;
+        }
+    });
+
     test('passes the v2 project handshake through the Socket.IO query option', () => {
         const socketClient = require('socket.io-client') as {
             connect: (url: string, options: Record<string, unknown>) => unknown;

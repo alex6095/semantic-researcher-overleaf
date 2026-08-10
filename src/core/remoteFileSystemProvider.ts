@@ -2325,6 +2325,32 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
+    private async confirmRenamePostconditionAfterUncertainFailure(
+        oldUri: vscode.Uri,
+        newUri: vscode.Uri,
+        entityType: FileType,
+        entityId: string,
+    ): Promise<boolean> {
+        try {
+            await this.reconnect(`verify rename/move ${oldUri.path} -> ${newUri.path}`);
+        } catch {
+            throw new RemoteMutationRetryableError(
+                `Could not verify the Overleaf entity after rename/move: ${oldUri.path}`,
+                true,
+            );
+        }
+        this.requireCurrentSession();
+        const actual = this._resolveById(entityId);
+        if (actual===undefined || actual.fileType!==entityType) {
+            throw new RemoteMutationRetryableError(
+                `Could not find the expected Overleaf entity after rename/move: ${oldUri.path}`,
+                true,
+            );
+        }
+        const desiredPath = '/' + parseUri(newUri).pathParts.filter(Boolean).join('/');
+        return actual.path.replace(/\/+$/, '')===desiredPath.replace(/\/+$/, '');
+    }
+
     async rename(
         oldUri: vscode.Uri,
         newUri: vscode.Uri,
@@ -2353,15 +2379,90 @@ export class VirtualFileSystem extends vscode.Disposable {
                 }
                 await this.remove(newUri, true);
             }
-            // rename or move
-            let res = undefined;
+            // A cross-folder rename needs two official project-tree operations:
+            // rename keeps the entity ID while changing its basename, then move
+            // changes its parent. Calling only moveEntity and updating the cache
+            // to the requested basename would fabricate a path Overleaf never
+            // accepted.
+            let res: any;
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
             if (oldPath.parentFolder===newPath.parentFolder) {
-                const [entityType, entityId, newName] = [oldPath.fileType, oldPath.fileEntity._id, newPath.fileName];
-                res = await this.api.renameEntity(identity, this.projectId, entityType, entityId, newName);
+                try {
+                    res = await this.api.renameEntity(
+                        identity,
+                        this.projectId,
+                        oldPath.fileType,
+                        oldPath.fileEntity._id,
+                        newPath.fileName,
+                    );
+                    this.requireCurrentSession();
+                } catch (error) {
+                    if (await this.confirmRenamePostconditionAfterUncertainFailure(
+                        oldUri, newUri, oldPath.fileType, oldPath.fileEntity._id,
+                    )) {
+                        return;
+                    }
+                    throw error;
+                }
             } else {
-                const [entityType, entityId, newParentFolderId] = [oldPath.fileType, oldPath.fileEntity._id, newPath.parentFolder._id];
-                res = await this.api.moveEntity(identity, this.projectId, entityType, entityId, newParentFolderId);
+                const changesBasename = oldPath.fileName!==newPath.fileName;
+                if (changesBasename) {
+                    const sourceParentPath = oldUri.path.slice(0, oldUri.path.lastIndexOf('/')+1);
+                    const intermediateUri = oldUri.with({
+                        path: sourceParentPath + newPath.fileName,
+                    });
+                    const intermediatePath = await this._resolveUri(intermediateUri);
+                    if (intermediatePath.fileType) {
+                        throw vscode.FileSystemError.FileExists(intermediateUri);
+                    }
+                    try {
+                        res = await this.api.renameEntity(
+                            identity,
+                            this.projectId,
+                            oldPath.fileType,
+                            oldPath.fileEntity._id,
+                            newPath.fileName,
+                        );
+                        this.requireCurrentSession();
+                    } catch (error) {
+                        if (await this.confirmRenamePostconditionAfterUncertainFailure(
+                            oldUri, newUri, oldPath.fileType, oldPath.fileEntity._id,
+                        )) {
+                            return;
+                        }
+                        throw error;
+                    }
+                    if (res?.type!=='success') {
+                        const message = res?.message
+                            ?? `Could not rename Overleaf ${oldPath.fileType} "${oldPath.fileEntity.name}".`;
+                        vscode.window.showErrorMessage(message);
+                        throw this.createMutationResponseError(message, res?.status);
+                    }
+                }
+                try {
+                    res = await this.api.moveEntity(
+                        identity,
+                        this.projectId,
+                        oldPath.fileType,
+                        oldPath.fileEntity._id,
+                        newPath.parentFolder._id,
+                    );
+                    this.requireCurrentSession();
+                } catch (error) {
+                    if (await this.confirmRenamePostconditionAfterUncertainFailure(
+                        oldUri, newUri, oldPath.fileType, oldPath.fileEntity._id,
+                    )) {
+                        return;
+                    }
+                    throw error;
+                }
+                if (res?.type!=='success' && changesBasename) {
+                    if (await this.confirmRenamePostconditionAfterUncertainFailure(
+                        oldUri, newUri, oldPath.fileType, oldPath.fileEntity._id,
+                    )) {
+                        return;
+                    }
+                }
             }
             this.requireCurrentSession();
             // update local cache
