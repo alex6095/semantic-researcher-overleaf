@@ -3672,6 +3672,418 @@ suite('Select Project Folder Local Replica', function () {
         assert.deepStrictEqual((scm as any).syncManifest.pendingOperations, {});
     });
 
+
+    test('keeps a journaled file move conflicted when its source parent is replaced at the rename boundary', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-file-move-source-parent-race-remote-');
+        const localRoot = await tempDir('sr-overleaf-file-move-source-parent-race-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteSource = vscode.Uri.joinPath(remoteRoot, 'drafts', 'draft.pdf');
+        const remoteArchive = vscode.Uri.joinPath(remoteRoot, 'archive');
+        const remoteDestination = vscode.Uri.joinPath(remoteArchive, 'final.pdf');
+        const localSource = vscode.Uri.joinPath(localRoot, 'drafts', 'draft.pdf');
+        const localDestination = vscode.Uri.joinPath(localRoot, 'archive', 'final.pdf');
+        const pdf = Buffer.from('%PDF-1.7 source parent race\\n', 'utf-8');
+        await writeBytes(remoteSource, pdf);
+        await vscode.workspace.fs.createDirectory(remoteArchive);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('drafts', 'file-source-parent-original');
+        fakeVfs.setEntityId('archive', 'file-destination-parent-original');
+        fakeVfs.setEntityId('drafts/draft.pdf', 'file-source-parent-race-entity');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.rename(localSource, localDestination, {overwrite: false});
+        const sourceRelPath = '/drafts/draft.pdf';
+        const destinationRelPath = '/archive/final.pdf';
+        const sourceEntry = scm.syncManifest.files[sourceRelPath];
+        const sourceState = await scm.captureRemotePathRevision(sourceRelPath);
+        const parentProof = await scm.capturePendingLocalFileMoveParentProof(
+            sourceRelPath,
+            destinationRelPath,
+            sourceEntry,
+        );
+        const record = await scm.journalPendingLocalFileMove(
+            sourceRelPath,
+            destinationRelPath,
+            sourceEntry,
+            sourceState,
+            parentProof,
+        );
+        assert.strictEqual(record.sourceParentEntity.id, 'file-source-parent-original');
+
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let renameAttempted = 0;
+        fakeVfs.rename = async (...args: Parameters<FakeVirtualFileSystem['rename']>) => {
+            renameAttempted += 1;
+            // This models a collaborator replacing /drafts after the client
+            // inspected the move but before the request's entity guard runs.
+            fakeVfs.setEntityId('drafts', 'file-source-parent-collaborator');
+            return originalRename(...args);
+        };
+        try {
+            const outcome = await scm.executePendingLocalFileMove(
+                sourceRelPath,
+                record,
+                await readBytes(localDestination),
+            );
+
+            assert.strictEqual(outcome, 'conflict');
+            assert.strictEqual(renameAttempted, 1);
+            assert.deepStrictEqual(await readBytes(remoteSource), pdf);
+            assert.strictEqual(await pathExists(remoteDestination), false);
+            assert.match(scm.syncConflicts.get(destinationRelPath), /local move|Overleaf changed/i);
+            const pending = scm.syncManifest.pendingOperations[sourceRelPath];
+            assert.strictEqual(pending.kind, 'move');
+            assert.strictEqual(pending.sourceParentEntity.id, 'file-source-parent-original');
+        } finally {
+            fakeVfs.rename = originalRename;
+        }
+    });
+
+    test('blocks a journaled file move before rename when its destination parent is replaced', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-file-move-destination-parent-race-remote-');
+        const localRoot = await tempDir('sr-overleaf-file-move-destination-parent-race-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteSource = vscode.Uri.joinPath(remoteRoot, 'drafts', 'draft.pdf');
+        const remoteArchive = vscode.Uri.joinPath(remoteRoot, 'archive');
+        const remoteDestination = vscode.Uri.joinPath(remoteArchive, 'final.pdf');
+        const localSource = vscode.Uri.joinPath(localRoot, 'drafts', 'draft.pdf');
+        const localDestination = vscode.Uri.joinPath(localRoot, 'archive', 'final.pdf');
+        const pdf = Buffer.from('%PDF-1.7 destination parent race\\n', 'utf-8');
+        await writeBytes(remoteSource, pdf);
+        await vscode.workspace.fs.createDirectory(remoteArchive);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('drafts', 'file-source-parent-original');
+        fakeVfs.setEntityId('archive', 'file-destination-parent-original');
+        fakeVfs.setEntityId('drafts/draft.pdf', 'file-destination-parent-race-entity');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.rename(localSource, localDestination, {overwrite: false});
+        const sourceRelPath = '/drafts/draft.pdf';
+        const destinationRelPath = '/archive/final.pdf';
+        const sourceEntry = scm.syncManifest.files[sourceRelPath];
+        const parentProof = await scm.capturePendingLocalFileMoveParentProof(
+            sourceRelPath,
+            destinationRelPath,
+            sourceEntry,
+        );
+        const record = await scm.journalPendingLocalFileMove(
+            sourceRelPath,
+            destinationRelPath,
+            sourceEntry,
+            await scm.captureRemotePathRevision(sourceRelPath),
+            parentProof,
+        );
+        assert.strictEqual(record.destinationParentEntity.id, 'file-destination-parent-original');
+
+        const originalEnsureConnectedForWrite = fakeVfs.ensureConnectedForWrite.bind(fakeVfs);
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let destinationParentPreflight = 0;
+        let renameAttempted = 0;
+        fakeVfs.ensureConnectedForWrite = async () => {
+            await originalEnsureConnectedForWrite();
+            if (destinationParentPreflight===0) {
+                destinationParentPreflight += 1;
+                // Change the parent after the ordinary inspection but before
+                // the new execution-time destination-parent proof.
+                fakeVfs.setEntityId('archive', 'file-destination-parent-collaborator');
+            }
+        };
+        fakeVfs.rename = async (...args: Parameters<FakeVirtualFileSystem['rename']>) => {
+            renameAttempted += 1;
+            return originalRename(...args);
+        };
+        try {
+            const outcome = await scm.executePendingLocalFileMove(
+                sourceRelPath,
+                record,
+                await readBytes(localDestination),
+            );
+
+            assert.strictEqual(outcome, 'conflict');
+            assert.strictEqual(destinationParentPreflight, 1);
+            assert.strictEqual(renameAttempted, 0);
+            assert.deepStrictEqual(await readBytes(remoteSource), pdf);
+            assert.strictEqual(await pathExists(remoteDestination), false);
+            assert.match(scm.syncConflicts.get(destinationRelPath), /local move|Overleaf changed/i);
+            const pending = scm.syncManifest.pendingOperations[sourceRelPath];
+            assert.strictEqual(pending.kind, 'move');
+            assert.strictEqual(pending.destinationParentEntity.id, 'file-destination-parent-original');
+        } finally {
+            fakeVfs.ensureConnectedForWrite = originalEnsureConnectedForWrite;
+            fakeVfs.rename = originalRename;
+        }
+    });
+
+    test('keeps a journaled folder move conflicted when its source parent is replaced at the rename boundary', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-folder-move-source-parent-race-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-move-source-parent-race-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteSource = vscode.Uri.joinPath(remoteRoot, 'chapters', 'draft');
+        const remoteArchive = vscode.Uri.joinPath(remoteRoot, 'archive');
+        const remoteDestination = vscode.Uri.joinPath(remoteArchive, 'final');
+        const localSource = vscode.Uri.joinPath(localRoot, 'chapters', 'draft');
+        const localDestination = vscode.Uri.joinPath(localRoot, 'archive', 'final');
+        await writeText(vscode.Uri.joinPath(remoteSource, 'main.tex'), 'folder source parent race');
+        await vscode.workspace.fs.createDirectory(remoteArchive);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('chapters', 'folder-source-parent-original');
+        fakeVfs.setEntityId('archive', 'folder-destination-parent-original');
+        fakeVfs.setEntityId('chapters/draft', 'folder-source-parent-race-entity');
+        fakeVfs.setEntityId('chapters/draft/main.tex', 'folder-source-parent-race-child');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.rename(localSource, localDestination, {overwrite: false});
+        const sourceRelPath = '/chapters/draft';
+        const destinationRelPath = '/archive/final';
+        const sourceEntry = scm.syncManifest.directories[sourceRelPath];
+        const destinationState = await scm.captureLocalPathRevision(destinationRelPath);
+        const record = await scm.journalPendingLocalDirectoryMove(
+            sourceRelPath,
+            destinationRelPath,
+            sourceEntry,
+            destinationState.revision,
+            scm.syncManifest.directories['/archive'].remoteEntity,
+        );
+        assert.strictEqual(record.sourceParentEntity.id, 'folder-source-parent-original');
+
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let renameAttempted = 0;
+        fakeVfs.rename = async (...args: Parameters<FakeVirtualFileSystem['rename']>) => {
+            renameAttempted += 1;
+            fakeVfs.setEntityId('chapters', 'folder-source-parent-collaborator');
+            return originalRename(...args);
+        };
+        try {
+            const outcome = await scm.executePendingLocalDirectoryMove(sourceRelPath, record);
+
+            assert.strictEqual(outcome, 'conflict');
+            assert.strictEqual(renameAttempted, 1);
+            assert.strictEqual(
+                await readText(vscode.Uri.joinPath(remoteSource, 'main.tex')),
+                'folder source parent race',
+            );
+            assert.strictEqual(await pathExists(remoteDestination), false);
+            assert.match(scm.syncConflicts.get(destinationRelPath), /folder move|Overleaf changed/i);
+            const pending = scm.syncManifest.pendingOperations[sourceRelPath];
+            assert.strictEqual(pending.kind, 'directory-move');
+            assert.strictEqual(pending.sourceParentEntity.id, 'folder-source-parent-original');
+        } finally {
+            fakeVfs.rename = originalRename;
+        }
+    });
+
+    test('blocks a journaled folder move before rename when its destination parent is replaced', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-folder-move-destination-parent-race-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-move-destination-parent-race-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteSource = vscode.Uri.joinPath(remoteRoot, 'chapters', 'draft');
+        const remoteArchive = vscode.Uri.joinPath(remoteRoot, 'archive');
+        const remoteDestination = vscode.Uri.joinPath(remoteArchive, 'final');
+        const localSource = vscode.Uri.joinPath(localRoot, 'chapters', 'draft');
+        const localDestination = vscode.Uri.joinPath(localRoot, 'archive', 'final');
+        await writeText(vscode.Uri.joinPath(remoteSource, 'main.tex'), 'folder destination parent race');
+        await vscode.workspace.fs.createDirectory(remoteArchive);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('chapters', 'folder-source-parent-original');
+        fakeVfs.setEntityId('archive', 'folder-destination-parent-original');
+        fakeVfs.setEntityId('chapters/draft', 'folder-destination-parent-race-entity');
+        fakeVfs.setEntityId('chapters/draft/main.tex', 'folder-destination-parent-race-child');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.rename(localSource, localDestination, {overwrite: false});
+        const sourceRelPath = '/chapters/draft';
+        const destinationRelPath = '/archive/final';
+        const sourceEntry = scm.syncManifest.directories[sourceRelPath];
+        const destinationState = await scm.captureLocalPathRevision(destinationRelPath);
+        const record = await scm.journalPendingLocalDirectoryMove(
+            sourceRelPath,
+            destinationRelPath,
+            sourceEntry,
+            destinationState.revision,
+            scm.syncManifest.directories['/archive'].remoteEntity,
+        );
+        assert.strictEqual(record.destinationParentEntity.id, 'folder-destination-parent-original');
+
+        const originalEnsureConnectedForWrite = fakeVfs.ensureConnectedForWrite.bind(fakeVfs);
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let destinationParentPreflight = 0;
+        let renameAttempted = 0;
+        fakeVfs.ensureConnectedForWrite = async () => {
+            await originalEnsureConnectedForWrite();
+            if (destinationParentPreflight===0) {
+                destinationParentPreflight += 1;
+                // Change the parent after the ordinary inspection but before
+                // the new execution-time destination-parent proof.
+                fakeVfs.setEntityId('archive', 'folder-destination-parent-collaborator');
+            }
+        };
+        fakeVfs.rename = async (...args: Parameters<FakeVirtualFileSystem['rename']>) => {
+            renameAttempted += 1;
+            return originalRename(...args);
+        };
+        try {
+            const outcome = await scm.executePendingLocalDirectoryMove(sourceRelPath, record);
+
+            assert.strictEqual(outcome, 'conflict');
+            assert.strictEqual(destinationParentPreflight, 1);
+            assert.strictEqual(renameAttempted, 0);
+            assert.strictEqual(
+                await readText(vscode.Uri.joinPath(remoteSource, 'main.tex')),
+                'folder destination parent race',
+            );
+            assert.strictEqual(await pathExists(remoteDestination), false);
+            assert.match(scm.syncConflicts.get(destinationRelPath), /folder move|Overleaf changed/i);
+            const pending = scm.syncManifest.pendingOperations[sourceRelPath];
+            assert.strictEqual(pending.kind, 'directory-move');
+            assert.strictEqual(pending.destinationParentEntity.id, 'folder-destination-parent-original');
+        } finally {
+            fakeVfs.ensureConnectedForWrite = originalEnsureConnectedForWrite;
+            fakeVfs.rename = originalRename;
+        }
+    });
+
+
+    test('upgrades a trusted legacy file move with recorded folder parents before applying it', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-legacy-file-move-upgrade-remote-');
+        const localRoot = await tempDir('sr-overleaf-legacy-file-move-upgrade-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteSource = vscode.Uri.joinPath(remoteRoot, 'drafts', 'draft.tex');
+        const remoteArchive = vscode.Uri.joinPath(remoteRoot, 'archive');
+        const remoteDestination = vscode.Uri.joinPath(remoteArchive, 'final.tex');
+        const localSource = vscode.Uri.joinPath(localRoot, 'drafts', 'draft.tex');
+        const localDestination = vscode.Uri.joinPath(localRoot, 'archive', 'final.tex');
+        await writeText(remoteSource, 'legacy parent proof');
+        await vscode.workspace.fs.createDirectory(remoteArchive);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('drafts', 'legacy-source-parent');
+        fakeVfs.setEntityId('archive', 'legacy-destination-parent');
+        fakeVfs.setEntityId('drafts/draft.tex', 'legacy-file-entity');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.rename(localSource, localDestination, {overwrite: false});
+        const sourceRelPath = '/drafts/draft.tex';
+        const destinationRelPath = '/archive/final.tex';
+        const sourceEntry = scm.syncManifest.files[sourceRelPath];
+        const parentProof = await scm.capturePendingLocalFileMoveParentProof(
+            sourceRelPath,
+            destinationRelPath,
+            sourceEntry,
+        );
+        const record = await scm.journalPendingLocalFileMove(
+            sourceRelPath,
+            destinationRelPath,
+            sourceEntry,
+            await scm.captureRemotePathRevision(sourceRelPath),
+            parentProof,
+        );
+        const legacyRecord = {
+            ...record,
+            version: 2,
+            sourceParentEntity: undefined,
+            destinationParentEntity: undefined,
+        };
+        scm.syncManifest.pendingOperations[sourceRelPath] = legacyRecord;
+        delete scm.syncManifest.files[sourceRelPath].parentEntity;
+
+        const outcome = await scm.executePendingLocalFileMove(
+            sourceRelPath,
+            legacyRecord,
+            await readBytes(localDestination),
+        );
+
+        assert.strictEqual(outcome, 'accepted');
+        assert.strictEqual(await pathExists(remoteSource), false);
+        assert.strictEqual(await readText(remoteDestination), 'legacy parent proof');
+        assert.deepStrictEqual(scm.syncManifest.pendingOperations, {});
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(remoteDestination)).fileEntity._id,
+            'legacy-file-entity',
+        );
+    });
+
+    test('keeps an identity-less legacy file move conflicted when trusted parent proof is unavailable', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-legacy-file-move-conflict-remote-');
+        const localRoot = await tempDir('sr-overleaf-legacy-file-move-conflict-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteSource = vscode.Uri.joinPath(remoteRoot, 'drafts', 'draft.tex');
+        const remoteArchive = vscode.Uri.joinPath(remoteRoot, 'archive');
+        const remoteDestination = vscode.Uri.joinPath(remoteArchive, 'final.tex');
+        const localSource = vscode.Uri.joinPath(localRoot, 'drafts', 'draft.tex');
+        const localDestination = vscode.Uri.joinPath(localRoot, 'archive', 'final.tex');
+        await writeText(remoteSource, 'legacy proof unavailable');
+        await vscode.workspace.fs.createDirectory(remoteArchive);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('drafts', 'legacy-unproven-source-parent');
+        fakeVfs.setEntityId('archive', 'legacy-unproven-destination-parent');
+        fakeVfs.setEntityId('drafts/draft.tex', 'legacy-unproven-file');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.rename(localSource, localDestination, {overwrite: false});
+        const sourceRelPath = '/drafts/draft.tex';
+        const destinationRelPath = '/archive/final.tex';
+        const sourceEntry = scm.syncManifest.files[sourceRelPath];
+        const parentProof = await scm.capturePendingLocalFileMoveParentProof(
+            sourceRelPath,
+            destinationRelPath,
+            sourceEntry,
+        );
+        const record = await scm.journalPendingLocalFileMove(
+            sourceRelPath,
+            destinationRelPath,
+            sourceEntry,
+            await scm.captureRemotePathRevision(sourceRelPath),
+            parentProof,
+        );
+        const legacyRecord = {
+            ...record,
+            version: 2,
+            sourceParentEntity: undefined,
+            destinationParentEntity: undefined,
+        };
+        scm.syncManifest.pendingOperations[sourceRelPath] = legacyRecord;
+        delete scm.syncManifest.files[sourceRelPath].parentEntity;
+        delete scm.syncManifest.directories['/drafts'].remoteEntity;
+        delete scm.syncManifest.directories['/archive'].remoteEntity;
+
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let renameAttempted = 0;
+        fakeVfs.rename = async (...args: Parameters<FakeVirtualFileSystem['rename']>) => {
+            renameAttempted += 1;
+            return originalRename(...args);
+        };
+        try {
+            const outcome = await scm.executePendingLocalFileMove(
+                sourceRelPath,
+                legacyRecord,
+                await readBytes(localDestination),
+            );
+
+            assert.strictEqual(outcome, 'conflict');
+            assert.strictEqual(renameAttempted, 0);
+            assert.strictEqual(await readText(remoteSource), 'legacy proof unavailable');
+            assert.strictEqual(await pathExists(remoteDestination), false);
+            assert.match(scm.syncConflicts.get(destinationRelPath), /legacy local move lacks trusted/i);
+            assert.strictEqual(
+                scm.syncManifest.pendingOperations[sourceRelPath].version,
+                2,
+            );
+        } finally {
+            fakeVfs.rename = originalRename;
+        }
+    });
+
     test('preserves folder and child entity IDs for a watcher-observed local cross-folder rename', async function () {
         this.timeout(20_000);
         const remoteRoot = await tempDir('sr-overleaf-local-folder-move-remote-');
@@ -4728,7 +5140,7 @@ suite('Select Project Folder Local Replica', function () {
         );
         const interruptedManifest = JSON.parse(await readText(manifestUri));
         const pending = interruptedManifest.pendingOperations['/main.tex'];
-        assert.strictEqual(interruptedManifest.version, 14);
+        assert.strictEqual(interruptedManifest.version, 15);
         assert.strictEqual(pending.kind, 'update');
         assert.strictEqual(pending.localKind, 'file');
         assert.strictEqual(pending.localRevision, sha1('offline local update'));
@@ -4850,7 +5262,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), false);
     });
 
-    test('migrates a version 2 manifest to the version 14 resolution schema', async () => {
+    test('migrates a version 2 manifest to the version 15 guarded-move schema', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-v3-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-v3-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -4874,7 +5286,7 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 14);
+        assert.strictEqual(migratedManifest.version, 15);
         assert.deepStrictEqual(migratedManifest.pendingOperations, {});
         assert.deepStrictEqual(migratedManifest.textMergeResolutions, {});
         assert.deepStrictEqual(migratedManifest.textMergeResolutionHistory, []);
@@ -4905,7 +5317,7 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 14);
+        assert.strictEqual(migratedManifest.version, 15);
         assert.deepStrictEqual(migratedManifest.folderConflictResolutions, {});
         assert.deepStrictEqual(migratedManifest.folderConflictResolutionHistory, []);
         assert.deepStrictEqual(migratedManifest.textMergeResolutions, {});
@@ -4913,7 +5325,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.ok(migratedManifest.files['/main.tex']);
     });
 
-    test('records remote entity and stable local inode identities in manifest v14', async () => {
+    test('records remote entity, parent, and stable local inode identities in manifest v15', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-identity-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-identity-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -4932,9 +5344,20 @@ suite('Select Project Folder Local Replica', function () {
             REPLICA_SETTINGS_DIR,
             'sync-manifest.json',
         )));
-        assert.strictEqual(manifest.version, 14);
+        assert.strictEqual(manifest.version, 15);
         assert.deepStrictEqual(manifest.files['/main.tex'].remoteEntity, {id: 'doc-main', type: 'doc'});
         assert.deepStrictEqual(manifest.files['/figure.png'].remoteEntity, {id: 'file-figure', type: 'file'});
+        const rootParentId = (await fakeVfs._resolveUri(
+            vscode.Uri.joinPath(remoteRoot, 'main.tex'),
+        )).parentFolder._id;
+        assert.deepStrictEqual(
+            manifest.files['/main.tex'].parentEntity,
+            {id: rootParentId, type: 'folder'},
+        );
+        assert.deepStrictEqual(
+            manifest.files['/figure.png'].parentEntity,
+            {id: rootParentId, type: 'folder'},
+        );
         for (const entry of [
             manifest.files['/main.tex'],
             manifest.files['/figure.png'],
@@ -6201,11 +6624,18 @@ suite('Select Project Folder Local Replica', function () {
         const sourceRemoteState = await internals.captureRemotePathRevision(
             '/outside.tex', generation,
         );
+        const parentProof = await internals.capturePendingLocalFileMoveParentProof(
+            '/outside.tex',
+            '/chapter/moved.tex',
+            sourceEntry,
+            generation,
+        );
         await internals.journalPendingLocalFileMove(
             '/outside.tex',
             '/chapter/moved.tex',
             sourceEntry,
             sourceRemoteState,
+            parentProof,
             generation,
         );
         await vscode.workspace.fs.delete(localChapter, {recursive: true});
