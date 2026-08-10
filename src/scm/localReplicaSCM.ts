@@ -117,11 +117,23 @@ type DetachedLocalGuardRecord = LocalReplicaOperationRecord & {
 
 const DELETE_DIGEST = '\0';
 
+interface SyncManifestRemoteEntityIdentity {
+    id: string;
+    type: 'doc' | 'file';
+}
+
+interface SyncManifestLocalFileIdentity {
+    dev: string;
+    ino: string;
+}
+
 interface SyncManifestEntry {
     remoteFingerprint: string;
     localSize: number;
     localMtime: number;
     localDigest: string;
+    remoteEntity?: SyncManifestRemoteEntityIdentity;
+    localIdentity?: SyncManifestLocalFileIdentity;
     baseContentBase64?: string;
     updatedAt: string;
 }
@@ -139,7 +151,7 @@ interface SyncManifestConflictEntry {
 }
 
 interface SyncManifest {
-    version: 3;
+    version: 4;
     projectUri: string;
     baselineComplete: boolean;
     files: Record<string, SyncManifestEntry>;
@@ -3351,7 +3363,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private emptySyncManifest(baselineComplete = true): SyncManifest {
         return {
-            version: 3,
+            version: 4,
             projectUri: stringifyOverleafUri(this.vfs.origin),
             baselineComplete,
             files: {},
@@ -3385,6 +3397,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 && contentDigest(Buffer.from(entry.baseContentBase64, 'base64'))
                     ===entry.localDigest
             );
+        const remoteEntity = entry.remoteEntity;
+        const validRemoteEntity = remoteEntity===undefined || (
+            typeof remoteEntity.id==='string'
+            && remoteEntity.id.length>0
+            && remoteEntity.id.length<=4096
+            && (remoteEntity.type==='doc' || remoteEntity.type==='file')
+        );
+        const localIdentity = entry.localIdentity;
+        const validLocalIdentity = localIdentity===undefined || (
+            typeof localIdentity.dev==='string'
+            && /^[0-9]+$/.test(localIdentity.dev)
+            && typeof localIdentity.ino==='string'
+            && /^[1-9][0-9]*$/.test(localIdentity.ino)
+        );
+
         return typeof entry.remoteFingerprint==='string'
             && entry.remoteFingerprint.length>0
             && entry.remoteFingerprint.length<=4096
@@ -3401,6 +3428,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 || typeof entry.baseContentBase64==='string'
             )
             && validBaseContent
+            && validRemoteEntity
+            && validLocalIdentity
             && (
                 !entry.remoteFingerprint.startsWith('content:')
                 || entry.remoteFingerprint===`content:${entry.localDigest}`
@@ -3559,7 +3588,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } catch {
                 sameProject = false;
             }
-            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3)
+            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4)
                 && sameProject
                 && (manifest.baselineComplete===undefined || typeof manifest.baselineComplete==='boolean')
                 && this.isValidSyncManifestRecord<SyncManifestEntry>(
@@ -3584,7 +3613,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     )
                 )
                 && (
-                    manifest.version!==3
+                    manifest.version===1
+                    || manifest.version===2
                     || this.isValidSyncManifestRecord<SyncManifestPendingOperation>(
                         manifest.pendingOperations,
                         (value): value is SyncManifestPendingOperation =>
@@ -3598,7 +3628,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (validShape) {
                 this.requireSyncSession(generation);
                 this.syncManifest = {
-                    version: 3,
+                    version: 4,
                     projectUri,
                     baselineComplete: manifest.baselineComplete!==false,
                     files: manifest.files!,
@@ -3606,7 +3636,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         ? manifest.directories
                         : {},
                     conflicts: manifest.conflicts ?? {},
-                    pendingOperations: manifest.version===3
+                    pendingOperations: manifest.version===3 || manifest.version===4
                         ? manifest.pendingOperations!
                         : {},
                 };
@@ -3629,7 +3659,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     ? 'unavailable'
                     : 'trusted';
                 this.syncManifestRevision += 1;
-                this.syncManifestDirty = manifest.version!==3
+                this.syncManifestDirty = manifest.version!==4
                     || manifest.directories===undefined
                     || manifest.conflicts===undefined
                     || manifest.baselineComplete===undefined
@@ -8308,6 +8338,24 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return undefined;
     }
 
+    private async getRemoteEntityIdentity(
+        vfsUri: vscode.Uri,
+    ): Promise<SyncManifestRemoteEntityIdentity | undefined> {
+        try {
+            const {fileType, fileEntity} = await this.vfs._resolveUri(vfsUri);
+            if (
+                (fileType==='doc' || fileType==='file')
+                && typeof fileEntity?._id==='string'
+                && fileEntity._id.length>0
+            ) {
+                return {id: fileEntity._id, type: fileType};
+            }
+        } catch {
+            return undefined;
+        }
+        return undefined;
+    }
+
     private async manifestLocalStat(relPath: string): Promise<{size: number; mtime: number} | undefined> {
         try {
             const stat = await this.statConfinedLocalUri(
@@ -8321,6 +8369,35 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+    private async captureManifestLocalFileIdentity(
+        relPath: string,
+        localUri: vscode.Uri,
+        expectedStat: vscode.FileStat,
+    ): Promise<SyncManifestLocalFileIdentity | undefined> {
+        if (localUri.scheme!=='file' || this.baseUri.scheme!=='file') {
+            return undefined;
+        }
+        const snapshot = await this.captureLocalPathIdentitySnapshot(
+            localUri,
+            `manifest identity snapshot of ${relPath}`,
+        );
+        const {finalStat} = snapshot;
+        if (
+            !finalStat.isFile
+            || finalStat.size!==expectedStat.size
+            || normalizeMtimeMs(finalStat.mtimeMs)!==normalizeMtimeMs(expectedStat.mtime)
+        ) {
+            throw new LocalReadUnstableError(
+                relPath,
+                'path-identity-changed',
+                `Local Replica manifest target changed while identity was recorded: ${localUri.fsPath}`,
+            );
+        }
+        if (finalStat.ino==='0') {
+            return undefined;
+        }
+        return {dev: finalStat.dev, ino: finalStat.ino};
+    }
     private async canSkipInitialBinaryPull(
         relPath: string,
         vfsUri: vscode.Uri,
@@ -8362,15 +8439,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     ): Promise<boolean> {
         this.requireSyncSession(generation);
         if (!this.syncManifest) { return false; }
+        const remoteEntity = await this.getRemoteEntityIdentity(vfsUri);
         const remoteFingerprint = this.isLikelyBinaryRelPath(relPath)
-            ? await this.getRemoteFingerprint(relPath, vfsUri)
+            ? remoteEntity?.type==='file' ? `file:${remoteEntity.id}` : undefined
             : `content:${contentDigest(content)}`;
         this.requireSyncSession(generation);
+        const localUri = this.localUri(relPath);
         let localStatBefore: vscode.FileStat;
         let localContent: Uint8Array;
         let localStatAfter: vscode.FileStat;
+        let localIdentity: SyncManifestLocalFileIdentity | undefined;
         try {
-            const localUri = this.localUri(relPath);
             localStatBefore = await this.statConfinedLocalUri(
                 localUri,
                 `manifest snapshot of ${relPath}`,
@@ -8379,6 +8458,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             localStatAfter = await this.statConfinedLocalUri(
                 localUri,
                 `manifest snapshot of ${relPath}`,
+            );
+            localIdentity = await this.captureManifestLocalFileIdentity(
+                relPath,
+                localUri,
+                localStatAfter,
             );
             this.requireSyncSession(generation);
         } catch {
@@ -8408,6 +8492,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             localSize: localStatAfter.size,
             localMtime: localStatAfter.mtime,
             localDigest: contentDigest(content),
+            remoteEntity,
+            localIdentity,
             baseContentBase64: this.decodeMergeableText(content)===undefined
                 ? undefined
                 : Buffer.from(content).toString('base64'),

@@ -12,6 +12,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cleared only after an accepted or verified-equal Overleaf state, and replayed
   through guarded reconciliation after reload; a concurrent same-path edit
   remains a conflict instead of silently overwriting the canonical project.
+- Add manifest schema v4 identity fields: each verified regular file records
+  its Overleaf document/file entity ID and stable local `dev:ino` identity.
+  Missing, legacy, or invalid identities can never prove an entity-preserving
+  local move.
 
 ### Changed
 - Replay pending regular-file updates and deletes automatically after a live

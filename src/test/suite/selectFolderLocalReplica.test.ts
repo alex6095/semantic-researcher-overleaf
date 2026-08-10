@@ -2878,7 +2878,7 @@ suite('Select Project Folder Local Replica', function () {
         );
         const interruptedManifest = JSON.parse(await readText(manifestUri));
         const pending = interruptedManifest.pendingOperations['/main.tex'];
-        assert.strictEqual(interruptedManifest.version, 3);
+        assert.strictEqual(interruptedManifest.version, 4);
         assert.strictEqual(pending.kind, 'update');
         assert.strictEqual(pending.localKind, 'file');
         assert.strictEqual(pending.localRevision, sha1('offline local update'));
@@ -3000,7 +3000,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), false);
     });
 
-    test('migrates a version 2 manifest to the version 3 journal schema', async () => {
+    test('migrates a version 2 manifest to the version 4 identity schema', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-v3-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-v3-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -3022,8 +3022,39 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 3);
+        assert.strictEqual(migratedManifest.version, 4);
         assert.deepStrictEqual(migratedManifest.pendingOperations, {});
+    });
+
+    test('records remote entity and stable local inode identities in manifest v4', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-manifest-identity-remote-');
+        const localRoot = await tempDir('sr-overleaf-manifest-identity-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'baseline');
+        await writeBytes(vscode.Uri.joinPath(remoteRoot, 'figure.png'), Buffer.from([7, 8, 9]));
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('main.tex', 'doc-main');
+        fakeVfs.setEntityId('figure.png', 'file-figure');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        assert.strictEqual(
+            await scm.initializeLocalReplica({resetLocalFilesToRemote: true}),
+            true,
+        );
+        const manifest = JSON.parse(await readText(vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-manifest.json',
+        )));
+        assert.strictEqual(manifest.version, 4);
+        assert.deepStrictEqual(manifest.files['/main.tex'].remoteEntity, {id: 'doc-main', type: 'doc'});
+        assert.deepStrictEqual(manifest.files['/figure.png'].remoteEntity, {id: 'file-figure', type: 'file'});
+        for (const entry of [
+            manifest.files['/main.tex'],
+            manifest.files['/figure.png'],
+        ]) {
+            assert.match(entry.localIdentity.dev, /^\d+$/);
+            assert.match(entry.localIdentity.ino, /^[1-9]\d*$/);
+        }
     });
 
     test('replays a journaled local update after a live reconnect without another watcher event', async () => {
@@ -3310,6 +3341,25 @@ suite('Select Project Folder Local Replica', function () {
                 },
                 directories: {},
                 conflicts: {},
+            })],
+            ['malformed-identity', projectUri => ({
+                version: 4,
+                projectUri,
+                baselineComplete: true,
+                files: {
+                    ['/stale.tex']: {
+                        remoteFingerprint: `content:${sha1('must not upload')}`,
+                        localSize: 15,
+                        localMtime: 1,
+                        localDigest: sha1('must not upload'),
+                        remoteEntity: {id: 'doc-stale', type: 'folder'},
+                        localIdentity: {dev: '0', ino: '0'},
+                        updatedAt: new Date().toISOString(),
+                    },
+                },
+                directories: {},
+                conflicts: {},
+                pendingOperations: {},
             })],
         ];
 
