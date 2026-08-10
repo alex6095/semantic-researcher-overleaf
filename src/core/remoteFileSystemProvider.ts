@@ -71,6 +71,13 @@ export interface RemoteDirectoryCreateResult {
     parentId: string;
 }
 
+export interface RemoteFileCreateResult {
+    created: boolean;
+    entityId: string;
+    entityType: 'doc' | 'file';
+    parentId: string;
+}
+
 export interface ExpectedRemoteEntity {
     id: string;
     type: FileType;
@@ -1677,49 +1684,150 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    async createFile(uri: vscode.Uri, content:Uint8Array, overwrite?:boolean) {
+    async createFile(
+        uri: vscode.Uri,
+        content: Uint8Array,
+        overwrite?: boolean,
+        expectedParentId?: string,
+    ): Promise<FileEntity> {
         const {parentFolder, fileName, fileEntity} = await this._resolveUri(uri);
+        if (expectedParentId!==undefined && parentFolder._id!==expectedParentId) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf parent folder changed before the local file create: ' + uri.path,
+            );
+        }
         if (fileEntity && !overwrite) {
             throw vscode.FileSystemError.FileExists(uri);
         }
 
-        let res = undefined;
+        let res: FileEntity | undefined;
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
 
         if (content.length===0) {
-            const _res = await this.api.addDoc(identity, this.projectId, parentFolder._id, fileName);
+            const response = await this.api.addDoc(identity, this.projectId, parentFolder._id, fileName);
             this.requireCurrentSession();
-            if (_res.type==='success' && _res.entity!==undefined) {
-                res = _res.entity;
+            if (response.type==='success' && response.entity!==undefined) {
+                res = response.entity as FileEntity;
             } else {
-                const message = _res.message ?? `Could not create Overleaf document "${fileName}".`;
+                const message = response.message ?? 'Could not create Overleaf document "' + fileName + '".';
                 vscode.window.showErrorMessage(message);
-                throw this.createMutationResponseError(message, _res.status);
+                throw this.createMutationResponseError(message, response.status);
             }
         } else {
-            const parentFolderId = parentFolder._id;
-            const _res = await this.api.uploadFile(identity, this.projectId, parentFolderId, fileName, content);
+            const response = await this.api.uploadFile(
+                identity, this.projectId, parentFolder._id, fileName, content,
+            );
             this.requireCurrentSession();
-            if (_res.type==='success' && _res.entity!==undefined) {
-                res = _res.entity;
+            if (response.type==='success' && response.entity!==undefined) {
+                res = response.entity as FileEntity;
             } else {
-                const message = _res.message ?? `Could not upload Overleaf file "${fileName}".`;
+                const message = response.message ?? 'Could not upload Overleaf file "' + fileName + '".';
                 vscode.window.showErrorMessage(message);
-                throw this.createMutationResponseError(message, _res.status);
+                throw this.createMutationResponseError(message, response.status);
             }
         }
-        if (res && res._type) {
+        if (
+            res
+            && (res._type==='doc' || res._type==='file')
+            && typeof res._id==='string'
+            && res._id.length>0
+        ) {
             this.insertEntity(parentFolder, res._type, res);
             this.notify([
                 {type: vscode.FileChangeType.Created, uri: uri},
             ]);
-            return;
+            return res;
         }
-        const message = `Overleaf returned an invalid entity while creating "${fileName}".`;
+        const message = 'Overleaf returned an invalid entity while creating "' + fileName + '".';
         vscode.window.showErrorMessage(message);
         throw new RemoteMutationRetryableError(message, true);
     }
 
+    // A guarded local-replica create is deliberately separate from a generic
+    // write. A same-name entity that appears after an ambiguous POST is not
+    // proof of ownership, even when its bytes happen to match.
+    async createFileIfMissing(
+        uri: vscode.Uri,
+        content: Uint8Array,
+        expectedParentId?: string,
+    ): Promise<RemoteFileCreateResult> {
+        await this.ensureConnectedForWrite();
+        const current = await this._resolveUri(uri);
+        const parentId = current.parentFolder._id;
+        if (expectedParentId!==undefined && parentId!==expectedParentId) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf parent folder changed before the local file create: ' + uri.path,
+            );
+        }
+        if (current.fileType==='doc' || current.fileType==='file') {
+            if (typeof current.fileEntity?._id!=='string' || current.fileEntity._id.length===0) {
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf exposed a file without an identity while the local file was being created: ' + uri.path,
+                );
+            }
+            return {
+                created: false,
+                entityId: current.fileEntity._id,
+                entityType: current.fileType,
+                parentId,
+            };
+        }
+        if (current.fileType) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf path has a different type while the local file was being created: ' + uri.path,
+            );
+        }
+        try {
+            const entity = await this.createFile(uri, content, false, parentId);
+            if (
+                (entity._type!=='doc' && entity._type!=='file')
+                || typeof entity._id!=='string'
+                || entity._id.length===0
+            ) {
+                throw new RemoteMutationRetryableError(
+                    'Overleaf returned an invalid identity while creating "' + current.fileName + '".',
+                    true,
+                );
+            }
+            return {
+                created: true,
+                entityId: entity._id,
+                entityType: entity._type,
+                parentId,
+            };
+        } catch (error) {
+            if ((error as {retryable?: boolean})?.retryable===false) {
+                throw error;
+            }
+            if (
+                error instanceof RemoteMutationRetryableError
+                && !error.requiresAuthoritativeRecheck
+            ) {
+                throw error;
+            }
+            await this.reconnect('verify guarded file create: ' + uri.path);
+            const refreshed = await this._resolveUri(uri);
+            if (refreshed.fileType==='doc' || refreshed.fileType==='file') {
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf file appeared after an unacknowledged local create; its identity is not proven: ' + uri.path,
+                );
+            }
+            if (refreshed.fileType) {
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf path changed type while the local file was being created: ' + uri.path,
+                );
+            }
+            if (
+                expectedParentId!==undefined
+                && refreshed.parentFolder._id!==expectedParentId
+            ) {
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf parent folder changed while the local file create was being verified: ' + uri.path,
+                );
+            }
+            throw error;
+        }
+    }
     private createMutationResponseError(message: string, status?: number): Error {
         if (status===408 || status===409 || (status!==undefined && status>=500)) {
             return new RemoteMutationRetryableError(message, true);
@@ -2304,10 +2412,12 @@ export class VirtualFileSystem extends vscode.Disposable {
         const {fileType, fileEntity} = await this._resolveUri(uri);
 
         if (!fileType && create) {
-            return this.createFile(uri, content, true);
+            await this.createFile(uri, content, true);
+            return;
         }
         if (fileType && fileType!=='doc' && create) {
-            return this.createFile(uri, content, overwrite);
+            await this.createFile(uri, content, overwrite);
+            return;
         }
         if (fileType==='doc' && fileEntity) {
             await this.updateDocument(uri, fileEntity as DocumentEntity, content);

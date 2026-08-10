@@ -267,7 +267,7 @@ interface SyncManifestFolderConflictResolutionHistoryEntry {
 }
 
 interface SyncManifest {
-    version: 11;
+    version: 12;
     projectUri: string;
     baselineComplete: boolean;
     files: Record<string, SyncManifestEntry>;
@@ -298,6 +298,11 @@ type RemoteFolderPathIdentity = {
     parent: SyncManifestRemoteFolderIdentity;
 };
 
+type RemoteFilePathIdentity = {
+    entity: SyncManifestRemoteEntityIdentity;
+    parent: SyncManifestRemoteFolderIdentity;
+};
+
 interface SyncManifestPendingFileOperation {
     version: 1;
     id: string;
@@ -306,6 +311,24 @@ interface SyncManifestPendingFileOperation {
     localRevision: string;
     remoteKind?: PathRevision['kind'];
     remoteRevision?: string;
+    createdAt: string;
+    updatedAt: string;
+}
+
+
+// A local regular-file creation is not an update with empty history. The
+// journal binds the missing target to the authoritative parent first, then
+// persists the server-issued document/file identity before it can be accepted.
+interface SyncManifestPendingFileCreateOperation {
+    version: 1;
+    id: string;
+    kind: 'create';
+    localKind: 'file';
+    localRevision: string;
+    remoteKind: 'missing';
+    remoteRevision: typeof DELETE_DIGEST;
+    parentEntity: SyncManifestRemoteFolderIdentity;
+    createdEntity?: SyncManifestRemoteEntityIdentity;
     createdAt: string;
     updatedAt: string;
 }
@@ -385,6 +408,7 @@ interface SyncManifestPendingDirectoryMoveOperation {
 }
 
 type SyncManifestPendingOperation = SyncManifestPendingFileOperation
+    | SyncManifestPendingFileCreateOperation
     | SyncManifestPendingMoveOperation
     | SyncManifestPendingDirectoryCreateOperation
     | SyncManifestPendingDirectoryDeleteOperation
@@ -748,6 +772,20 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private initialPullStatus: 'pending' | 'complete' | 'partial' = 'pending';
     private partialPullToastGeneration?: number;
     private syncQueues: Map<string, Promise<unknown>> = new Map();
+    // One guarded mkdir may be observed by a parent reconciliation and several
+    // child watcher queues at once. They must share its issued-ID proof.
+    private pendingDirectoryCreateReconciliations: Map<string, {
+        generation: number;
+        operationId: string;
+        promise: Promise<boolean>;
+    }> = new Map();
+    // A direct child-file flush can arrive before its local parent directory's
+    // watcher event. Serialize only that missing-parent preparation so sibling
+    // files reuse one guarded mkdir journal instead of racing two creates.
+    private pendingRemoteParentFolderEnsures: Map<string, {
+        generation: number;
+        promise: Promise<SyncManifestRemoteFolderIdentity>;
+    }> = new Map();
     private locallyDivergedPaths: Set<string> = new Set();
     // Paths the local content scan could not classify, keyed to the time of the
     // first failure. One unreadable path (a symlinked references.bib, an EACCES
@@ -3717,7 +3755,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private emptySyncManifest(baselineComplete = true): SyncManifest {
         return {
-            version: 11,
+            version: 12,
             projectUri: stringifyOverleafUri(this.vfs.origin),
             baselineComplete,
             files: {},
@@ -3809,6 +3847,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && identity.type==='folder';
     }
 
+
+    private isValidSyncManifestRemoteEntityIdentity(
+        value: unknown,
+    ): value is SyncManifestRemoteEntityIdentity {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const identity = value as Partial<SyncManifestRemoteEntityIdentity>;
+        return typeof identity.id==='string'
+            && identity.id.length>0
+            && identity.id.length<=4096
+            && (identity.type==='doc' || identity.type==='file');
+    }
     private isValidSyncManifestDirectoryEntry(
         value: unknown,
     ): value is SyncManifestDirectoryEntry {
@@ -4101,6 +4152,32 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && Number.isFinite(Date.parse(entry.updatedAt));
     }
 
+
+    private isValidSyncManifestPendingFileCreateOperation(
+        value: unknown,
+    ): value is SyncManifestPendingFileCreateOperation {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const entry = value as Partial<SyncManifestPendingFileCreateOperation>;
+        return entry.version===1
+            && typeof entry.id==='string'
+            && /^[a-f0-9]{32}$/.test(entry.id)
+            && entry.kind==='create'
+            && entry.localKind==='file'
+            && /^[a-f0-9]{40}$/.test(entry.localRevision ?? '')
+            && entry.remoteKind==='missing'
+            && entry.remoteRevision===DELETE_DIGEST
+            && this.isValidSyncManifestFolderIdentity(entry.parentEntity)
+            && (
+                entry.createdEntity===undefined
+                || this.isValidSyncManifestRemoteEntityIdentity(entry.createdEntity)
+            )
+            && typeof entry.createdAt==='string'
+            && Number.isFinite(Date.parse(entry.createdAt))
+            && typeof entry.updatedAt==='string'
+            && Number.isFinite(Date.parse(entry.updatedAt));
+    }
     private isValidSyncManifestPendingMoveOperation(
         value: unknown,
     ): value is SyncManifestPendingMoveOperation {
@@ -4251,6 +4328,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         )
             ? (value as {kind?: unknown}).kind
             : undefined;
+        if (kind==='create') {
+            return this.isValidSyncManifestPendingFileCreateOperation(value);
+        }
         if (kind==='move') {
             return this.isValidSyncManifestPendingMoveOperation(value);
         }
@@ -4341,7 +4421,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } catch {
                 sameProject = false;
             }
-            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11)
+            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11 || manifest.version===12)
                 && sameProject
                 && (manifest.baselineComplete===undefined || typeof manifest.baselineComplete==='boolean')
                 && this.isValidSyncManifestRecord<SyncManifestEntry>(
@@ -4366,7 +4446,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     )
                 )
                 && (
-                    manifest.version!==10 && manifest.version!==11
+                    manifest.version!==10 && manifest.version!==11 && manifest.version!==12
                     || (
                         this.isValidSyncManifestRecord<SyncManifestConflictResolution>(
                             manifest.conflictResolutions,
@@ -4385,7 +4465,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     )
                 )
                 && (
-                    manifest.version!==11
+                    manifest.version!==11 && manifest.version!==12
                     || (
                         this.isValidSyncManifestRecord<SyncManifestFolderConflictResolution>(
                             manifest.folderConflictResolutions,
@@ -4419,7 +4499,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (validShape) {
                 this.requireSyncSession(generation);
                 this.syncManifest = {
-                    version: 11,
+                    version: 12,
                     projectUri,
                     baselineComplete: manifest.baselineComplete!==false,
                     files: manifest.files!,
@@ -4427,19 +4507,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         ? manifest.directories
                         : {},
                     conflicts: manifest.conflicts ?? {},
-                    conflictResolutions: manifest.version===10 || manifest.version===11
+                    conflictResolutions: manifest.version===10 || manifest.version===11 || manifest.version===12
                         ? manifest.conflictResolutions!
                         : {},
-                    conflictResolutionHistory: manifest.version===10 || manifest.version===11
+                    conflictResolutionHistory: manifest.version===10 || manifest.version===11 || manifest.version===12
                         ? manifest.conflictResolutionHistory!
                         : [],
-                    folderConflictResolutions: manifest.version===11
+                    folderConflictResolutions: manifest.version===11 || manifest.version===12
                         ? manifest.folderConflictResolutions!
                         : {},
-                    folderConflictResolutionHistory: manifest.version===11
+                    folderConflictResolutionHistory: manifest.version===11 || manifest.version===12
                         ? manifest.folderConflictResolutionHistory!
                         : [],
-                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11
+                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11 || manifest.version===12
                         ? manifest.pendingOperations!
                         : {},
                 };
@@ -4467,7 +4547,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     ? 'unavailable'
                     : 'trusted';
                 this.syncManifestRevision += 1;
-                this.syncManifestDirty = manifest.version!==11
+                this.syncManifestDirty = manifest.version!==12
                     || manifest.directories===undefined
                     || manifest.conflicts===undefined
                     || manifest.conflictResolutions===undefined
@@ -12104,6 +12184,35 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         };
     }
 
+
+    private async resolveRemoteFilePathIdentity(
+        vfsUri: vscode.Uri,
+    ): Promise<RemoteFilePathIdentity | undefined> {
+        const {parentFolder, fileType, fileEntity} = await this.vfs._resolveUri(vfsUri);
+        if (
+            (fileType!=='doc' && fileType!=='file')
+            || typeof fileEntity?._id!=='string'
+            || fileEntity._id.length===0
+            || typeof parentFolder?._id!=='string'
+            || parentFolder._id.length===0
+        ) {
+            return undefined;
+        }
+        return {
+            entity: {id: fileEntity._id, type: fileType},
+            parent: {id: parentFolder._id, type: 'folder'},
+        };
+    }
+
+    private remoteFilePathIdentityMatches(
+        actual: RemoteFilePathIdentity | undefined,
+        expectedEntity: SyncManifestRemoteEntityIdentity,
+        expectedParent: SyncManifestRemoteFolderIdentity,
+    ): boolean {
+        return actual?.entity.id===expectedEntity.id
+            && actual.entity.type===expectedEntity.type
+            && this.remoteFolderIdentityMatches(actual.parent, expectedParent);
+    }
     private remoteFolderIdentityMatches(
         actual: SyncManifestRemoteFolderIdentity | undefined,
         expected: SyncManifestRemoteFolderIdentity,
@@ -12398,6 +12507,134 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         );
     }
 
+
+    // A local file create is a tree mutation with its own proof. Replacing the
+    // provisional generic update journal is safe because no remote create has
+    // run yet; from this point, a same-name remote file is never content-adopted.
+    private async journalPendingLocalFileCreate(
+        relPath: string,
+        localRevision: string,
+        parentEntity: SyncManifestRemoteFolderIdentity,
+        generation = this.syncGeneration,
+    ): Promise<SyncManifestPendingFileCreateOperation> {
+        this.requireSyncSession(generation);
+        if (!this.syncManifest) {
+            throw new Error('Local Replica file-create journal requires an active manifest.');
+        }
+        if (
+            !this.isCanonicalReplicaRelPath(relPath)
+            || !/^[a-f0-9]{40}$/.test(localRevision)
+        ) {
+            throw new Error('Invalid stable local revision for pending file create: ' + relPath);
+        }
+        const existing = this.syncManifest.pendingOperations[relPath];
+        const sameIntent = existing?.kind==='create'
+            && existing.localRevision===localRevision
+            && this.remoteFolderIdentityMatches(existing.parentEntity, parentEntity);
+        if (sameIntent) {
+            this.locallyDivergedPaths.add(relPath);
+            this.refreshDerivedSyncStatusWhenNotActive();
+            return existing;
+        }
+        // The watcher journals a generic update before it has inspected
+        // Overleaf. Upgrade only that exact unchanged intent once a missing
+        // target and parent identity are observed; all other journals conflict.
+        const replaceProvisionalUpdate = existing?.kind==='update'
+            && existing.localKind==='file'
+            && existing.localRevision===localRevision;
+        if (existing && !replaceProvisionalUpdate) {
+            throw new Error('A different Local Replica operation is already pending for this file create.');
+        }
+        const now = new Date().toISOString();
+        const record: SyncManifestPendingFileCreateOperation = {
+            version: 1,
+            id: replaceProvisionalUpdate && existing
+                ? existing.id
+                : crypto.randomBytes(16).toString('hex'),
+            kind: 'create',
+            localKind: 'file',
+            localRevision,
+            remoteKind: 'missing',
+            remoteRevision: DELETE_DIGEST,
+            parentEntity: {...parentEntity},
+            createdAt: replaceProvisionalUpdate && existing
+                ? existing.createdAt
+                : now,
+            updatedAt: now,
+        };
+        this.syncManifest.pendingOperations[relPath] = record;
+        this.locallyDivergedPaths.add(relPath);
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+        this.refreshDerivedSyncStatusWhenNotActive();
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [pending file create journaled] ' +
+            relPath + ' parent=folder:' + parentEntity.id,
+        );
+        return record;
+    }
+
+    private async markPendingLocalFileCreateEntity(
+        relPath: string,
+        record: SyncManifestPendingFileCreateOperation,
+        createdEntity: SyncManifestRemoteEntityIdentity,
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        const current = this.syncManifest?.pendingOperations[relPath];
+        if (
+            !current
+            || current.kind!=='create'
+            || current.id!==record.id
+            || current.localRevision!==record.localRevision
+            || !this.remoteFolderIdentityMatches(current.parentEntity, record.parentEntity)
+        ) {
+            throw new Error('Local Replica file-create journal changed before its server acknowledgement.');
+        }
+        if (
+            current.createdEntity!==undefined
+            && (
+                current.createdEntity.id!==createdEntity.id
+                || current.createdEntity.type!==createdEntity.type
+            )
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf returned a different file identity for the pending local create.',
+            );
+        }
+        current.createdEntity = {...createdEntity};
+        current.updatedAt = new Date().toISOString();
+        this.markSyncManifestDirty();
+        // Persist the server-issued ID before a path lookup. A crash after
+        // this point recognizes only this exact entity on reconnect/restart.
+        await this.persistSyncManifest(false, generation);
+    }
+
+    private async removePendingLocalFileCreate(
+        relPath: string,
+        reason: string,
+        generation = this.syncGeneration,
+        expected?: Pick<SyncManifestPendingFileCreateOperation, 'id'>,
+    ): Promise<boolean> {
+        this.requireSyncSession(generation);
+        const current = this.syncManifest?.pendingOperations[relPath];
+        if (
+            !current
+            || current.kind!=='create'
+            || (expected!==undefined && current.id!==expected.id)
+        ) {
+            return false;
+        }
+        delete this.syncManifest!.pendingOperations[relPath];
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+        this.refreshDerivedSyncStatusWhenNotActive();
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [pending file create acknowledged] ' +
+            relPath + ': ' + reason,
+        );
+        return true;
+    }
     // A move is a project-tree mutation, not a delete plus unrelated create.
     // Persist the exact source entity, its local inode/digest, and a missing
     // destination before invoking the Overleaf rename/move API. This is the
@@ -14079,6 +14316,283 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+
+    private async finalizeAcceptedPendingLocalFileCreate(
+        relPath: string,
+        record: SyncManifestPendingFileCreateOperation,
+        remoteIdentity: RemoteFilePathIdentity,
+        content: Uint8Array,
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        if (
+            !record.createdEntity
+            || !this.remoteFilePathIdentityMatches(
+                remoteIdentity,
+                record.createdEntity,
+                record.parentEntity,
+            )
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf file identity changed before the pending local create was verified.',
+            );
+        }
+        const [localState, remoteState] = await Promise.all([
+            this.captureLocalPathRevision(relPath, generation),
+            this.captureRemotePathRevision(relPath, generation),
+        ]);
+        this.requireSyncSession(generation);
+        if (
+            localState.kind!=='file'
+            || localState.revision!==record.localRevision
+            || localState.content===undefined
+            || remoteState.kind!=='file'
+            || remoteState.revision!==record.localRevision
+            || !bytesEqual(localState.content, content)
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'Local or Overleaf file contents changed before the pending local create was verified.',
+            );
+        }
+        const stable = await this.recordSyncManifestEntry(
+            relPath,
+            this.vfs.pathToUri(relPath),
+            content,
+            generation,
+        );
+        this.requireSyncSession(generation);
+        if (!stable) {
+            throw new RemoteDocumentMergeConflictError(
+                'The local file changed while its pending create was being finalized.',
+            );
+        }
+        // recordSyncManifestEntry has asynchronous local and remote reads. Make
+        // the journal's exact entity/parent proof the final acceptance test.
+        const [postState, postIdentity] = await Promise.all([
+            this.captureRemotePathRevision(relPath, generation),
+            this.resolveRemoteFilePathIdentity(this.vfs.pathToUri(relPath)),
+        ]);
+        this.requireSyncSession(generation);
+        if (
+            postState.kind!=='file'
+            || postState.revision!==record.localRevision
+            || !this.remoteFilePathIdentityMatches(
+                postIdentity,
+                record.createdEntity,
+                record.parentEntity,
+            )
+        ) {
+            this.removeSyncManifestEntry(relPath);
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf changed the created file before its final postcondition was observed.',
+            );
+        }
+        this.baseCache[relPath] = content;
+        this.seenLocalEntities.add(relPath);
+        this.setBypassCache(relPath, content, 'push');
+        this.clearRemoteDelete(relPath);
+        this.locallyDivergedPaths.delete(relPath);
+        const removed = await this.removePendingLocalFileCreate(
+            relPath,
+            'Overleaf accepted the guarded local file create',
+            generation,
+            record,
+        );
+        if (!removed) {
+            throw new Error('Local Replica file-create journal changed before final acknowledgement.');
+        }
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [local file create accepted] ' +
+            relPath + ' entity=' + remoteIdentity.entity.type + ':' + remoteIdentity.entity.id,
+        );
+    }
+
+    private async reconcilePendingLocalFileCreate(
+        relPath: string,
+        record: SyncManifestPendingFileCreateOperation,
+        generation = this.syncGeneration,
+    ): Promise<boolean> {
+        this.requireSyncSession(generation);
+        const localState = await this.captureLocalPathRevision(relPath, generation);
+        if (
+            localState.kind!=='file'
+            || localState.revision!==record.localRevision
+            || localState.content===undefined
+        ) {
+            await this.markSyncConflict(
+                relPath,
+                'A pending local file create cannot replay because the local file changed or disappeared',
+                localState.kind==='file' ? localState.content : undefined,
+                generation,
+            );
+            return false;
+        }
+        const remoteState = await this.captureRemotePathRevision(relPath, generation);
+        this.requireSyncSession(generation);
+        if (remoteState.kind==='file') {
+            const actual = await this.resolveRemoteFilePathIdentity(
+                this.vfs.pathToUri(relPath),
+            );
+            this.requireSyncSession(generation);
+            if (
+                record.createdEntity!==undefined
+                && remoteState.revision===record.localRevision
+                && this.remoteFilePathIdentityMatches(
+                    actual,
+                    record.createdEntity,
+                    record.parentEntity,
+                )
+            ) {
+                await this.finalizeAcceptedPendingLocalFileCreate(
+                    relPath, record, actual!, localState.content, generation,
+                );
+                return true;
+            }
+            await this.markSyncConflict(
+                relPath,
+                record.createdEntity===undefined
+                    ? 'Overleaf file appeared after an unacknowledged local create; its identity is not proven'
+                    : 'Overleaf file identity or contents changed while the local create was being verified',
+                localState.content,
+                generation,
+                remoteState,
+            );
+            return false;
+        }
+        if (remoteState.kind!=='missing') {
+            await this.markSyncConflict(
+                relPath,
+                'Overleaf path changed type while the local file create was pending',
+                localState.content,
+                generation,
+                remoteState,
+            );
+            return false;
+        }
+        if (record.createdEntity!==undefined) {
+            await this.markSyncConflict(
+                relPath,
+                'The exact Overleaf file created for this local intent disappeared before it was verified',
+                localState.content,
+                generation,
+                remoteState,
+            );
+            return false;
+        }
+        const parentRelPath = nodePath.posix.dirname(relPath);
+        const parentIdentity = await this.resolveRemoteFolderPathIdentity(
+            this.vfs.pathToUri(parentRelPath),
+        );
+        this.requireSyncSession(generation);
+        if (!this.remoteFolderIdentityMatches(parentIdentity?.entity, record.parentEntity)) {
+            await this.markSyncConflict(
+                relPath,
+                'Overleaf parent folder changed before the pending local file create could be applied',
+                localState.content,
+                generation,
+                remoteState,
+            );
+            return false;
+        }
+        let creation: Awaited<ReturnType<VirtualFileSystem['createFileIfMissing']>>;
+        try {
+            creation = await this.createFileWithRetry(
+                relPath,
+                this.vfs.pathToUri(relPath),
+                localState.content,
+                record.parentEntity,
+                generation,
+            );
+        } catch (error) {
+            if (!(error instanceof RemoteDocumentMergeConflictError)) {
+                throw error;
+            }
+            await this.markSyncConflict(
+                relPath,
+                error.message,
+                localState.content,
+                generation,
+            );
+            return false;
+        }
+        if (
+            !creation.created
+            || creation.parentId!==record.parentEntity.id
+            || (creation.entityType!=='doc' && creation.entityType!=='file')
+            || typeof creation.entityId!=='string'
+            || creation.entityId.length===0
+        ) {
+            await this.markSyncConflict(
+                relPath,
+                'Overleaf did not prove that the pending local file create produced the expected entity',
+                localState.content,
+                generation,
+            );
+            return false;
+        }
+        const createdEntity: SyncManifestRemoteEntityIdentity = {
+            id: creation.entityId,
+            type: creation.entityType,
+        };
+        await this.markPendingLocalFileCreateEntity(
+            relPath, record, createdEntity, generation,
+        );
+        const verified = await this.resolveRemoteFilePathIdentity(
+            this.vfs.pathToUri(relPath),
+        );
+        this.requireSyncSession(generation);
+        if (!this.remoteFilePathIdentityMatches(
+            verified, createdEntity, record.parentEntity,
+        )) {
+            await this.markSyncConflict(
+                relPath,
+                'Overleaf did not retain the created file identity at the requested path',
+                localState.content,
+                generation,
+            );
+            return false;
+        }
+        await this.finalizeAcceptedPendingLocalFileCreate(
+            relPath, record, verified!, localState.content, generation,
+        );
+        return true;
+    }
+    // Parent and child watcher events are independent queues. A child may
+    // discover the parent after the mkdir POST but before its ID is persisted;
+    // share that exact reconciliation rather than interpreting the half-finished
+    // folder as a collaborator's same-name create.
+    private async reconcilePendingLocalDirectoryCreateSingleFlight(
+        relPath: string,
+        record: SyncManifestPendingDirectoryCreateOperation,
+        generation = this.syncGeneration,
+    ): Promise<boolean> {
+        const active = this.pendingDirectoryCreateReconciliations.get(relPath);
+        if (
+            active?.generation===generation
+            && active.operationId===record.id
+        ) {
+            return active.promise;
+        }
+        const promise = this.reconcilePendingLocalDirectoryCreate(
+            relPath,
+            record,
+            generation,
+        );
+        const reconciliation = {
+            generation,
+            operationId: record.id,
+            promise,
+        };
+        this.pendingDirectoryCreateReconciliations.set(relPath, reconciliation);
+        try {
+            return await promise;
+        } finally {
+            if (this.pendingDirectoryCreateReconciliations.get(relPath)===reconciliation) {
+                this.pendingDirectoryCreateReconciliations.delete(relPath);
+            }
+        }
+    }
+
     private async reconcilePendingLocalDirectoryCreate(
         relPath: string,
         record: SyncManifestPendingDirectoryCreateOperation,
@@ -14234,6 +14748,195 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             generation,
         );
         return true;
+    }
+
+    // A local regular-file create inherits the same entity proof as a local
+    // mkdir. Watcher order is not a correctness boundary: agents/shells can
+    // write /new-folder/file.tex before VS Code reports /new-folder itself.
+    // Create every missing local ancestor first through the durable mkdir
+    // journal, then bind the file create to that exact server-issued parent ID.
+    private async ensureGuardedRemoteParentForLocalFileCreate(
+        relPath: string,
+        generation = this.syncGeneration,
+    ): Promise<SyncManifestRemoteFolderIdentity> {
+        this.requireSyncSession(generation);
+        const parentRelPath = nodePath.posix.dirname(relPath);
+        const active = this.pendingRemoteParentFolderEnsures.get(parentRelPath);
+        if (active?.generation===generation) {
+            return active.promise;
+        }
+        const promise = this.ensureGuardedRemoteParentFolderForLocalFileCreate(
+            parentRelPath,
+            generation,
+        );
+        const record = {generation, promise};
+        this.pendingRemoteParentFolderEnsures.set(parentRelPath, record);
+        try {
+            return await promise;
+        } finally {
+            if (this.pendingRemoteParentFolderEnsures.get(parentRelPath)===record) {
+                this.pendingRemoteParentFolderEnsures.delete(parentRelPath);
+            }
+        }
+    }
+
+    private async ensureGuardedRemoteParentFolderForLocalFileCreate(
+        parentRelPath: string,
+        generation: number,
+    ): Promise<SyncManifestRemoteFolderIdentity> {
+        this.requireSyncSession(generation);
+        const parentUri = this.vfs.pathToUri(parentRelPath);
+        const acceptObservedParent = async (
+            observed: RemoteFolderPathIdentity,
+        ): Promise<SyncManifestRemoteFolderIdentity> => {
+            this.requireSyncSession(generation);
+            if (parentRelPath==='/') {
+                return observed.entity;
+            }
+            const pending = this.syncManifest?.pendingOperations[parentRelPath];
+            if (pending?.kind==='mkdir') {
+                const grandparent = await this.ensureGuardedRemoteParentForLocalFileCreate(
+                    parentRelPath,
+                    generation,
+                );
+                this.requireSyncSession(generation);
+                if (!this.remoteFolderIdentityMatches(pending.parentEntity, grandparent)) {
+                    throw new RemoteDocumentMergeConflictError(
+                        'The pending local parent folder create has a different Overleaf parent identity.',
+                    );
+                }
+                if (!await this.reconcilePendingLocalDirectoryCreateSingleFlight(
+                    parentRelPath,
+                    pending,
+                    generation,
+                )) {
+                    throw new RemoteDocumentMergeConflictError(
+                        'The pending local parent folder create was not accepted by Overleaf.',
+                    );
+                }
+                const verified = await this.resolveRemoteFolderPathIdentity(parentUri);
+                this.requireSyncSession(generation);
+                if (
+                    pending.createdEntity!==undefined
+                    && this.remoteFolderPathIdentityMatches(
+                        verified,
+                        pending.createdEntity,
+                        pending.parentEntity,
+                    )
+                ) {
+                    return verified!.entity;
+                }
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf did not retain the pending local parent folder identity.',
+                );
+            }
+            const recorded = this.syncManifest?.directories[parentRelPath];
+            if (
+                recorded?.remoteEntity!==undefined
+                && recorded.parentEntity!==undefined
+                && this.remoteFolderPathIdentityMatches(
+                    observed,
+                    recorded.remoteEntity,
+                    recorded.parentEntity,
+                )
+            ) {
+                return observed.entity;
+            }
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf parent folder appeared without a matching authoritative local folder baseline.',
+            );
+        };
+
+        const observed = await this.resolveRemoteFolderPathIdentity(parentUri);
+        this.requireSyncSession(generation);
+        if (observed!==undefined) {
+            return acceptObservedParent(observed);
+        }
+
+        const localState = await this.captureLocalPathRevision(parentRelPath, generation);
+        if (localState.kind!=='directory') {
+            throw new RemoteDocumentMergeConflictError(
+                'The local parent for a file create is not a stable directory: ' + parentRelPath,
+            );
+        }
+        const remoteState = await this.captureRemotePathRevision(parentRelPath, generation);
+        this.requireSyncSession(generation);
+        if (remoteState.kind!=='missing') {
+            const appeared = await this.resolveRemoteFolderPathIdentity(parentUri);
+            this.requireSyncSession(generation);
+            if (appeared!==undefined) {
+                return acceptObservedParent(appeared);
+            }
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf parent path changed type while preparing the local file create: ' +
+                parentRelPath,
+            );
+        }
+
+        const grandparent = await this.ensureGuardedRemoteParentForLocalFileCreate(
+            parentRelPath,
+            generation,
+        );
+        this.requireSyncSession(generation);
+        const recheckedRemoteState = await this.captureRemotePathRevision(
+            parentRelPath,
+            generation,
+        );
+        this.requireSyncSession(generation);
+        if (recheckedRemoteState.kind!=='missing') {
+            const appeared = await this.resolveRemoteFolderPathIdentity(parentUri);
+            this.requireSyncSession(generation);
+            if (appeared!==undefined) {
+                return acceptObservedParent(appeared);
+            }
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf parent path changed type while preparing the local file create: ' +
+                parentRelPath,
+            );
+        }
+
+        const existing = this.syncManifest?.pendingOperations[parentRelPath];
+        let mkdir: SyncManifestPendingDirectoryCreateOperation;
+        if (existing?.kind==='mkdir') {
+            if (!this.remoteFolderIdentityMatches(existing.parentEntity, grandparent)) {
+                throw new RemoteDocumentMergeConflictError(
+                    'The pending local parent folder create has a different Overleaf parent identity.',
+                );
+            }
+            mkdir = existing;
+        } else {
+            if (existing!==undefined) {
+                throw new RemoteDocumentMergeConflictError(
+                    'A different Local Replica operation is pending for the local parent folder.',
+                );
+            }
+            mkdir = await this.journalPendingLocalDirectoryCreate(
+                parentRelPath,
+                localState.revision,
+                grandparent,
+                generation,
+            );
+        }
+        if (!await this.reconcilePendingLocalDirectoryCreateSingleFlight(parentRelPath, mkdir, generation)) {
+            throw new RemoteDocumentMergeConflictError(
+                'The pending local parent folder create was not accepted by Overleaf.',
+            );
+        }
+        const verified = await this.resolveRemoteFolderPathIdentity(parentUri);
+        this.requireSyncSession(generation);
+        if (
+            mkdir.createdEntity===undefined
+            || !this.remoteFolderPathIdentityMatches(
+                verified,
+                mkdir.createdEntity,
+                mkdir.parentEntity,
+            )
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf did not retain the pending local parent folder identity.',
+            );
+        }
+        return verified!.entity;
     }
 
     private async reconcilePendingLocalDirectoryDelete(
@@ -14451,6 +15154,24 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
                 continue;
             }
+            if (recorded.kind==='create') {
+                try {
+                    if (await this.reconcilePendingLocalFileCreate(
+                        relPath,
+                        recorded,
+                        generation,
+                    )) {
+                        recovered += 1;
+                    }
+                } catch (error) {
+                    this.locallyDivergedPaths.add(relPath);
+                    getOutputChannel().appendLine(
+                        new Date().toISOString() + ' [pending file create replay deferred] ' +
+                        relPath + ': ' + formatUnknownError(error),
+                    );
+                }
+                continue;
+            }
             if (recorded.kind==='rmdir') {
                 try {
                     if (await this.reconcilePendingLocalDirectoryDelete(
@@ -14471,7 +15192,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
             if (recorded.kind==='mkdir') {
                 try {
-                    if (await this.reconcilePendingLocalDirectoryCreate(
+                    if (await this.reconcilePendingLocalDirectoryCreateSingleFlight(
                         relPath,
                         recorded,
                         generation,
@@ -16048,6 +16769,35 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         });
     }
 
+
+    private async createFileWithRetry(
+        relPath: string,
+        toUri: vscode.Uri,
+        content: Uint8Array,
+        parentEntity: SyncManifestRemoteFolderIdentity,
+        generation = this.syncGeneration,
+    ): Promise<Awaited<ReturnType<VirtualFileSystem['createFileIfMissing']>>> {
+        return this.withRetry('push', relPath, async () => {
+            await this.vfs.ensureConnectedForWrite();
+            this.requireSyncSession(generation);
+            return this.runSessionIO(
+                generation,
+                () => this.vfs.createFileIfMissing(
+                    toUri,
+                    content,
+                    parentEntity.id,
+                ),
+            );
+        }, {
+            delays: LocalReplicaSCMProvider.pushRetryDelays,
+            generation,
+            betweenAttempts: async () => {
+                await this.waitForConnectedOrTimeout(
+                    LocalReplicaSCMProvider.pushReconnectWaitMs,
+                );
+            },
+        });
+    }
     // Pull binary files with a wider backoff. Binary VFS reads occasionally
     // return Unknown / zero bytes during socket reconnects; surface those as
     // failures the outer code can retry rather than silently writing empty
@@ -17249,7 +17999,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         ) => {
                             let accepted = false;
                             try {
-                                accepted = await this.reconcilePendingLocalDirectoryCreate(
+                                accepted = await this.reconcilePendingLocalDirectoryCreateSingleFlight(
                                     relPath,
                                     record,
                                     generation,
@@ -17658,32 +18408,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 );
                                 this.requireSyncSession(generation);
                                 if (remoteState.kind==='file') {
-                                    if (bytesEqual(newContent, remoteState.content!)) {
-                                        this.setBypassCache(relPath, newContent, 'pull');
-                                        this.baseCache[relPath] = newContent;
-                                        this.seenLocalEntities.add(relPath);
-                                        this.clearRemoteDelete(relPath);
-                                        this.locallyDivergedPaths.delete(relPath);
-                                        await this.recordPushManifestEntry(
-                                            relPath,
-                                            toUri,
-                                            fromUri,
-                                            newContent,
-                                            generation,
-                                        );
-                                        await this.removePendingFilePushOperation(
-                                            relPath,
-                                            'current local state already matches authoritative Overleaf',
-                                            generation,
-                                            {kind: 'update', localRevision: contentDigest(newContent)},
-                                        );
-                                        await this.persistSyncManifest(false, generation);
-                                        getOutputChannel().appendLine(
-                                            `${new Date().toISOString()} [push verified] ${relPath}: ` +
-                                            'untracked remote already matches local',
-                                        );
-                                        return;
-                                    }
+                                    // No accepted baseline binds this local
+                                    // file to the remote entity. Equal bytes do
+                                    // not prove who created it, so a concurrent
+                                    // same-name create remains a conflict.
                                     await this.markSyncConflict(
                                         relPath,
                                         'Local and Overleaf files appeared concurrently without a common baseline',
@@ -17901,38 +18629,106 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             // sync session.
                             this.requireSyncSession(generation);
                             const pendingPushRevision = contentDigest(newContent);
-                            const pendingRemoteState = await this.captureRemotePathRevision(
-                                relPath,
-                                generation,
-                            );
-                            await this.journalPendingFilePushOperation(
-                                relPath, 'update', pendingPushRevision, pendingRemoteState, generation,
-                            );
-                            // Push with bounded retry so a transient socket blip doesn't
+                            let pendingCreate: SyncManifestPendingFileCreateOperation | undefined;
+                            if (expectedRemoteMissingForPush) {
+                                const parentEntity = await this.ensureGuardedRemoteParentForLocalFileCreate(
+                                    relPath,
+                                    generation,
+                                );
+                                this.requireSyncSession(generation);
+                                pendingCreate = await this.journalPendingLocalFileCreate(
+                                    relPath,
+                                    pendingPushRevision,
+                                    parentEntity,
+                                    generation,
+                                );
+                            } else {
+                                const pendingRemoteState = await this.captureRemotePathRevision(
+                                    relPath,
+                                    generation,
+                                );
+                                await this.journalPendingFilePushOperation(
+                                    relPath,
+                                    'update',
+                                    pendingPushRevision,
+                                    pendingRemoteState,
+                                    generation,
+                                );
+                            }
+                            // Push with bounded retry so a transient socket blip does not
                             // silently lose the accepted edit.
                             try {
-                                const pushedContent = (
-                                    remoteBaselineForPush!==undefined
-                                    && await this.remoteEntityNeedsGuardedReplace(relPath, toUri)
-                                )
-                                    ? await this.guardedReplaceRemoteBinary(
+                                if (pendingCreate!==undefined) {
+                                    const creation = await this.createFileWithRetry(
                                         relPath,
                                         toUri,
                                         newContent,
-                                        remoteBaselineForPush,
+                                        pendingCreate.parentEntity,
                                         generation,
-                                    )
-                                    : await this.pushWithRetry(
-                                        relPath,
-                                        toUri,
-                                        newContent,
-                                        generation,
-                                        remoteBaselineForPush,
-                                        expectedRemoteMissingForPush,
                                     );
-                                if (!bytesEqual(pushedContent, newContent)) {
-                                    newContent = pushedContent;
-                                    writeMergedContentBackToLocal = true;
+                                    if (
+                                        !creation.created
+                                        || creation.parentId!==pendingCreate.parentEntity.id
+                                        || (creation.entityType!=='doc' && creation.entityType!=='file')
+                                        || typeof creation.entityId!=='string'
+                                        || creation.entityId.length===0
+                                    ) {
+                                        throw new RemoteDocumentMergeConflictError(
+                                            'Overleaf did not prove that the local file create produced the expected entity.',
+                                        );
+                                    }
+                                    const createdEntity: SyncManifestRemoteEntityIdentity = {
+                                        id: creation.entityId,
+                                        type: creation.entityType,
+                                    };
+                                    await this.markPendingLocalFileCreateEntity(
+                                        relPath,
+                                        pendingCreate,
+                                        createdEntity,
+                                        generation,
+                                    );
+                                    const verified = await this.resolveRemoteFilePathIdentity(toUri);
+                                    this.requireSyncSession(generation);
+                                    if (!this.remoteFilePathIdentityMatches(
+                                        verified,
+                                        createdEntity,
+                                        pendingCreate.parentEntity,
+                                    )) {
+                                        throw new RemoteDocumentMergeConflictError(
+                                            'Overleaf did not retain the created file identity at the requested path.',
+                                        );
+                                    }
+                                    await this.finalizeAcceptedPendingLocalFileCreate(
+                                        relPath,
+                                        pendingCreate,
+                                        verified!,
+                                        newContent,
+                                        generation,
+                                    );
+                                } else {
+                                    const pushedContent = (
+                                        remoteBaselineForPush!==undefined
+                                        && await this.remoteEntityNeedsGuardedReplace(relPath, toUri)
+                                    )
+                                        ? await this.guardedReplaceRemoteBinary(
+                                            relPath,
+                                            toUri,
+                                            newContent,
+                                            remoteBaselineForPush,
+                                            generation,
+                                        )
+                                        : await this.pushWithRetry(
+                                            relPath,
+                                            toUri,
+                                            newContent,
+                                            generation,
+                                            remoteBaselineForPush,
+                                            false,
+                                        );
+                                    if (!bytesEqual(pushedContent, newContent)) {
+                                        newContent = pushedContent;
+                                        writeMergedContentBackToLocal = true;
+                                    }
                                 }
                             } catch (error) {
                                 if (
@@ -17948,7 +18744,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     generation,
                                 );
                                 outcome = 'blocked';
-                                errorMessage = 'remote changed during rebased push';
+                                errorMessage = 'remote changed during guarded create or rebased push';
+                                return;
+                            }
+                            if (pendingCreate!==undefined) {
+                                if (options.forcePush) {
+                                    this.setBypassCache(relPath, newContent, 'push');
+                                }
                                 return;
                             }
                             if (options.forcePush) {

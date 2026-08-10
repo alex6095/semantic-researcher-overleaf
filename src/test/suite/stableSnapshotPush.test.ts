@@ -107,6 +107,46 @@ class FakeVirtualFileSystem {
 
     async ensureConnectedForWrite() {}
 
+    async createFileIfMissing(
+        uri: vscode.Uri,
+        content: Uint8Array,
+        expectedParentId?: string,
+    ) {
+        const current = await this._resolveUri(uri);
+        const parentId = current.parentFolder._id;
+        if (expectedParentId!==undefined && parentId!==expectedParentId) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf parent folder changed before the local file create: ' + uri.path,
+            );
+        }
+        if (await pathExists(uri)) {
+            if (current.fileType!=='doc' && current.fileType!=='file') {
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf path has a different type while the local file was being created: ' + uri.path,
+                );
+            }
+            return {
+                created: false,
+                entityId: current.fileEntity._id,
+                entityType: current.fileType,
+                parentId,
+            };
+        }
+        await this.writeFileFromRemoteBaseline(uri, content);
+        const created = await this._resolveUri(uri);
+        if (
+            (created.fileType!=='doc' && created.fileType!=='file')
+            || !created.fileEntity?._id
+        ) {
+            throw new Error('Fake VFS did not create a regular file entity.');
+        }
+        return {
+            created: true,
+            entityId: created.fileEntity._id,
+            entityType: created.fileType,
+            parentId,
+        };
+    }
     async writeFileFromRemoteBaseline(
         uri: vscode.Uri,
         content: Uint8Array,
@@ -978,7 +1018,7 @@ suite('Local Replica stable-snapshot push', function () {
         await waitUntil(() => internals.locallyDivergedPaths.has('/main.tex')===false);
     });
 
-    test('the untracked-remote exit re-drives when the local file advanced', async () => {
+    test('does not adopt an untracked same-byte remote file when the local file advanced', async () => {
         const remoteRoot = await tempDir('sr-stable-exit-b-remote-');
         const localRoot = await tempDir('sr-stable-exit-b-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -1013,19 +1053,13 @@ suite('Local Replica stable-snapshot push', function () {
             localNew,
             remoteNew,
         ) as Events['scmSyncCompleteEvent'];
-        const retryWait = waitForSyncComplete(localRoot, '/appendix.tex', 'push', 'update');
 
         assert.strictEqual(advanced, true);
-        assert.strictEqual(event.outcome, 'success');
-        assert.ok(hasLine('untracked remote already matches local'));
-        assert.ok(hasLine('[push intermediate]'));
-        assert.strictEqual(internals.locallyDivergedPaths.has('/appendix.tex'), true);
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(await readText(remoteNew), 'a1');
+        assert.strictEqual(await readText(localNew), 'a2');
         assert.strictEqual(vfs.uploadCount, 0);
-
-        assert.strictEqual((await retryWait).outcome, 'success');
-        assert.strictEqual(await readText(remoteNew), 'a2');
-        assert.strictEqual(vfs.uploadCount, 1);
-        await waitUntil(() => internals.locallyDivergedPaths.has('/appendix.tex')===false);
+        assert.strictEqual(internals.syncConflicts.has('/appendix.tex'), true);
     });
 
     // ---------------------------------------------- transient disappearance ----
