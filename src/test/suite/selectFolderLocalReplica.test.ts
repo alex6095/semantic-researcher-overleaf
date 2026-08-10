@@ -6017,6 +6017,102 @@ suite('Select Project Folder Local Replica', function () {
         }
     });
 
+    test('blocks a tampered remote folder stage before moving the canonical local tree', async () => {
+        const fixture = await createFolderReplacementConflictFixture(
+            'folder-replacement-stage-tamper',
+        );
+        const originalPreserve = (fixture.scm as any)
+            .preserveFolderConflictLocalTree.bind(fixture.scm);
+        (fixture.scm as any).preserveFolderConflictLocalTree = async () => false;
+        try {
+            const staged = await fixture.scm.resolveFolderConflictWithOverleafState(
+                '/chapter',
+                true,
+            );
+            assert.strictEqual(staged.resolved, false);
+        } finally {
+            (fixture.scm as any).preserveFolderConflictLocalTree = originalPreserve;
+        }
+
+        const record = (fixture.scm as any).syncManifest.folderConflictResolutions['/chapter'];
+        assert.strictEqual(record.phase, 'remote-staged');
+        assert.strictEqual(await pathExists(fixture.localFolder), true);
+        const localInodeBefore = (await fs.lstat(fixture.localFolder.fsPath)).ino;
+        await writeText(uriForRelPath(
+            fixture.localRoot,
+            record.stageRelPath + '/tampered.tex',
+        ), 'metadata tamper');
+
+        assert.strictEqual(
+            await (fixture.scm as any).reconcilePersistedFolderConflictResolutionTransactions(),
+            0,
+        );
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.folderConflictResolutions['/chapter'].phase,
+            'blocked',
+        );
+        assert.strictEqual(
+            (await fs.lstat(fixture.localFolder.fsPath)).ino,
+            localInodeBefore,
+        );
+        assert.deepStrictEqual(await readBytes(fixture.localPdf), fixture.localPdfContent);
+        assert.strictEqual(
+            await pathExists(vscode.Uri.joinPath(fixture.localFolder, 'remote.tex')),
+            false,
+        );
+        assert.strictEqual(
+            await pathExists(uriForRelPath(fixture.localRoot, record.artifactRelPath)),
+            false,
+        );
+        assert.strictEqual(await readText(fixture.replacementTex), fixture.replacementTexContent);
+        assert.ok((fixture.scm as any).syncConflicts.has('/chapter'));
+    });
+
+    test('rebuilds a missing remote folder stage before preserving the local tree', async () => {
+        const fixture = await createFolderReplacementConflictFixture(
+            'folder-replacement-stage-rebuild',
+        );
+        const originalPreserve = (fixture.scm as any)
+            .preserveFolderConflictLocalTree.bind(fixture.scm);
+        (fixture.scm as any).preserveFolderConflictLocalTree = async () => false;
+        try {
+            const staged = await fixture.scm.resolveFolderConflictWithOverleafState(
+                '/chapter',
+                true,
+            );
+            assert.strictEqual(staged.resolved, false);
+        } finally {
+            (fixture.scm as any).preserveFolderConflictLocalTree = originalPreserve;
+        }
+
+        const record = (fixture.scm as any).syncManifest.folderConflictResolutions['/chapter'];
+        assert.strictEqual(record.phase, 'remote-staged');
+        await vscode.workspace.fs.delete(
+            uriForRelPath(fixture.localRoot, record.stageRelPath),
+            {recursive: true},
+        );
+        assert.strictEqual(
+            await (fixture.scm as any).reconcilePersistedFolderConflictResolutionTransactions(),
+            1,
+        );
+        assert.strictEqual(
+            await readText(vscode.Uri.joinPath(fixture.localFolder, 'remote.tex')),
+            fixture.replacementTexContent,
+        );
+        assert.deepStrictEqual(
+            await readBytes(uriForRelPath(
+                fixture.localRoot,
+                record.artifactRelPath + '/paper.pdf',
+            )),
+            fixture.localPdfContent,
+        );
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/chapter'), false);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.folderConflictResolutions['/chapter'],
+            undefined,
+        );
+    });
+
     test('defers a persisted folder replacement during a transient reconciliation failure', async () => {
         const fixture = await createFolderReplacementConflictFixture(
             'folder-replacement-reconcile-deferred',

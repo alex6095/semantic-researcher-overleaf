@@ -9679,6 +9679,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
                 return {resolved: false, artifactRelPath: record.artifactRelPath};
             }
+            // The protected remote stage can be tampered with while the
+            // transaction is deferred. Revalidate (or safely recreate a
+            // missing stage from the still-proven remote tree) BEFORE moving
+            // the canonical local tree into its artifact/guard.
+            if (!await this.stageFolderConflictRemoteDirectory(
+                record,
+                remote,
+                generation,
+            )) {
+                return {resolved: false, artifactRelPath: record.artifactRelPath};
+            }
             const latestLocal = await this.captureStableFolderConflictLocalState(
                 record.conflictPath,
                 generation,
