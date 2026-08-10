@@ -29,6 +29,7 @@ import {
     LEGACY_REPLICA_SETTINGS_BACKUP_FILE,
     LEGACY_REPLICA_SETTINGS_DIR,
     LEGACY_REPLICA_SETTINGS_FILE,
+    OUTPUT_FOLDER_NAME,
     REPLICA_SETTINGS_DIR,
     REPLICA_SETTINGS_FILE,
     getConfiguredValue,
@@ -42,6 +43,30 @@ import { decodeUtf8Text, mergeUtf8Text } from '../utils/threeWayMerge';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 const ECHO_WINDOW_MS = 500;
+/**
+ * The extension's compile output is distinguished by its configured root
+ * folder, never by a filename. In particular, source assets named main.pdf
+ * and output.pdf are ordinary project files and must remain syncable.
+ */
+export function isLocalReplicaCompileOutputPath(
+    relPath: string,
+    outputFolderName = OUTPUT_FOLDER_NAME,
+): boolean {
+    // Settings validation rejects path separators, but persisted legacy values
+    // still need a fail-closed check before they can affect sync filtering.
+    if (
+        outputFolderName==='' ||
+        outputFolderName==='.' ||
+        outputFolderName==='..' ||
+        /[\\/]/.test(outputFolderName)
+    ) {
+        return false;
+    }
+    const outputRoot = '/' + outputFolderName;
+    const normalized = normalizeReplicaPath(relPath);
+    return normalized===outputRoot || normalized.startsWith(outputRoot + '/');
+}
+
 const SYNC_MANIFEST_FILE = `${REPLICA_SETTINGS_DIR}/sync-manifest.json`;
 const SYNC_OWNER_FILE = 'sync-owner.json';
 const SYNC_OWNER_REPAIR_FILE = 'sync-owner.repair.json';
@@ -642,8 +667,6 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         '**/*.synctex.gz',
         '**/*.toc',
         '**/*.xdv',
-        '**/main.pdf',
-        '**/output.pdf',
     ];
 
     constructor(
@@ -8365,6 +8388,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }
 
     private matchIgnorePatterns(path: string): boolean {
+        if (isLocalReplicaCompileOutputPath(path)) {
+            return true;
+        }
         const ignorePatterns = this.getSetting<string[]>(IGNORE_SETTING_KEY) || this.ignorePatterns;
         for (const pattern of [...PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS, ...ignorePatterns]) {
             if (matchesLocalReplicaIgnorePattern(path, pattern)) {

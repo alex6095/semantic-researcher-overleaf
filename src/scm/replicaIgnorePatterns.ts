@@ -8,6 +8,8 @@ import { REPLICA_SETTINGS_DIR } from '../consts';
  * this list is prepended to (and cannot be overridden by) `ignore-patterns`.
  */
 export const PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS = [
+    '**/.output',
+    '**/.output/**',
     '**/AGENTS.md',
     '**/CLAUDE.md',
     '**/.cursor/**',

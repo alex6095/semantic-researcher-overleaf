@@ -23,6 +23,7 @@ import {
 } from '../../core/remoteFileSystemProvider';
 import {
     LocalReplicaSCMProvider,
+    isLocalReplicaCompileOutputPath,
     matchesLocalReplicaIgnorePattern,
 } from '../../scm/localReplicaSCM';
 import { SCMCollectionProvider } from '../../scm/scmCollectionProvider';
@@ -401,6 +402,24 @@ suite('Select Project Folder Local Replica', function () {
     let originalShowWarningMessage: typeof vscode.window.showWarningMessage;
     let originalShowInformationMessage: typeof vscode.window.showInformationMessage;
     let originalShowErrorMessage: typeof vscode.window.showErrorMessage;
+    test('filters configured extension output folders, not source PDF filenames', () => {
+        assert.strictEqual(isLocalReplicaCompileOutputPath('/.output/output.pdf'), true);
+        assert.strictEqual(isLocalReplicaCompileOutputPath('/main.pdf'), false);
+        assert.strictEqual(isLocalReplicaCompileOutputPath('/output.pdf'), false);
+        assert.strictEqual(
+            isLocalReplicaCompileOutputPath('/build/output.pdf', 'build'),
+            true,
+        );
+        assert.strictEqual(
+            isLocalReplicaCompileOutputPath('/rebuild/output.pdf', 'build'),
+            false,
+        );
+        assert.strictEqual(
+            isLocalReplicaCompileOutputPath('/build/output.pdf', '../build'),
+            false,
+        );
+    });
+
     let originalShowTextDocument: typeof vscode.window.showTextDocument;
     let originalCreateFileSystemWatcher: typeof vscode.workspace.createFileSystemWatcher;
     let originalExecuteCommand: typeof vscode.commands.executeCommand;
@@ -836,10 +855,19 @@ suite('Select Project Folder Local Replica', function () {
 
         const pngBytes = Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]);
         const pdfBytes = Buffer.from('%PDF-1.7\nsource pdf\n', 'utf-8');
+        const zipBytes = Buffer.from([0x50, 0x4b, 0x03, 0x04, 1, 2, 3]);
+        const csvBytes = Buffer.from('seed,metric\n1,0.91\n', 'utf-8');
         await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote text');
         await writeBytes(vscode.Uri.joinPath(remoteRoot, 'figures', 'plot.png'), pngBytes);
         await writeBytes(vscode.Uri.joinPath(remoteRoot, 'supplement.pdf'), pdfBytes);
-        await writeBytes(vscode.Uri.joinPath(remoteRoot, 'main.pdf'), Buffer.from('%PDF generated\n', 'utf-8'));
+        await writeBytes(vscode.Uri.joinPath(remoteRoot, 'main.pdf'), pdfBytes);
+        await writeBytes(vscode.Uri.joinPath(remoteRoot, 'output.pdf'), pdfBytes);
+        await writeBytes(vscode.Uri.joinPath(remoteRoot, 'archive', 'source.zip'), zipBytes);
+        await writeBytes(vscode.Uri.joinPath(remoteRoot, 'data', 'metrics.csv'), csvBytes);
+        await writeBytes(
+            vscode.Uri.joinPath(remoteRoot, '.output', 'output.pdf'),
+            Buffer.from('%PDF extension output\n', 'utf-8'),
+        );
 
         const scm = createSCM(remoteRoot, localRoot);
         await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
@@ -847,7 +875,11 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(await readText(vscode.Uri.joinPath(localRoot, 'main.tex')), 'remote text');
         assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(localRoot, 'figures', 'plot.png')), pngBytes);
         assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(localRoot, 'supplement.pdf')), pdfBytes);
-        assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, 'main.pdf')), false);
+        assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(localRoot, 'main.pdf')), pdfBytes);
+        assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(localRoot, 'output.pdf')), pdfBytes);
+        assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(localRoot, 'archive', 'source.zip')), zipBytes);
+        assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(localRoot, 'data', 'metrics.csv')), csvBytes);
+        assert.strictEqual(await pathExists(vscode.Uri.joinPath(localRoot, '.output', 'output.pdf')), false);
     });
 
     test('pushes local text and media edits back to remote', async () => {
@@ -857,18 +889,45 @@ suite('Select Project Folder Local Replica', function () {
 
         await writeText(vscode.Uri.joinPath(remoteRoot, 'main.tex'), 'remote text');
         await writeBytes(vscode.Uri.joinPath(remoteRoot, 'supplement.pdf'), Buffer.from('%PDF old\n', 'utf-8'));
+        const localZip = vscode.Uri.joinPath(localRoot, 'archive', 'source.zip');
+        const localCsv = vscode.Uri.joinPath(localRoot, 'data', 'metrics.csv');
+        const localNamedMainPdf = vscode.Uri.joinPath(localRoot, 'main.pdf');
+        const localNamedOutputPdf = vscode.Uri.joinPath(localRoot, 'output.pdf');
+        const localExtensionOutput = vscode.Uri.joinPath(localRoot, '.output', 'output.pdf');
 
         const scm = createSCM(remoteRoot, localRoot);
+        const nextZip = Buffer.from([0x50, 0x4b, 0x03, 0x04, 4, 5, 6]);
+        const nextCsv = Buffer.from('seed,metric\n2,0.97\n', 'utf-8');
+        const nextNamedMainPdf = Buffer.from('%PDF named main source\n', 'utf-8');
+        const nextNamedOutputPdf = Buffer.from('%PDF named output source\n', 'utf-8');
         await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
 
         const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        await writeBytes(localZip, nextZip);
+        await writeBytes(localCsv, nextCsv);
+        await writeBytes(localNamedMainPdf, nextNamedMainPdf);
+        await writeBytes(localNamedOutputPdf, nextNamedOutputPdf);
+        await writeBytes(localExtensionOutput, Buffer.from('%PDF local extension output\n', 'utf-8'));
         const localPdf = vscode.Uri.joinPath(localRoot, 'supplement.pdf');
         const nextPdf = Buffer.from('%PDF new\nbinary-ish\n', 'utf-8');
         await writeText(localMain, 'local text');
+        await scm.flushPendingPush(localZip);
+        await scm.flushPendingPush(localCsv);
+        await scm.flushPendingPush(localNamedMainPdf);
+        await scm.flushPendingPush(localNamedOutputPdf);
+        await scm.flushPendingPush(localExtensionOutput);
         await writeBytes(localPdf, nextPdf);
 
         await scm.flushPendingPush(localMain);
         await scm.flushPendingPush(localPdf);
+        assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(remoteRoot, 'archive', 'source.zip')), nextZip);
+        assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(remoteRoot, 'data', 'metrics.csv')), nextCsv);
+        assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(remoteRoot, 'main.pdf')), nextNamedMainPdf);
+        assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(remoteRoot, 'output.pdf')), nextNamedOutputPdf);
+        assert.strictEqual(
+            await pathExists(vscode.Uri.joinPath(remoteRoot, '.output', 'output.pdf')),
+            false,
+        );
 
         assert.strictEqual(await readText(vscode.Uri.joinPath(remoteRoot, 'main.tex')), 'local text');
         assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(remoteRoot, 'supplement.pdf')), nextPdf);
