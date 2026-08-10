@@ -1903,6 +1903,100 @@ suite('Extension host and lifecycle isolation', () => {
         assert.strictEqual(conflictVfs.updates.length, 0);
     });
 
+    test('refreshes the subscribed revision before submitting a local OT update', async () => {
+        const uri = vscode.Uri.parse(
+            'semantic-researcher-overleaf://www.overleaf.com/Project/main.tex' +
+            '?user=user-1&project=project-1',
+        );
+        const encoder = new TextEncoder();
+        const document = {
+            _id: 'doc-preflight',
+            name: 'main.tex',
+            version: 4,
+            lastVersion: 3,
+            localCache: 'title: base\nmiddle: base\nbody: base\n',
+            remoteCache: 'title: base\nmiddle: base\nbody: base\n',
+        };
+        const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
+        const internals = vfs as any;
+        attachAuthenticatedSession(internals);
+        const server = {
+            content: 'title: remote\nmiddle: base\nbody: base\n',
+            version: 5,
+        };
+        let joinCalls = 0;
+        let submitted: any;
+        const applyOperations = (
+            content: string,
+            operations: Array<{p: number; i?: string; d?: string}>,
+        ) => {
+            for (const operation of operations) {
+                if (operation.i!==undefined) {
+                    content = content.slice(0, operation.p)
+                        + operation.i + content.slice(operation.p);
+                } else if (operation.d!==undefined) {
+                    content = content.slice(0, operation.p)
+                        + content.slice(operation.p+operation.d.length);
+                }
+            }
+            return content;
+        };
+        internals.disposed = false;
+        internals.origin = uri.with({path: '/Project'});
+        internals.projectName = 'Project';
+        internals.documentWriteQueues = new Map();
+        internals.documentCollaboratorRevisions = new Map();
+        internals.pendingDocumentWrites = new Map();
+        internals.documentInDoubtSenderVersions = new Map();
+        internals.ensureConnectedForWrite = async () => undefined;
+        internals._resolveUri = async () => ({fileType: 'doc', fileEntity: document});
+        internals._resolveById = () => ({fileEntity: document, path: '/main.tex'});
+        internals.notify = () => undefined;
+        internals.socket = {
+            joinDoc: async (_docId: string, fromVersion?: number) => {
+                joinCalls += 1;
+                assert.strictEqual(fromVersion, 4);
+                return {
+                    type: 'sharejs-text-ot',
+                    version: server.version,
+                    updates: [{
+                        doc: document._id,
+                        v: 4,
+                        op: [
+                            {p: 7, d: 'base'},
+                            {p: 7, i: 'remote'},
+                        ],
+                    }],
+                };
+            },
+            applyOtUpdate: async (_docId: string, update: any) => {
+                submitted = update;
+                assert.strictEqual(update.v, server.version);
+                server.content = applyOperations(server.content, update.op);
+                const appliedVersion = server.version;
+                server.version += 1;
+                internals.applyRemoteDocumentUpdate({
+                    doc: document._id,
+                    v: appliedVersion,
+                });
+            },
+        };
+
+        const written = await vfs.writeFileFromRemoteBaseline(
+            uri,
+            encoder.encode('title: base\nmiddle: base\nbody: local\n'),
+            encoder.encode('title: base\nmiddle: base\nbody: base\n'),
+        );
+
+        assert.strictEqual(joinCalls, 1);
+        assert.strictEqual(submitted.v, 5);
+        assert.strictEqual(
+            new TextDecoder().decode(written),
+            'title: remote\nmiddle: base\nbody: local\n',
+        );
+        assert.strictEqual(server.content, 'title: remote\nmiddle: base\nbody: local\n');
+    });
+
     test('refreshes authoritative text when a collaborator OT races a Local Replica write', async () => {
         const uri = vscode.Uri.parse(
             'semantic-researcher-overleaf://www.overleaf.com/Project/main.tex' +
@@ -2170,7 +2264,7 @@ suite('Extension host and lifecycle isolation', () => {
         const vfs = Object.create(VirtualFileSystem.prototype) as VirtualFileSystem;
         const internals = vfs as any;
         attachAuthenticatedSession(internals);
-        const server = {content: 'title: remote\n', version: 41};
+        const server = {content: 'title: base\n', version: 40};
         let updateCount = 0;
         internals.disposed = false;
         internals.origin = uri.with({path: '/Project'});
@@ -2186,6 +2280,8 @@ suite('Extension host and lifecycle isolation', () => {
         internals.socket = {
             applyOtUpdate: async () => {
                 updateCount += 1;
+                server.content = 'title: remote\n';
+                server.version += 1;
                 throw new Error('timeout');
             },
             joinDoc: async () => ({
@@ -2223,6 +2319,7 @@ suite('Extension host and lifecycle isolation', () => {
         const internals = vfs as any;
         attachAuthenticatedSession(internals);
         let updateCount = 0;
+        let joinCount = 0;
         internals.disposed = false;
         internals.origin = uri.with({path: '/Project'});
         internals.projectName = 'Project';
@@ -2240,6 +2337,15 @@ suite('Extension host and lifecycle isolation', () => {
                 throw new Error('timeout');
             },
             joinDoc: async () => {
+                joinCount += 1;
+                if (joinCount===1) {
+                    return {
+                        docLines: ['title: base', ''],
+                        version: 45,
+                        updates: [],
+                        type: 'sharejs-text-ot',
+                    };
+                }
                 throw new Error('readback unavailable');
             },
         };
@@ -2309,7 +2415,7 @@ suite('Extension host and lifecycle isolation', () => {
             },
             joinDoc: async () => {
                 joinCount += 1;
-                if (joinCount===1) {
+                if (joinCount===2) {
                     throw new Error('readback unavailable');
                 }
                 return {
@@ -3654,7 +3760,7 @@ suite('Extension host and lifecycle isolation', () => {
             RemoteDocumentWriteAmbiguousError,
         );
 
-        assert.strictEqual(joinCount, 1);
+        assert.strictEqual(joinCount, 2);
         assert.strictEqual(document.remoteCache, 'title: base\n');
         assert.strictEqual(document.localCache, 'title: base\n');
         assert.strictEqual(internals.pendingDocumentWrites.has(document._id), false);
@@ -3682,6 +3788,7 @@ suite('Extension host and lifecycle isolation', () => {
         const attempts: any[] = [];
         const server = {content: 'base\n', version: 70};
         let reconnects = 0;
+        let joinCount = 0;
         internals.disposed = false;
         internals.origin = uri.with({path: '/Project'});
         internals.projectName = 'Project';
@@ -3722,7 +3829,16 @@ suite('Extension host and lifecycle isolation', () => {
                     v: appliedVersion,
                 });
             },
-            joinDoc: async () => assert.fail('A sender acknowledgement should avoid a snapshot read.'),
+            joinDoc: async (_docId: string, fromVersion?: number) => {
+                joinCount += 1;
+                assert.strictEqual(fromVersion, 70);
+                return {
+                    docLines: server.content.split('\n'),
+                    version: server.version,
+                    updates: [],
+                    type: 'sharejs-text-ot',
+                };
+            },
         };
 
         const written = await vfs.writeFileFromRemoteBaseline(
@@ -3737,6 +3853,7 @@ suite('Extension host and lifecycle isolation', () => {
         assert.strictEqual(attempts[0].dupIfSource, undefined);
         assert.deepStrictEqual(attempts[0].op, attempts[1].op);
         assert.strictEqual(document.remoteCache, desired);
+        assert.strictEqual(joinCount, 1);
         assert.strictEqual(internals.documentInDoubtSenderVersions.has(document._id), false);
     });
     test('confirms a duplicate OT rejection through authoritative readback', async () => {
@@ -3814,7 +3931,7 @@ suite('Extension host and lifecycle isolation', () => {
 
         assert.strictEqual(new TextDecoder().decode(written), desired);
         assert.strictEqual(attempts.length, 2);
-        assert.deepStrictEqual(joinVersions, [undefined]);
+        assert.deepStrictEqual(joinVersions, [80, undefined]);
         assert.strictEqual(document.version, server.version);
         assert.strictEqual(document.remoteCache, desired);
         assert.strictEqual(internals.pendingDocumentWrites.has(document._id), false);
@@ -3857,6 +3974,15 @@ suite('Extension host and lifecycle isolation', () => {
                         doc: document._id,
                         v: appliedVersion,
                     });
+                },
+                joinDoc: async (_docId: string, fromVersion?: number) => {
+                    assert.strictEqual(fromVersion, document.version);
+                    return {
+                        docLines: document.remoteCache.split('\n'),
+                        version: document.version,
+                        updates: [],
+                        type: 'sharejs-text-ot',
+                    };
                 },
             };
             return {vfs, internals, updates};

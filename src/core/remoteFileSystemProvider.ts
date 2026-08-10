@@ -1890,6 +1890,31 @@ export class VirtualFileSystem extends vscode.Disposable {
             throw new Error(`Remote document cache is not initialized for ${uri.toString()}`);
         }
 
+        // A subscribed cache is normally advanced by socket operations, but it
+        // is still only a local observation. Before constructing the outgoing
+        // OT operation, ask the authoritative document channel for the exact
+        // current revision. Preserve the pre-refresh local cache as a merge
+        // base: refreshDocumentFromServer intentionally updates both caches,
+        // and using its new remote value as the base would turn a missed
+        // collaborator edit into a silent local overwrite.
+        const localCacheBeforeRefresh = doc.localCache;
+        // The HTTP fallback cannot issue the socket joinDoc RPC. Its explicit
+        // write outcome is handled by the existing alternative-scheme branch
+        // below, so do not turn that supported fallback into a permanent
+        // offline failure merely to request an unavailable subscription.
+        if (!this.socket.isUsingAlternativeConnectionScheme) {
+            await this.refreshDocumentFromServer(uri, doc);
+        }
+        if (
+            doc.version===undefined
+            || doc.localCache===undefined
+            || doc.remoteCache===undefined
+        ) {
+            throw new RemoteDocumentWriteAmbiguousError(
+                `Could not obtain a current Overleaf revision for ${uri.path} before saving.`,
+            );
+        }
+
         const desiredText = decodeUtf8Text(content);
         if (desiredText===undefined) {
             throw new Error(`Remote document content is not mergeable UTF-8 for ${uri.toString()}`);
@@ -1901,47 +1926,29 @@ export class VirtualFileSystem extends vscode.Disposable {
         // remote text: after a rejoin `remoteCache` is the *new* server text,
         // and diffing it against itself would make the local text a silent
         // winner that deletes every collaborator edit made during the outage.
-        const mergeBaseline = remoteBaseline ?? this.preservedBaselineContent(doc);
-        if (mergeBaseline!==undefined) {
-            const baselineText = decodeUtf8Text(mergeBaseline);
-            if (baselineText===undefined) {
-                throw new Error(`Remote document baseline is not mergeable UTF-8 for ${uri.toString()}`);
-            }
-            if (doc.remoteCache===baselineText || doc.remoteCache===desiredText) {
-                mergeRes = desiredText;
-            } else {
-                const merged = mergeUtf8Text(
-                    mergeBaseline,
-                    content,
-                    new TextEncoder().encode(doc.remoteCache),
-                );
-                if (merged===undefined) {
-                    throw new RemoteDocumentMergeConflictError(
-                        `Overleaf changed ${uri.path} again before the rebased Local Replica write could be applied.`,
-                    );
-                }
-                mergeRes = new TextDecoder().decode(merged);
-            }
+        // Direct VFS writes use the subscribed cache from immediately before
+        // the pre-submit refresh as the equivalent merge base.
+        const mergeBaseline = remoteBaseline
+            ?? this.preservedBaselineContent(doc)
+            ?? new TextEncoder().encode(localCacheBeforeRefresh);
+        const baselineText = decodeUtf8Text(mergeBaseline);
+        if (baselineText===undefined) {
+            throw new Error(`Remote document baseline is not mergeable UTF-8 for ${uri.toString()}`);
+        }
+        if (doc.remoteCache===baselineText || doc.remoteCache===desiredText) {
+            mergeRes = desiredText;
         } else {
-            // Direct VFS writes do not carry a Local Replica manifest
-            // baseline. When a collaborator has advanced the subscribed cache,
-            // do an explicit three-way merge from the last local cache rather
-            // than letting diff-match-patch choose a fuzzy nearby match.
-            if (doc.localCache===doc.remoteCache) {
-                mergeRes = desiredText;
-            } else {
-                const merged = mergeUtf8Text(
-                    new TextEncoder().encode(doc.localCache),
-                    content,
-                    new TextEncoder().encode(doc.remoteCache),
+            const merged = mergeUtf8Text(
+                mergeBaseline,
+                content,
+                new TextEncoder().encode(doc.remoteCache),
+            );
+            if (merged===undefined) {
+                throw new RemoteDocumentMergeConflictError(
+                    `Overleaf changed ${uri.path} again before the rebased Local Replica write could be applied.`,
                 );
-                if (merged===undefined) {
-                    throw new RemoteDocumentMergeConflictError(
-                        `Overleaf changed ${uri.path} in an overlapping direct editor write.`,
-                    );
-                }
-                mergeRes = new TextDecoder().decode(merged);
             }
+            mergeRes = new TextDecoder().decode(merged);
         }
 
         let writtenContent = new TextEncoder().encode(mergeRes);
