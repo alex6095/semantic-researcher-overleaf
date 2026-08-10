@@ -5245,7 +5245,9 @@ suite('Select Project Folder Local Replica', function () {
             await vscode.workspace.fs.rename(localOld, localNew, {overwrite: false});
             await internals.syncToVFS(localOld, 'delete');
             await internals.syncToVFS(localNew, 'update');
-            await new Promise<void>(resolve => setTimeout(resolve, 400));
+            await waitUntil(() => (
+                internals.syncManifest.pendingOperations['/draft.pdf']!==undefined
+            ), 3_000);
             await internals.drainPendingSyncWork();
 
             const pendingMove = internals.syncManifest.pendingOperations['/draft.pdf'];
@@ -5294,22 +5296,25 @@ suite('Select Project Folder Local Replica', function () {
         await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
 
         const internals = scm as any;
-        const originalCapture = internals.captureMoveSourceRemoteStateOrDefer.bind(scm);
-        let captureEntered = false;
-        internals.captureMoveSourceRemoteStateOrDefer = async (...args: unknown[]) => {
-            captureEntered = true;
+        const originalExecute = internals.executePendingLocalFileMove.bind(scm);
+        let executeEntered = false;
+        internals.executePendingLocalFileMove = async (...args: unknown[]) => {
+            executeEntered = true;
             await new Promise<void>(resolve => setTimeout(resolve, 800));
-            return originalCapture(...args);
+            return originalExecute(...args);
         };
         try {
             await vscode.workspace.fs.rename(localOld, localNew, {overwrite: false});
             const sourceSync = internals.syncToVFS(localOld, 'delete');
             const destinationSync = internals.syncToVFS(localNew, 'update');
-            await waitUntil(() => captureEntered, 3_000);
+            await waitUntil(() => executeEntered, 3_000);
+            const persistedMove = internals.syncManifest.pendingOperations['/draft.png'];
+            assert.strictEqual(persistedMove.kind, 'move');
+            assert.strictEqual(persistedMove.version, 3);
+            assert.strictEqual(await pathExists(remoteOld), true);
             // This deliberately outlasts the 500ms delete-candidate timer.
-            // If the destination does not claim its matching source before
-            // waiting for remote proof, an ordinary delete journal overwrites
-            // the move and leaves a false conflict.
+            // The intent must already be on disk before remote execution
+            // waits, otherwise an ordinary delete can overwrite the move.
             await new Promise<void>(resolve => setTimeout(resolve, 650));
             await Promise.all([sourceSync, destinationSync]);
             await internals.drainPendingSyncWork();
@@ -5324,10 +5329,206 @@ suite('Select Project Folder Local Replica', function () {
             assert.strictEqual(internals.syncConflicts.get('/final.png'), undefined);
             assert.deepStrictEqual(internals.syncManifest.pendingOperations, {});
         } finally {
-            internals.captureMoveSourceRemoteStateOrDefer = originalCapture;
+            internals.executePendingLocalFileMove = originalExecute;
         }
     });
 
+    test('replays a prepared local move after restart creates its new destination parent', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-prepared-move-restart-remote-');
+        const localRoot = await tempDir('sr-overleaf-prepared-move-restart-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteOld = vscode.Uri.joinPath(remoteRoot, 'draft.png');
+        const remoteParent = vscode.Uri.joinPath(remoteRoot, 'generated');
+        const remoteNew = vscode.Uri.joinPath(remoteParent, 'draft.png');
+        const localOld = vscode.Uri.joinPath(localRoot, 'draft.png');
+        const localParent = vscode.Uri.joinPath(localRoot, 'generated');
+        const localNew = vscode.Uri.joinPath(localParent, 'draft.png');
+        const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x11, 0x22, 0x33]);
+        await writeBytes(remoteOld, png);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('', 'prepared-move-root');
+        fakeVfs.setEntityId('draft.png', 'prepared-move-original');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.createDirectory(localParent);
+        await vscode.workspace.fs.rename(localOld, localNew, {overwrite: false});
+        const internals = scm as any;
+        const record = await internals.journalPendingLocalFileMoveBeforeRemoteProof(
+            '/draft.png',
+            '/generated/draft.png',
+            internals.syncManifest.files['/draft.png'],
+        );
+        assert.strictEqual(record.kind, 'move');
+        assert.strictEqual(record.version, 4);
+        assert.strictEqual(record.phase, 'awaiting-destination-parent');
+        assert.strictEqual(await pathExists(remoteParent), false);
+
+        const manifestUri = vscode.Uri.joinPath(
+            localRoot, REPLICA_SETTINGS_DIR, 'sync-manifest.json',
+        );
+        const persisted = JSON.parse(await readText(manifestUri));
+        assert.strictEqual(persisted.pendingOperations['/draft.png'].version, 4);
+        await scm.deactivate();
+        const restartedScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        const restartedInternals = restartedScm as any;
+        const originalOverwrite = restartedInternals.overwrite.bind(restartedScm);
+        const originalExecute = restartedInternals.executePendingLocalFileMove.bind(restartedScm);
+        let pendingVersionAtOverwrite: number | undefined;
+        let moveOutcome: string | undefined;
+        restartedInternals.overwrite = async (...args: unknown[]) => {
+            pendingVersionAtOverwrite = restartedInternals.syncManifest
+                ?.pendingOperations['/draft.png']?.version;
+            return originalOverwrite(...args);
+        };
+        restartedInternals.executePendingLocalFileMove = async (...args: unknown[]) => {
+            moveOutcome = await originalExecute(...args);
+            return moveOutcome;
+        };
+        try {
+            assert.strictEqual(
+                await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+                true,
+            );
+        } finally {
+            restartedInternals.overwrite = originalOverwrite;
+            restartedInternals.executePendingLocalFileMove = originalExecute;
+        }
+        assert.strictEqual(pendingVersionAtOverwrite, 4);
+        assert.strictEqual(moveOutcome, 'accepted', restartedInternals.syncConflicts.get('/generated/draft.png'));
+
+        assert.strictEqual(await pathExists(remoteOld), false);
+        assert.strictEqual(await pathExists(remoteParent), true);
+        assert.deepStrictEqual(await readBytes(remoteNew), png);
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(remoteNew)).fileEntity._id,
+            'prepared-move-original',
+        );
+        assert.deepStrictEqual((restartedScm as any).syncManifest.pendingOperations, {});
+        assert.strictEqual((restartedScm as any).syncConflicts.get('/generated/draft.png'), undefined);
+    });
+
+    test('keeps a prepared local move conflicted when its Overleaf source advances before restart', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-prepared-move-conflict-remote-');
+        const localRoot = await tempDir('sr-overleaf-prepared-move-conflict-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteOld = vscode.Uri.joinPath(remoteRoot, 'draft.png');
+        const remoteNew = vscode.Uri.joinPath(remoteRoot, 'generated', 'draft.png');
+        const localOld = vscode.Uri.joinPath(localRoot, 'draft.png');
+        const localParent = vscode.Uri.joinPath(localRoot, 'generated');
+        const localNew = vscode.Uri.joinPath(localParent, 'draft.png');
+        const original = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0xaa]);
+        const collaborator = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0xbb]);
+        await writeBytes(remoteOld, original);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('', 'prepared-move-conflict-root');
+        fakeVfs.setEntityId('draft.png', 'prepared-move-conflict-original');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.createDirectory(localParent);
+        await vscode.workspace.fs.rename(localOld, localNew, {overwrite: false});
+        const internals = scm as any;
+        const record = await internals.journalPendingLocalFileMoveBeforeRemoteProof(
+            '/draft.png',
+            '/generated/draft.png',
+            internals.syncManifest.files['/draft.png'],
+        );
+        assert.strictEqual(record.version, 4);
+        await writeBytes(remoteOld, collaborator);
+        fakeVfs.setEntityId('draft.png', 'prepared-move-conflict-collaborator');
+
+        await scm.deactivate();
+        const restartedScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+
+        assert.deepStrictEqual(await readBytes(remoteOld), collaborator);
+        assert.strictEqual(await pathExists(remoteNew), false);
+        assert.deepStrictEqual(await readBytes(localNew), original);
+        assert.match(
+            (restartedScm as any).syncConflicts.get('/generated/draft.png'),
+            /prepared local move|Overleaf changed/i,
+        );
+        const pending = (restartedScm as any).syncManifest.pendingOperations['/draft.png'];
+        assert.strictEqual(pending.kind, 'move');
+        assert.strictEqual(pending.version, 4);
+    });
+
+    test('keeps a new-parent file move durable while guarded mkdir outlasts its source-delete hold', async function () {
+        this.timeout(20_000);
+        const remoteRoot = await tempDir('sr-overleaf-prepared-move-parent-remote-');
+        const localRoot = await tempDir('sr-overleaf-prepared-move-parent-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteOld = vscode.Uri.joinPath(remoteRoot, 'draft.png');
+        const remoteParent = vscode.Uri.joinPath(remoteRoot, 'generated');
+        const remoteNew = vscode.Uri.joinPath(remoteParent, 'draft.png');
+        const localOld = vscode.Uri.joinPath(localRoot, 'draft.png');
+        const localParent = vscode.Uri.joinPath(localRoot, 'generated');
+        const localNew = vscode.Uri.joinPath(localParent, 'draft.png');
+        const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x44, 0x55]);
+        await writeBytes(remoteOld, png);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('', 'prepared-move-parent-root');
+        fakeVfs.setEntityId('draft.png', 'prepared-move-parent-original');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.createDirectory(localParent);
+        const internals = scm as any;
+        const originalCreateDirectory = fakeVfs.createDirectoryIfMissing.bind(fakeVfs);
+        let releaseCreate: (() => void) | undefined;
+        let enterCreate: (() => void) | undefined;
+        const createEntered = new Promise<void>(resolve => { enterCreate = resolve; });
+        const createRelease = new Promise<void>(resolve => { releaseCreate = resolve; });
+        fakeVfs.createDirectoryIfMissing = async uri => {
+            if (uri.toString()===remoteParent.toString()) {
+                enterCreate?.();
+                await createRelease;
+            }
+            return originalCreateDirectory(uri);
+        };
+        try {
+            await vscode.workspace.fs.rename(localOld, localNew, {overwrite: false});
+            const sourceSync = internals.syncToVFS(localOld, 'delete');
+            const destinationSync = internals.syncToVFS(localNew, 'update');
+            await createEntered;
+
+            const prepared = internals.syncManifest.pendingOperations['/draft.png'];
+            assert.strictEqual(prepared.kind, 'move');
+            assert.strictEqual(prepared.version, 4);
+            assert.strictEqual(prepared.phase, 'awaiting-destination-parent');
+            await new Promise<void>(resolve => setTimeout(resolve, 650));
+            assert.strictEqual(await pathExists(remoteOld), true);
+            assert.strictEqual(await pathExists(remoteNew), false);
+            assert.strictEqual(
+                internals.syncManifest.pendingOperations['/draft.png'].version,
+                4,
+            );
+
+            releaseCreate?.();
+            await Promise.all([sourceSync, destinationSync]);
+            await internals.drainPendingSyncWork();
+
+            assert.strictEqual(await pathExists(remoteOld), false);
+            assert.strictEqual(await pathExists(remoteParent), true);
+            assert.deepStrictEqual(await readBytes(remoteNew), png);
+            assert.strictEqual(
+                (await fakeVfs._resolveUri(remoteNew)).fileEntity._id,
+                'prepared-move-parent-original',
+            );
+            assert.deepStrictEqual(internals.syncManifest.pendingOperations, {});
+            assert.strictEqual(internals.syncConflicts.get('/generated/draft.png'), undefined);
+        } finally {
+            releaseCreate?.();
+            fakeVfs.createDirectoryIfMissing = originalCreateDirectory;
+        }
+    });
     test('replays a journaled local move after its remote mutation is deferred', async () => {
         const remoteRoot = await tempDir('sr-overleaf-local-move-replay-remote-');
         const localRoot = await tempDir('sr-overleaf-local-move-replay-local-');
@@ -5515,7 +5716,7 @@ suite('Select Project Folder Local Replica', function () {
         );
         const interruptedManifest = JSON.parse(await readText(manifestUri));
         const pending = interruptedManifest.pendingOperations['/main.tex'];
-        assert.strictEqual(interruptedManifest.version, 15);
+        assert.strictEqual(interruptedManifest.version, 16);
         assert.strictEqual(pending.kind, 'update');
         assert.strictEqual(pending.localKind, 'file');
         assert.strictEqual(pending.localRevision, sha1('offline local update'));
@@ -5637,7 +5838,65 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), false);
     });
 
-    test('migrates a version 2 manifest to the version 15 guarded-move schema', async () => {
+    test('rejects malformed guarded file-move journal proofs', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-move-journal-schema-remote-');
+        const localRoot = await tempDir('sr-overleaf-move-journal-schema-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const scm = createSCM(remoteRoot, localRoot);
+        const now = '2026-08-11T00:00:00.000Z';
+        const prepared = {
+            version: 4,
+            id: 'a'.repeat(32),
+            kind: 'move',
+            localKind: 'file',
+            localRevision: sha1('local bytes'),
+            destinationRelPath: '/generated/main.tex',
+            sourceEntity: {id: 'doc-main', type: 'doc'},
+            sourceLocalIdentity: {dev: '1', ino: '2'},
+            sourceParentEntity: {id: 'folder-root', type: 'folder'},
+            sourceRemoteKind: 'file',
+            sourceRemoteRevision: sha1('accepted remote bytes'),
+            phase: 'awaiting-destination-parent',
+            createdAt: now,
+            updatedAt: now,
+        };
+        const isValid = (entry: unknown) => (
+            scm as any
+        ).isValidSyncManifestPendingMoveOperation(entry);
+
+        assert.strictEqual(isValid(prepared), true);
+        assert.strictEqual(isValid({
+            ...prepared,
+            sourceRemoteRevision: 'directory:' + sha1('not a file proof'),
+        }), false);
+        assert.strictEqual(isValid({...prepared, phase: undefined}), false);
+
+        const guarded = {
+            ...prepared,
+            version: 3,
+            destinationParentEntity: {id: 'folder-generated', type: 'folder'},
+            phase: undefined,
+        };
+        assert.strictEqual(isValid(guarded), true);
+        assert.strictEqual(isValid({
+            ...guarded,
+            phase: 'awaiting-destination-parent',
+        }), false);
+
+        const legacy = {
+            ...guarded,
+            version: 2,
+            sourceParentEntity: undefined,
+            destinationParentEntity: undefined,
+        };
+        assert.strictEqual(isValid(legacy), true);
+        assert.strictEqual(isValid({
+            ...legacy,
+            phase: 'awaiting-destination-parent',
+        }), false);
+    });
+
+    test('migrates a version 2 manifest to the version 16 guarded-move schema', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-v3-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-v3-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -5661,7 +5920,7 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 15);
+        assert.strictEqual(migratedManifest.version, 16);
         assert.deepStrictEqual(migratedManifest.pendingOperations, {});
         assert.deepStrictEqual(migratedManifest.textMergeResolutions, {});
         assert.deepStrictEqual(migratedManifest.textMergeResolutionHistory, []);
@@ -5692,7 +5951,7 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 15);
+        assert.strictEqual(migratedManifest.version, 16);
         assert.deepStrictEqual(migratedManifest.folderConflictResolutions, {});
         assert.deepStrictEqual(migratedManifest.folderConflictResolutionHistory, []);
         assert.deepStrictEqual(migratedManifest.textMergeResolutions, {});
@@ -5700,7 +5959,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.ok(migratedManifest.files['/main.tex']);
     });
 
-    test('records remote entity, parent, and stable local inode identities in manifest v15', async () => {
+    test('records remote entity, parent, and stable local inode identities in manifest v16', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-identity-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-identity-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -5719,7 +5978,7 @@ suite('Select Project Folder Local Replica', function () {
             REPLICA_SETTINGS_DIR,
             'sync-manifest.json',
         )));
-        assert.strictEqual(manifest.version, 15);
+        assert.strictEqual(manifest.version, 16);
         assert.deepStrictEqual(manifest.files['/main.tex'].remoteEntity, {id: 'doc-main', type: 'doc'});
         assert.deepStrictEqual(manifest.files['/figure.png'].remoteEntity, {id: 'file-figure', type: 'file'});
         const rootParentId = (await fakeVfs._resolveUri(
