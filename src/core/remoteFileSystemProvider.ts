@@ -71,6 +71,13 @@ export interface RemoteDirectoryCreateResult {
     parentId: string;
 }
 
+export interface ExpectedRemoteEntity {
+    id: string;
+    type: FileType;
+    // Checked immediately before the ID-scoped tree mutation when known.
+    parentId?: string;
+}
+
 export interface ProjectEntity {
     _id: string,
     name: string,
@@ -2332,8 +2339,27 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    async remove(uri: vscode.Uri, recursive: boolean) {
+    async remove(
+        uri: vscode.Uri,
+        recursive: boolean,
+        expectedEntity?: ExpectedRemoteEntity,
+    ) {
         const {parentFolder, fileType, fileEntity} = await this._resolveUri(uri);
+        if (
+            expectedEntity!==undefined
+            && (
+                fileType!==expectedEntity.type
+                || fileEntity?._id!==expectedEntity.id
+                || (
+                    expectedEntity.parentId!==undefined
+                    && parentFolder._id!==expectedEntity.parentId
+                )
+            )
+        ) {
+            throw vscode.FileSystemError.Unavailable(
+                'Overleaf delete source or parent no longer matches the recorded entity.',
+            );
+        }
         if (fileType && fileEntity) {
             const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
             const res = await this.api.deleteEntity(identity, this.projectId, fileType, fileEntity._id);
@@ -2383,7 +2409,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         oldUri: vscode.Uri,
         newUri: vscode.Uri,
         force: boolean,
-        expectedEntity?: {id: string; type: 'doc' | 'file'},
+        expectedEntity?: ExpectedRemoteEntity,
     ) {
         const oldPath = await this._resolveUri(oldUri);
         const newPath = await this._resolveUri(newUri);
@@ -2392,10 +2418,14 @@ export class VirtualFileSystem extends vscode.Disposable {
             && (
                 oldPath.fileType!==expectedEntity.type
                 || oldPath.fileEntity?._id!==expectedEntity.id
+                || (
+                    expectedEntity.parentId!==undefined
+                    && oldPath.parentFolder._id!==expectedEntity.parentId
+                )
             )
         ) {
             throw vscode.FileSystemError.Unavailable(
-                'Overleaf move source no longer matches the recorded entity.',
+                'Overleaf move source or parent no longer matches the recorded entity.',
             );
         }
 

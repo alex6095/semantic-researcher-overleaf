@@ -183,7 +183,7 @@ interface SyncManifestConflictEntry {
 }
 
 interface SyncManifest {
-    version: 6;
+    version: 7;
     projectUri: string;
     baselineComplete: boolean;
     files: Record<string, SyncManifestEntry>;
@@ -254,9 +254,30 @@ interface SyncManifestPendingDirectoryCreateOperation {
     updatedAt: string;
 }
 
+// A local folder deletion has no bytes left to journal. Its durable proof is
+// the exact remote tree revision and the target/parent folder identities that
+// existed before the remote stage mutation. The deterministic stage fields link
+// this manifest intent to the crash-recovery journal kept beside it.
+interface SyncManifestPendingDirectoryDeleteOperation {
+    version: 1;
+    id: string;
+    kind: 'rmdir';
+    localKind: 'missing';
+    localRevision: typeof DELETE_DIGEST;
+    remoteKind: 'directory';
+    remoteRevision: string;
+    targetEntity: SyncManifestRemoteFolderIdentity;
+    parentEntity: SyncManifestRemoteFolderIdentity;
+    stageOperationId: string;
+    stagingRelPath: string;
+    createdAt: string;
+    updatedAt: string;
+}
+
 type SyncManifestPendingOperation = SyncManifestPendingFileOperation
     | SyncManifestPendingMoveOperation
-    | SyncManifestPendingDirectoryCreateOperation;
+    | SyncManifestPendingDirectoryCreateOperation
+    | SyncManifestPendingDirectoryDeleteOperation;
 
 type PendingLocalMoveDelete = {
     timer: ReturnType<typeof setTimeout>;
@@ -285,6 +306,12 @@ interface LocalReplicaOperationRecord {
     createdAt: string;
 }
 
+interface RemoteFolderDeleteGuard {
+    entity: SyncManifestRemoteFolderIdentity;
+    parent: SyncManifestRemoteFolderIdentity;
+    pendingOperationId: string;
+}
+
 interface RemoteDeleteOperationRecord {
     version: 1;
     id: string;
@@ -294,6 +321,9 @@ interface RemoteDeleteOperationRecord {
     expectedRevision: string;
     replacementRevision?: string;
     supersededByRevision?: string;
+    // Present only for a guarded recursive folder deletion. It lets crash
+    // recovery distinguish the original folder from a same-name replacement.
+    folderGuard?: RemoteFolderDeleteGuard;
     createdAt: string;
 }
 
@@ -2431,6 +2461,31 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             );
     }
 
+    private isValidRemoteFolderDeleteGuard(
+        value: unknown,
+    ): value is RemoteFolderDeleteGuard {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const guard = value as Partial<RemoteFolderDeleteGuard>;
+        return this.isValidSyncManifestFolderIdentity(guard.entity)
+            && this.isValidSyncManifestFolderIdentity(guard.parent)
+            && typeof guard.pendingOperationId==='string'
+            && /^[a-f0-9]{32}$/.test(guard.pendingOperationId);
+    }
+
+    private remoteFolderDeleteGuardsMatch(
+        left: RemoteFolderDeleteGuard | undefined,
+        right: RemoteFolderDeleteGuard | undefined,
+    ): boolean {
+        if (left===undefined || right===undefined) {
+            return left===right;
+        }
+        return this.remoteFolderIdentityMatches(left.entity, right.entity)
+            && this.remoteFolderIdentityMatches(left.parent, right.parent)
+            && left.pendingOperationId===right.pendingOperationId;
+    }
+
     private isValidRemoteDeleteOperationRecord(
         value: unknown,
     ): value is RemoteDeleteOperationRecord {
@@ -2442,6 +2497,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const expectedStageName = kind==='replace'
             ? `.sr-overleaf-replace-${record.id}`
             : `.sr-overleaf-delete-${record.id}`;
+        const validFolderGuard = record.folderGuard===undefined
+            || (
+                kind==='delete'
+                && this.isValidRemoteFolderDeleteGuard(record.folderGuard)
+            );
         return record.version===1
             && (kind==='delete' || kind==='replace')
             && typeof record.id==='string'
@@ -2464,6 +2524,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             || this.isValidRecordedPathRevision(record.supersededByRevision)
                         )
             )
+            && validFolderGuard
             && typeof record.createdAt==='string'
             && Number.isFinite(Date.parse(record.createdAt));
     }
@@ -2482,6 +2543,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 && (existing.kind ?? 'delete')===(record.kind ?? 'delete')
                 && existing.replacementRevision===record.replacementRevision
                 && existing.supersededByRevision===record.supersededByRevision
+                && this.remoteFolderDeleteGuardsMatch(existing.folderGuard, record.folderGuard)
             ) {
                 return;
             }
@@ -3460,7 +3522,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private emptySyncManifest(baselineComplete = true): SyncManifest {
         return {
-            version: 6,
+            version: 7,
             projectUri: stringifyOverleafUri(this.vfs.origin),
             baselineComplete,
             files: {},
@@ -3702,6 +3764,37 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && Number.isFinite(Date.parse(entry.updatedAt));
     }
 
+    private isValidSyncManifestPendingDirectoryDeleteOperation(
+        value: unknown,
+    ): value is SyncManifestPendingDirectoryDeleteOperation {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const entry = value as Partial<SyncManifestPendingDirectoryDeleteOperation>;
+        const validStage = typeof entry.stageOperationId==='string'
+            && /^[a-f0-9]{24}$/.test(entry.stageOperationId)
+            && typeof entry.stagingRelPath==='string'
+            && this.isCanonicalReplicaRelPath(entry.stagingRelPath)
+            && nodePath.posix.basename(entry.stagingRelPath)
+                ==='.sr-overleaf-delete-' + entry.stageOperationId;
+        return entry.version===1
+            && typeof entry.id==='string'
+            && /^[a-f0-9]{32}$/.test(entry.id)
+            && entry.kind==='rmdir'
+            && entry.localKind==='missing'
+            && entry.localRevision===DELETE_DIGEST
+            && entry.remoteKind==='directory'
+            && typeof entry.remoteRevision==='string'
+            && /^directory:[a-f0-9]{40}$/.test(entry.remoteRevision)
+            && this.isValidSyncManifestFolderIdentity(entry.targetEntity)
+            && this.isValidSyncManifestFolderIdentity(entry.parentEntity)
+            && validStage
+            && typeof entry.createdAt==='string'
+            && Number.isFinite(Date.parse(entry.createdAt))
+            && typeof entry.updatedAt==='string'
+            && Number.isFinite(Date.parse(entry.updatedAt));
+    }
+
     private isValidSyncManifestPendingOperation(
         value: unknown,
     ): value is SyncManifestPendingOperation {
@@ -3717,6 +3810,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         if (kind==='mkdir') {
             return this.isValidSyncManifestPendingDirectoryCreateOperation(value);
+        }
+        if (kind==='rmdir') {
+            return this.isValidSyncManifestPendingDirectoryDeleteOperation(value);
         }
         return this.isValidSyncManifestPendingFileOperation(value);
     }
@@ -3792,7 +3888,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } catch {
                 sameProject = false;
             }
-            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6)
+            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7)
                 && sameProject
                 && (manifest.baselineComplete===undefined || typeof manifest.baselineComplete==='boolean')
                 && this.isValidSyncManifestRecord<SyncManifestEntry>(
@@ -3832,7 +3928,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (validShape) {
                 this.requireSyncSession(generation);
                 this.syncManifest = {
-                    version: 6,
+                    version: 7,
                     projectUri,
                     baselineComplete: manifest.baselineComplete!==false,
                     files: manifest.files!,
@@ -3840,7 +3936,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         ? manifest.directories
                         : {},
                     conflicts: manifest.conflicts ?? {},
-                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6
+                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7
                         ? manifest.pendingOperations!
                         : {},
                 };
@@ -3868,7 +3964,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     ? 'unavailable'
                     : 'trusted';
                 this.syncManifestRevision += 1;
-                this.syncManifestDirty = manifest.version!==6
+                this.syncManifestDirty = manifest.version!==7
                     || manifest.directories===undefined
                     || manifest.conflicts===undefined
                     || manifest.baselineComplete===undefined
@@ -4103,13 +4199,31 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         );
     }
 
-    private remoteDeleteOperationId(relPath: string, expectedRevision: string): string {
-        return contentDigest(Buffer.from(`${relPath}\0${expectedRevision}`)).slice(0, 24);
+    private remoteDeleteOperationId(
+        relPath: string,
+        expectedRevision: string,
+        expectedFolderId?: string,
+    ): string {
+        // Keep the v0.16.1 file-delete seed byte-for-byte stable. Existing
+        // crash journals name their remote stage from it, so adding folder
+        // identity must be a distinct seed rather than an empty third field.
+        const seed = expectedFolderId===undefined
+            ? `${relPath}\0${expectedRevision}`
+            : `${relPath}\0${expectedRevision}\0${expectedFolderId}`;
+        return contentDigest(Buffer.from(seed)).slice(0, 24);
     }
 
-    private remoteDeleteStagingPath(relPath: string, expectedRevision: string): string {
+    private remoteDeleteStagingPath(
+        relPath: string,
+        expectedRevision: string,
+        expectedFolderId?: string,
+    ): string {
         const parentPath = nodePath.posix.dirname(relPath);
-        const operationId = this.remoteDeleteOperationId(relPath, expectedRevision);
+        const operationId = this.remoteDeleteOperationId(
+            relPath,
+            expectedRevision,
+            expectedFolderId,
+        );
         const stageName = `.sr-overleaf-delete-${operationId}`;
         return parentPath==='/' ? `/${stageName}` : `${parentPath}/${stageName}`;
     }
@@ -4231,6 +4345,335 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             );
             return false;
         }
+    }
+
+    private async assertRemoteFolderDeletePath(
+        uri: vscode.Uri,
+        relPath: string,
+        expectedRevision: string,
+        expectedEntity: SyncManifestRemoteFolderIdentity,
+        expectedParent: SyncManifestRemoteFolderIdentity,
+        label: string,
+        generation = this.syncGeneration,
+    ): Promise<PathRevision> {
+        const state = await this.captureRemoteUriRevision(uri, relPath, generation);
+        this.requireSyncSession(generation);
+        if (state.kind==='missing') {
+            return state;
+        }
+        if (state.kind!=='directory' || state.revision!==expectedRevision) {
+            throw new ConcurrentReplicaChangeError(
+                `Overleaf ${label} no longer has the expected folder tree revision`,
+            );
+        }
+        const identity = await this.resolveRemoteFolderPathIdentity(uri);
+        this.requireSyncSession(generation);
+        if (!this.remoteFolderPathIdentityMatches(
+            identity,
+            expectedEntity,
+            expectedParent,
+        )) {
+            throw new ConcurrentReplicaChangeError(
+                `Overleaf ${label} no longer has the expected folder identity`,
+            );
+        }
+        return state;
+    }
+
+    private async verifyRemoteFolderDeletePostcondition(
+        relPath: string,
+        record: SyncManifestPendingDirectoryDeleteOperation,
+        generation = this.syncGeneration,
+    ): Promise<boolean> {
+        await this.refreshRemoteStateForReconciliation(
+            relPath,
+            generation,
+            'verify guarded remote folder delete',
+        );
+        const [target, staging] = await Promise.all([
+            this.captureRemotePathRevision(relPath, generation),
+            this.captureRemoteUriRevision(
+                this.vfs.pathToUri(record.stagingRelPath),
+                record.stagingRelPath,
+                generation,
+            ),
+        ]);
+        this.requireSyncSession(generation);
+        return target.kind==='missing'
+            && staging.kind==='missing'
+            && this.vfs._resolveById(record.targetEntity.id)===undefined;
+    }
+
+    private async restoreRemoteFolderDeleteStage(
+        relPath: string,
+        record: SyncManifestPendingDirectoryDeleteOperation,
+        generation = this.syncGeneration,
+    ): Promise<boolean> {
+        const targetUri = this.vfs.pathToUri(relPath);
+        const stagingUri = this.vfs.pathToUri(record.stagingRelPath);
+        const target = await this.captureRemotePathRevision(relPath, generation);
+        if (target.kind!=='missing') {
+            return false;
+        }
+        const staging = await this.assertRemoteFolderDeletePath(
+            stagingUri,
+            record.stagingRelPath,
+            record.remoteRevision,
+            record.targetEntity,
+            record.parentEntity,
+            'folder delete recovery stage',
+            generation,
+        );
+        if (staging.kind==='missing') {
+            return false;
+        }
+        try {
+            await this.runSessionIO(
+                generation,
+                () => this.vfs.rename(
+                    stagingUri,
+                    targetUri,
+                    false,
+                    {
+                        id: record.targetEntity.id,
+                        type: 'folder',
+                        parentId: record.parentEntity.id,
+                    },
+                ),
+            );
+        } catch (error) {
+            await this.refreshRemoteStateForReconciliation(
+                relPath,
+                generation,
+                'reconcile guarded remote folder stage restore',
+            );
+            const restored = await this.assertRemoteFolderDeletePath(
+                targetUri,
+                relPath,
+                record.remoteRevision,
+                record.targetEntity,
+                record.parentEntity,
+                'restored folder delete target',
+                generation,
+            );
+            if (restored.kind!=='missing') {
+                return true;
+            }
+            throw error;
+        }
+        await this.refreshRemoteStateForReconciliation(
+            relPath,
+            generation,
+            'verify guarded remote folder stage restore',
+        );
+        const restored = await this.assertRemoteFolderDeletePath(
+            targetUri,
+            relPath,
+            record.remoteRevision,
+            record.targetEntity,
+            record.parentEntity,
+            'restored folder delete target',
+            generation,
+        );
+        return restored.kind!=='missing';
+    }
+
+    // This deliberately does not reuse the generic file delete helper. Folder
+    // names and recursive digests are not identities: a collaborator can
+    // recreate the same tree under the same name with a different folder ID.
+    // Every reversible stage and the final DELETE therefore carry and verify
+    // the exact folder/parent identity recorded in the durable rmdir journal.
+    private async atomicDeleteRemoteFolderIfIdentity(
+        relPath: string,
+        record: SyncManifestPendingDirectoryDeleteOperation,
+        generation = this.syncGeneration,
+        confirmLocalStillAbsent?: () => Promise<boolean>,
+    ): Promise<boolean> {
+        this.requireSyncSession(generation);
+        const targetUri = this.vfs.pathToUri(relPath);
+        const stagingUri = this.vfs.pathToUri(record.stagingRelPath);
+        const guard: RemoteFolderDeleteGuard = {
+            entity: {...record.targetEntity},
+            parent: {...record.parentEntity},
+            pendingOperationId: record.id,
+        };
+        const inspectTarget = () => this.assertRemoteFolderDeletePath(
+            targetUri,
+            relPath,
+            record.remoteRevision,
+            record.targetEntity,
+            record.parentEntity,
+            'folder delete target',
+            generation,
+        );
+        const inspectStage = () => this.assertRemoteFolderDeletePath(
+            stagingUri,
+            record.stagingRelPath,
+            record.remoteRevision,
+            record.targetEntity,
+            record.parentEntity,
+            'folder delete stage',
+            generation,
+        );
+        let [target, staged] = await Promise.all([inspectTarget(), inspectStage()]);
+        this.requireSyncSession(generation);
+
+        if (target.kind==='missing' && staged.kind==='missing') {
+            if (await this.verifyRemoteFolderDeletePostcondition(relPath, record, generation)) {
+                await this.removeRemoteDeleteOperationRecord(record.stageOperationId);
+                return true;
+            }
+            throw new ConcurrentReplicaChangeError(
+                'Overleaf moved or recreated the folder while its local delete was pending',
+            );
+        }
+
+        await this.createRemoteDeleteOperationRecord({
+            version: 1,
+            id: record.stageOperationId,
+            relPath,
+            stagingRelPath: record.stagingRelPath,
+            expectedRevision: record.remoteRevision,
+            folderGuard: guard,
+            createdAt: new Date().toISOString(),
+        });
+
+        if (staged.kind!=='missing') {
+            if (target.kind!=='missing') {
+                // Never discard the old staged entity merely because another
+                // actor now occupies the original name. Both copies remain
+                // recoverable and the caller raises a conflict.
+                throw new ConcurrentReplicaChangeError(
+                    'Overleaf recreated the folder while its prior entity was staged for delete',
+                );
+            }
+        } else {
+            if (target.kind==='missing') {
+                throw new ConcurrentReplicaChangeError(
+                    'Overleaf folder disappeared before it could be staged for delete',
+                );
+            }
+            try {
+                await this.runSessionIO(
+                    generation,
+                    () => this.vfs.rename(
+                        targetUri,
+                        stagingUri,
+                        false,
+                        {
+                            id: record.targetEntity.id,
+                            type: 'folder',
+                            parentId: record.parentEntity.id,
+                        },
+                    ),
+                );
+            } catch (error) {
+                await this.refreshRemoteStateForReconciliation(
+                    relPath,
+                    generation,
+                    'reconcile ambiguous guarded remote folder stage',
+                );
+                [target, staged] = await Promise.all([inspectTarget(), inspectStage()]);
+                this.requireSyncSession(generation);
+                if (!(target.kind==='missing' && staged.kind==='directory')) {
+                    throw error;
+                }
+                // The rename POST may have succeeded even though its response
+                // was lost; the exact ID at the stage is the only acceptance
+                // proof, not a same-name/digest observation.
+            }
+        }
+
+        [target, staged] = await Promise.all([inspectTarget(), inspectStage()]);
+        this.requireSyncSession(generation);
+        if (staged.kind==='missing') {
+            if (target.kind==='missing'
+                && await this.verifyRemoteFolderDeletePostcondition(relPath, record, generation)
+            ) {
+                await this.removeRemoteDeleteOperationRecord(record.stageOperationId);
+                return true;
+            }
+            throw new ConcurrentReplicaChangeError(
+                'The guarded Overleaf folder stage disappeared before final deletion',
+            );
+        }
+        if (target.kind!=='missing') {
+            throw new ConcurrentReplicaChangeError(
+                'Overleaf recreated the folder before its staged entity could be deleted',
+            );
+        }
+
+        if (
+            confirmLocalStillAbsent!==undefined
+            && !await confirmLocalStillAbsent()
+        ) {
+            const restored = await this.restoreRemoteFolderDeleteStage(
+                relPath,
+                record,
+                generation,
+            );
+            if (restored) {
+                await this.removeRemoteDeleteOperationRecord(record.stageOperationId);
+            }
+            throw new LocalReadUnstableError(
+                relPath,
+                'vanished-during-update',
+                'Local Replica folder delete was cancelled because the local tree or a child intent reappeared: ' +
+                    relPath,
+            );
+        }
+
+        // The last read and local-intent check were asynchronous. Re-prove both
+        // remote paths immediately before the irreversible ID-scoped DELETE.
+        [target, staged] = await Promise.all([inspectTarget(), inspectStage()]);
+        this.requireSyncSession(generation);
+        if (target.kind!=='missing' || staged.kind==='missing') {
+            throw new ConcurrentReplicaChangeError(
+                'Overleaf changed the guarded folder delete paths immediately before final deletion',
+            );
+        }
+
+        try {
+            await this.runSessionIO(
+                generation,
+                () => this.vfs.remove(
+                    stagingUri,
+                    true,
+                    {
+                        id: record.targetEntity.id,
+                        type: 'folder',
+                        parentId: record.parentEntity.id,
+                    },
+                ),
+            );
+        } catch (error) {
+            if (await this.verifyRemoteFolderDeletePostcondition(relPath, record, generation)) {
+                await this.removeRemoteDeleteOperationRecord(record.stageOperationId);
+                return true;
+            }
+            try {
+                const restored = await this.restoreRemoteFolderDeleteStage(
+                    relPath,
+                    record,
+                    generation,
+                );
+                if (restored) {
+                    await this.removeRemoteDeleteOperationRecord(record.stageOperationId);
+                }
+            } catch {
+                // The external journal deliberately remains when restoration
+                // itself cannot be proven; restart recovery will inspect it.
+            }
+            throw error;
+        }
+
+        if (!await this.verifyRemoteFolderDeletePostcondition(relPath, record, generation)) {
+            throw new ConcurrentReplicaChangeError(
+                'Overleaf did not prove the guarded folder entity was deleted',
+            );
+        }
+        await this.removeRemoteDeleteOperationRecord(record.stageOperationId);
+        return true;
     }
 
     // `confirmLocalStillAbsent` is consulted at the one moment that matters: after
@@ -5058,6 +5501,64 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     );
                     getOutputChannel().appendLine(
                         `${new Date().toISOString()} [remote replacement recovery blocked] ` +
+                        `${record.relPath}: ${formatUnknownError(error)}`,
+                    );
+                }
+                continue;
+            }
+            if (record.folderGuard!==undefined) {
+                try {
+                    const pending = this.syncManifest?.pendingOperations[record.relPath];
+                    if (
+                        !pending
+                        || pending.kind!=='rmdir'
+                        || pending.id!==record.folderGuard.pendingOperationId
+                        || pending.stageOperationId!==record.id
+                        || pending.stagingRelPath!==record.stagingRelPath
+                        || !this.remoteFolderIdentityMatches(
+                            pending.targetEntity,
+                            record.folderGuard.entity,
+                        )
+                        || !this.remoteFolderIdentityMatches(
+                            pending.parentEntity,
+                            record.folderGuard.parent,
+                        )
+                    ) {
+                        throw new ConcurrentReplicaChangeError(
+                            'The durable folder-delete journals no longer describe the same entity.',
+                        );
+                    }
+                    await this.atomicDeleteRemoteFolderIfIdentity(
+                        record.relPath,
+                        pending,
+                        generation,
+                        async () => {
+                            const localState = await this.captureLocalPathRevision(
+                                record.relPath,
+                                generation,
+                            );
+                            return localState.kind==='missing'
+                                && this.pendingOperationAtOrBelow(
+                                    record.relPath,
+                                    pending.id,
+                                )===undefined;
+                        },
+                    );
+                } catch (error) {
+                    const localState = await this.captureLocalPathRevision(
+                        record.relPath,
+                        generation,
+                    );
+                    await this.markSyncConflict(
+                        record.relPath,
+                        `An interrupted guarded folder delete could not be resumed safely: ${formatUnknownError(error)}`,
+                        localState.kind==='missing'
+                            ? null
+                            : (localState.kind==='file' ? localState.content : undefined),
+                        generation,
+                    );
+                    getOutputChannel().appendLine(
+                        `${new Date().toISOString()} [guarded folder delete recovery blocked] ` +
                         `${record.relPath}: ${formatUnknownError(error)}`,
                     );
                 }
@@ -6480,7 +6981,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (changed) {
             this.markSyncManifestDirty();
         }
-        this.completeUnavailableBaselineIfResolved();
+        this.completeTrustedBaselineIfResolved();
         if (
             this.syncConflicts.size===0
             && this.status.status==='need-attention'
@@ -6490,9 +6991,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
-    private completeUnavailableBaselineIfResolved() {
+    // A freshly created replica becomes a trusted baseline only after the
+    // authoritative initial pull has completed without conflicts or failed
+    // reads. The same gate repairs an unavailable baseline after its conflicts
+    // are resolved; neither state is safe for destructive local intent first.
+    private completeTrustedBaselineIfResolved() {
         if (
-            this.syncManifestBaselineMode!=='unavailable'
+            this.syncManifestBaselineMode==='trusted'
+            || (
+                this.syncManifestBaselineMode==='fresh-replica'
+                && this.initialPullStatus!=='complete'
+            )
             || this.syncConflicts.size!==0
             || this.failedInitialPulls.size!==0
             || !this.syncManifest
@@ -6901,7 +7410,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 }
             }
         }
-        this.completeUnavailableBaselineIfResolved();
+        this.completeTrustedBaselineIfResolved();
     }
 
     private isPathAtOrBelow(relPath: string, parentPath: string): boolean {
@@ -6918,10 +7427,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
      * destinations matter too: deleting a folder that a move is entering
      * would otherwise erase the move's verified destination precondition.
      */
-    private pendingOperationAtOrBelow(relPath: string): string | undefined {
+    private pendingOperationAtOrBelow(
+        relPath: string,
+        ignoreOperationId?: string,
+    ): string | undefined {
         for (const [sourceRelPath, operation] of Object.entries(
             this.syncManifest?.pendingOperations ?? {},
         )) {
+            if (operation.id===ignoreOperationId) { continue; }
             if (this.isPathAtOrBelow(sourceRelPath, relPath)) {
                 return operation.kind==='move'
                     ? `${sourceRelPath} -> ${operation.destinationRelPath} (${operation.kind})`
@@ -9044,6 +9557,263 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return true;
     }
 
+    // The manifest already contains each tracked child's verified digest, so
+    // reconstruct the same recursive revision used by captureRemotePathRevision
+    // without doing network I/O. This is what makes a proven offline rmdir
+    // intent durable rather than a timestamp-based guess.
+    private manifestDirectoryRevision(relPath: string): string | undefined {
+        const manifest = this.syncManifest;
+        if (
+            !manifest
+            || !manifest.baselineComplete
+            || this.syncManifestBaselineMode!=='trusted'
+            || this.failedInitialPulls.size>0
+        ) {
+            return undefined;
+        }
+        const visiting = new Set<string>();
+        const visit = (directoryPath: string): string | undefined => {
+            if (!manifest.directories[directoryPath] || visiting.has(directoryPath)) {
+                return undefined;
+            }
+            visiting.add(directoryPath);
+            const children = new Map<string, {kind: 'file' | 'directory'; revision: string}>();
+            for (const [path, entry] of Object.entries(manifest.files)) {
+                if (nodePath.posix.dirname(path)!==directoryPath) { continue; }
+                const name = nodePath.posix.basename(path);
+                if (children.has(name)) {
+                    visiting.delete(directoryPath);
+                    return undefined;
+                }
+                children.set(name, {kind: 'file', revision: entry.localDigest});
+            }
+            for (const path of Object.keys(manifest.directories)) {
+                if (nodePath.posix.dirname(path)!==directoryPath) { continue; }
+                const name = nodePath.posix.basename(path);
+                if (children.has(name)) {
+                    visiting.delete(directoryPath);
+                    return undefined;
+                }
+                const revision = visit(path);
+                if (!revision) {
+                    visiting.delete(directoryPath);
+                    return undefined;
+                }
+                children.set(name, {kind: 'directory', revision});
+            }
+            visiting.delete(directoryPath);
+            const entries = [...children.entries()]
+                .sort(([left], [right]) => left.localeCompare(right))
+                .map(([name, child]) => `${name}\0${child.kind}\0${child.revision}`);
+            return 'directory:' + contentDigest(Buffer.from(entries.join('\n')));
+        };
+        return visit(relPath);
+    }
+
+    // Persist a recursive local delete before observing or mutating Overleaf.
+    // Unlike a file, the deleted directory has no bytes left locally; only the
+    // last trusted manifest tree and exact remote folder identities can prove
+    // which entity the user intended to remove after reconnect.
+    private async journalPendingLocalDirectoryDelete(
+        relPath: string,
+        generation = this.syncGeneration,
+    ): Promise<SyncManifestPendingDirectoryDeleteOperation> {
+        this.requireSyncSession(generation);
+        const manifest = this.syncManifest;
+        if (!manifest) {
+            throw new Error('Local Replica rmdir journal requires an active manifest.');
+        }
+        const entry = manifest.directories[relPath];
+        const remoteRevision = this.manifestDirectoryRevision(relPath);
+        if (
+            !entry?.remoteEntity
+            || !entry.parentEntity
+            || remoteRevision===undefined
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'Local Replica cannot prove the authoritative folder identity for an offline delete. ' +
+                'Reconnect and complete an initial pull before deleting this folder.',
+            );
+        }
+        const stageOperationId = this.remoteDeleteOperationId(
+            relPath,
+            remoteRevision,
+            entry.remoteEntity.id,
+        );
+        const stagingRelPath = this.remoteDeleteStagingPath(
+            relPath,
+            remoteRevision,
+            entry.remoteEntity.id,
+        );
+        const existing = manifest.pendingOperations[relPath];
+        const sameIntent = existing?.kind==='rmdir'
+            && existing.remoteRevision===remoteRevision
+            && this.remoteFolderIdentityMatches(existing.targetEntity, entry.remoteEntity)
+            && this.remoteFolderIdentityMatches(existing.parentEntity, entry.parentEntity)
+            && existing.stageOperationId===stageOperationId
+            && existing.stagingRelPath===stagingRelPath;
+        if (sameIntent) {
+            this.locallyDivergedPaths.add(relPath);
+            this.refreshDerivedSyncStatusWhenNotActive();
+            return existing;
+        }
+        if (existing) {
+            throw new Error('A different Local Replica operation is already pending for this folder.');
+        }
+        const now = new Date().toISOString();
+        const record: SyncManifestPendingDirectoryDeleteOperation = {
+            version: 1,
+            id: crypto.randomBytes(16).toString('hex'),
+            kind: 'rmdir',
+            localKind: 'missing',
+            localRevision: DELETE_DIGEST,
+            remoteKind: 'directory',
+            remoteRevision,
+            targetEntity: {...entry.remoteEntity},
+            parentEntity: {...entry.parentEntity},
+            stageOperationId,
+            stagingRelPath,
+            createdAt: now,
+            updatedAt: now,
+        };
+        manifest.pendingOperations[relPath] = record;
+        this.locallyDivergedPaths.add(relPath);
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+        this.refreshDerivedSyncStatusWhenNotActive();
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [pending rmdir journaled] ' +
+            relPath + ' entity=folder:' + record.targetEntity.id +
+            ' parent=folder:' + record.parentEntity.id,
+        );
+        return record;
+    }
+
+    // An explicit “Keep Local” decision is different from an automatic replay:
+    // the user has just reviewed the current Overleaf folder revision. Rebind
+    // the still-local delete intent to that proven entity/tree, but never
+    // overwrite an external stage journal that may already have moved data.
+    private async rebasePendingLocalDirectoryDeleteForConflictResolution(
+        relPath: string,
+        record: SyncManifestPendingDirectoryDeleteOperation,
+        remoteState: PathRevision,
+        generation = this.syncGeneration,
+    ): Promise<SyncManifestPendingDirectoryDeleteOperation> {
+        this.requireSyncSession(generation);
+        if (remoteState.kind!=='directory') {
+            throw new RemoteDocumentMergeConflictError(
+                'The reviewed Overleaf path is no longer a folder, so the local folder delete cannot be rebased.',
+            );
+        }
+        const current = this.syncManifest?.pendingOperations[relPath];
+        if (!current || current.kind!=='rmdir' || current.id!==record.id) {
+            throw new RemoteDocumentMergeConflictError(
+                'The guarded local folder-delete intent changed before the reviewed decision could be applied.',
+            );
+        }
+        if (await this.localPathExists(
+            this.remoteDeleteOperationRecordPath(record.stageOperationId),
+        )) {
+            throw new RemoteDocumentMergeConflictError(
+                'The prior guarded folder delete is already staged remotely and must be recovered before choosing a new remote revision.',
+            );
+        }
+        const identity = await this.resolveRemoteFolderPathIdentity(
+            this.vfs.pathToUri(relPath),
+        );
+        this.requireSyncSession(generation);
+        if (!identity) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf did not provide the reviewed folder identity needed for the local delete.',
+            );
+        }
+        const stageOperationId = this.remoteDeleteOperationId(
+            relPath,
+            remoteState.revision,
+            identity.entity.id,
+        );
+        const rebased: SyncManifestPendingDirectoryDeleteOperation = {
+            ...record,
+            remoteRevision: remoteState.revision,
+            targetEntity: {...identity.entity},
+            parentEntity: {...identity.parent},
+            stageOperationId,
+            stagingRelPath: this.remoteDeleteStagingPath(
+                relPath,
+                remoteState.revision,
+                identity.entity.id,
+            ),
+            updatedAt: new Date().toISOString(),
+        };
+        this.syncManifest!.pendingOperations[relPath] = rebased;
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [pending rmdir rebased:explicit-resolution] ' +
+            relPath + ' entity=folder:' + rebased.targetEntity.id,
+        );
+        return rebased;
+    }
+    private async removePendingLocalDirectoryDelete(
+        relPath: string,
+        reason: string,
+        generation = this.syncGeneration,
+        expected?: Pick<SyncManifestPendingDirectoryDeleteOperation, 'id'>,
+    ): Promise<boolean> {
+        this.requireSyncSession(generation);
+        const current = this.syncManifest?.pendingOperations[relPath];
+        if (
+            !current
+            || current.kind!=='rmdir'
+            || (expected!==undefined && current.id!==expected.id)
+        ) {
+            return false;
+        }
+        delete this.syncManifest!.pendingOperations[relPath];
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+        this.refreshDerivedSyncStatusWhenNotActive();
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [pending rmdir acknowledged] ' +
+            relPath + ': ' + reason,
+        );
+        return true;
+    }
+
+    private async finalizeAcceptedPendingLocalDirectoryDelete(
+        relPath: string,
+        record: SyncManifestPendingDirectoryDeleteOperation,
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        const surviving = this.vfs._resolveById(record.targetEntity.id);
+        if (surviving!==undefined) {
+            throw new RemoteDocumentMergeConflictError(
+                'The original Overleaf folder still exists at a different path after its local delete.',
+            );
+        }
+        this.setBypassCache(relPath, undefined, 'push', 'delete');
+        this.clearRemoteDelete(relPath);
+        // Preserve watcher events: a local re-creation that landed after the
+        // final absence check must queue a fresh guarded update, never vanish
+        // with the deleted tree's bookkeeping.
+        this.clearReplicaState(relPath, true, true);
+        const removed = await this.removePendingLocalDirectoryDelete(
+            relPath,
+            'Overleaf accepted the guarded local folder delete',
+            generation,
+            record,
+        );
+        if (!removed) {
+            throw new Error('Local Replica rmdir journal changed before final acknowledgement.');
+        }
+        await this.persistSyncManifest(false, generation);
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [local rmdir accepted] ' +
+            relPath + ' entity=folder:' + record.targetEntity.id,
+        );
+    }
+
     private async removePendingFilePushOperation(
         relPath: string,
         reason: string,
@@ -9054,7 +9824,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const entry = this.syncManifest?.pendingOperations[relPath];
         if (
             !entry
-            || entry.kind==='move'
+            || (entry.kind!=='update' && entry.kind!=='delete')
             || (
                 expected!==undefined
                 && (
@@ -9814,6 +10584,206 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return true;
     }
 
+    private async reconcilePendingLocalDirectoryDelete(
+        relPath: string,
+        record: SyncManifestPendingDirectoryDeleteOperation,
+        generation = this.syncGeneration,
+        options: {allowRemoteDivergence?: boolean} = {},
+    ): Promise<'accepted' | 'deferred' | 'conflict'> {
+        this.requireSyncSession(generation);
+        const localState = await this.captureLocalPathRevision(relPath, generation);
+        if (localState.kind!=='missing') {
+            await this.markSyncConflict(
+                relPath,
+                'A pending local folder delete cannot replay because the local folder was recreated',
+                undefined,
+                generation,
+            );
+            return 'conflict';
+        }
+        const pendingDescendant = this.pendingOperationAtOrBelow(relPath, record.id);
+        if (pendingDescendant!==undefined) {
+            getOutputChannel().appendLine(
+                new Date().toISOString() + ' [pending rmdir deferred:pending-descendant] ' +
+                relPath + ': ' + pendingDescendant,
+            );
+            return 'deferred';
+        }
+
+        const remoteState = await this.captureRemotePathRevision(relPath, generation);
+        this.requireSyncSession(generation);
+        if (remoteState.kind==='missing') {
+            if (!await this.verifyRemoteFolderDeletePostcondition(relPath, record, generation)) {
+                await this.markSyncConflict(
+                    relPath,
+                    'Overleaf removed the folder path but the recorded folder identity was not proven deleted',
+                    undefined,
+                    generation,
+                );
+                return 'conflict';
+            }
+            await this.finalizeAcceptedPendingLocalDirectoryDelete(relPath, record, generation);
+            return 'accepted';
+        }
+        if (remoteState.kind==='directory') {
+            const ignoredDescendant = await this.findIgnoredDescendant(
+                this.vfs.pathToUri(relPath),
+                relPath,
+                generation,
+            );
+            this.requireSyncSession(generation);
+            if (ignoredDescendant) {
+                await this.markSyncConflict(
+                    relPath,
+                    'The local folder was deleted, but ignored Overleaf content must be preserved (' +
+                        ignoredDescendant + ')',
+                    null,
+                    generation,
+                );
+                return 'conflict';
+            }
+        }
+        if (
+            remoteState.kind!=='directory'
+            || remoteState.revision!==record.remoteRevision
+        ) {
+            await this.markSyncConflict(
+                relPath,
+                'The local folder was deleted while its Overleaf contents also changed',
+                undefined,
+                generation,
+                remoteState,
+            );
+            return 'conflict';
+        }
+
+        try {
+            await this.assertRemoteFolderDeletePath(
+                this.vfs.pathToUri(relPath),
+                relPath,
+                record.remoteRevision,
+                record.targetEntity,
+                record.parentEntity,
+                'pending folder delete target',
+                generation,
+            );
+            if (
+                !options.allowRemoteDivergence
+                && await this.remoteDirectoryHasChanges(relPath, generation)
+            ) {
+                this.requireSyncSession(generation);
+                await this.markSyncConflict(
+                    relPath,
+                    'The local folder was deleted while its Overleaf contents also changed',
+                    null,
+                    generation,
+                );
+                return 'conflict';
+            }
+            // The directory scan above itself awaits every child. A
+            // collaborator can land a new entity immediately after its last
+            // read, so take one final full-tree+identity snapshot before the
+            // stage journal is allowed to mutate the remote tree.
+            const finalRemoteState = await this.captureRemotePathRevision(
+                relPath,
+                generation,
+            );
+            this.requireSyncSession(generation);
+            if (
+                finalRemoteState.kind!=='directory'
+                || finalRemoteState.revision!==record.remoteRevision
+            ) {
+                await this.markSyncConflict(
+                    relPath,
+                    'Overleaf changed the folder tree immediately before the local delete could be staged',
+                    null,
+                    generation,
+                    finalRemoteState,
+                );
+                return 'conflict';
+            }
+            await this.assertRemoteFolderDeletePath(
+                this.vfs.pathToUri(relPath),
+                relPath,
+                record.remoteRevision,
+                record.targetEntity,
+                record.parentEntity,
+                'final pending folder delete target',
+                generation,
+            );
+
+            await this.withRetry('push', relPath, async () => {
+                await this.vfs.ensureConnectedForWrite();
+                this.requireSyncSession(generation);
+                return this.atomicDeleteRemoteFolderIfIdentity(
+                    relPath,
+                    record,
+                    generation,
+                    async () => {
+                        const currentLocal = await this.captureLocalPathRevision(
+                            relPath,
+                            generation,
+                        );
+                        return currentLocal.kind==='missing'
+                            && this.pendingOperationAtOrBelow(relPath, record.id)===undefined;
+                    },
+                );
+            }, {
+                delays: LocalReplicaSCMProvider.pushRetryDelays,
+                generation,
+                betweenAttempts: async () => {
+                    await this.waitForConnectedOrTimeout(
+                        LocalReplicaSCMProvider.pushReconnectWaitMs,
+                    );
+                },
+            });
+        } catch (error) {
+            if (LocalReplicaSCMProvider.isLocalReadUnstable(error)) {
+                const latestLocal = await this.captureLocalPathRevision(relPath, generation);
+                const laterPending = this.pendingOperationAtOrBelow(relPath, record.id);
+                if (latestLocal.kind==='missing' && laterPending!==undefined) {
+                    getOutputChannel().appendLine(
+                        new Date().toISOString() + ' [pending rmdir replay deferred] ' +
+                        relPath + ': ' + laterPending,
+                    );
+                    return 'deferred';
+                }
+            }
+            if (
+                error instanceof ConcurrentReplicaChangeError
+                || error instanceof RemoteDocumentMergeConflictError
+                || LocalReplicaSCMProvider.isLocalReadUnstable(error)
+            ) {
+                await this.markSyncConflict(
+                    relPath,
+                    'The guarded local folder delete could not be applied safely: ' +
+                        formatUnknownError(error),
+                    undefined,
+                    generation,
+                );
+                return 'conflict';
+            }
+            throw error;
+        }
+
+        this.requireSyncSession(generation);
+        const localRecreated = (
+            await this.captureLocalPathRevision(relPath, generation)
+        ).kind!=='missing';
+        const pendingLocalChange = [...this.pendingLocalEvents.keys()]
+            .some(path => this.isPathAtOrBelow(path, relPath));
+        await this.finalizeAcceptedPendingLocalDirectoryDelete(relPath, record, generation);
+        if (localRecreated || pendingLocalChange) {
+            this.locallyDivergedPaths.add(relPath);
+            this.queueForcedPush(
+                relPath,
+                'local-change-during-guarded-folder-delete',
+                localRecreated ? 'update' : 'delete',
+            );
+        }
+        return 'accepted';
+    }
+
     private async reconcilePendingFilePushOperations(
         generation = this.syncGeneration,
     ): Promise<void> {
@@ -9827,6 +10797,24 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 getOutputChannel().appendLine(
                     `${new Date().toISOString()} [pending operation blocked:conflict] ${relPath}`,
                 );
+                continue;
+            }
+            if (recorded.kind==='rmdir') {
+                try {
+                    if (await this.reconcilePendingLocalDirectoryDelete(
+                        relPath,
+                        recorded,
+                        generation,
+                    )==='accepted') {
+                        recovered += 1;
+                    }
+                } catch (error) {
+                    this.locallyDivergedPaths.add(relPath);
+                    getOutputChannel().appendLine(
+                        new Date().toISOString() + ' [pending rmdir replay deferred] ' +
+                        relPath + ': ' + formatUnknownError(error),
+                    );
+                }
                 continue;
             }
             if (recorded.kind==='mkdir') {
@@ -10029,7 +11017,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (this.failedInitialPulls.size===0) {
             this.initialPullStatus = 'complete';
             this.partialPullToastGeneration = undefined;
-            this.completeUnavailableBaselineIfResolved();
+            this.completeTrustedBaselineIfResolved();
             if (this.syncConflicts.size===0) {
                 this.status = {status: 'idle', message: ''};
             }
@@ -10550,8 +11538,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     ),
                 );
                 this.requireSyncSession(generation);
+                const remoteIdentity = await this.resolveRemoteFolderPathIdentity(
+                    this.vfs.pathToUri(relPath),
+                );
+                this.requireSyncSession(generation);
+                if (!remoteIdentity) {
+                    throw new Error(
+                        'Could not resolve the authoritative Overleaf folder identity for ' + relPath,
+                    );
+                }
                 this.seenLocalEntities.add(relPath);
-                this.recordSyncManifestDirectory(relPath);
+                this.recordSyncManifestDirectory(relPath, remoteIdentity);
             }
 
             // sync the files
@@ -10978,8 +11975,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 for (const relPath of localSnapshot.directories) {
                     if (pathIsBlockedByDirectory(relPath)) { continue; }
                     if (remoteDirectoryPaths.has(relPath)) {
+                        const remoteIdentity = await this.resolveRemoteFolderPathIdentity(
+                            this.vfs.pathToUri(relPath),
+                        );
+                        this.requireSyncSession(generation);
+                        if (!remoteIdentity) {
+                            throw new Error(
+                                'Could not resolve the authoritative Overleaf folder identity for ' + relPath,
+                            );
+                        }
                         this.seenLocalEntities.add(relPath);
-                        this.recordSyncManifestDirectory(relPath);
+                        this.recordSyncManifestDirectory(relPath, remoteIdentity);
                     } else if (this.syncManifest?.directories[relPath]===undefined) {
                         startupPushDirectoryPaths.add(relPath);
                     }
@@ -11812,6 +12818,159 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 let localDeleteState: PathRevision | undefined;
                 let remoteDeleteState: PathRevision | undefined;
 
+                // Folder deletes carry a durable entity identity from the
+                // manifest, rather than falling through to the file-oriented
+                // path/revision staging helper. This applies on a live local
+                // delete and when an inbound delete arrives while that local
+                // intent is still awaiting acknowledgement.
+                const pendingDirectoryDelete = this.syncManifest?.pendingOperations[relPath];
+                if (
+                    directoryDelete
+                    && (
+                        action==='push'
+                        || pendingDirectoryDelete?.kind==='rmdir'
+                    )
+                ) {
+                    let record: SyncManifestPendingDirectoryDeleteOperation | undefined;
+                    try {
+                        if (action==='push') {
+                            const localState = await this.captureLocalPathRevision(
+                                relPath,
+                                generation,
+                            );
+                            if (localState.kind!=='missing') {
+                                throw new LocalReadUnstableError(
+                                    relPath,
+                                    'vanished-during-update',
+                                    'Local Replica folder delete target reappeared before its intent was journaled: ' +
+                                        relPath,
+                                );
+                            }
+                            // A one-off ENOENT is a normal atomic-save shape.
+                            // Require a second absence before a recursive rmdir
+                            // becomes durable; after that point a re-creation is
+                            // a real competing intent and is conflict-preserved.
+                            if (pendingDirectoryDelete?.kind!=='rmdir') {
+                                const confirmedLocalState = await this.captureLocalPathRevision(
+                                    relPath,
+                                    generation,
+                                );
+                                if (confirmedLocalState.kind!=='missing') {
+                                    throw new LocalReadUnstableError(
+                                        relPath,
+                                        'vanished-during-update',
+                                        'Local Replica folder delete target reappeared during absence corroboration: ' +
+                                            relPath,
+                                    );
+                                }
+                            }
+                            const pendingDescendant = this.pendingOperationAtOrBelow(
+                                relPath,
+                                pendingDirectoryDelete?.kind==='rmdir'
+                                    ? pendingDirectoryDelete.id
+                                    : undefined,
+                            );
+                            if (pendingDescendant!==undefined) {
+                                getOutputChannel().appendLine(
+                                    new Date().toISOString() +
+                                    ' [folder delete deferred:pending-descendant] ' +
+                                    relPath + ': ' + pendingDescendant,
+                                );
+                                outcome = 'blocked';
+                                errorMessage = 'unresolved descendant local operation';
+                                return;
+                            }
+                            record = pendingDirectoryDelete?.kind==='rmdir'
+                                ? pendingDirectoryDelete
+                                : await this.journalPendingLocalDirectoryDelete(
+                                    relPath,
+                                    generation,
+                                );
+                        } else {
+                            if (pendingDirectoryDelete?.kind!=='rmdir') {
+                                // An ordinary remote delete uses the existing
+                                // pull path. Only a matching pending local
+                                // rmdir gets the durable acknowledgement flow.
+                                record = undefined;
+                            } else {
+                                record = pendingDirectoryDelete;
+                            }
+                        }
+                    } catch (error) {
+                        if (LocalReplicaSCMProvider.isLocalReadUnstable(error)) {
+                            this.scheduleLocalPushRetry(
+                                relPath,
+                                fromUri,
+                                'unstable-read',
+                                generation,
+                                'delete',
+                            );
+                            outcome = 'blocked';
+                            errorMessage = LOCAL_SNAPSHOT_UNSTABLE;
+                            return;
+                        }
+                        if (error instanceof RemoteDocumentMergeConflictError) {
+                            await this.markSyncConflict(
+                                relPath,
+                                formatUnknownError(error),
+                                undefined,
+                                generation,
+                            );
+                            outcome = 'blocked';
+                            errorMessage = this.syncConflicts.get(relPath)
+                                ?? 'sync conflict: guarded local folder delete could not be journaled';
+                            return;
+                        }
+                        throw error;
+                    }
+                    if (record!==undefined) {
+                        try {
+                            if (
+                                action==='push'
+                                && resolveConflict
+                                && conflictResolutionProof?.remoteState.kind==='directory'
+                            ) {
+                                record = await this.rebasePendingLocalDirectoryDeleteForConflictResolution(
+                                    relPath,
+                                    record,
+                                    conflictResolutionProof.remoteState,
+                                    generation,
+                                );
+                            }
+                        } catch (error) {
+                            await this.markSyncConflict(
+                                relPath,
+                                'The explicit local folder-delete decision could not be applied safely: ' +
+                                    formatUnknownError(error),
+                                undefined,
+                                generation,
+                            );
+                            outcome = 'blocked';
+                            errorMessage = this.syncConflicts.get(relPath)
+                                ?? 'sync conflict: guarded local folder delete resolution failed';
+                            return;
+                        }
+                        const result = await this.reconcilePendingLocalDirectoryDelete(
+                            relPath,
+                            record,
+                            generation,
+                            {allowRemoteDivergence: resolveConflict},
+                        );
+                        if (result==='accepted') {
+                            if (action==='pull') {
+                                authoritativePullCompleted = true;
+                            }
+                            return;
+                        }
+                        outcome = 'blocked';
+                        errorMessage = result==='deferred'
+                            ? 'unresolved descendant local operation'
+                            : this.syncConflicts.get(relPath)
+                                ?? 'sync conflict: guarded local folder delete conflict';
+                        return;
+                    }
+                }
+
                 if (directoryDelete) {
                     const pendingDescendant = this.pendingOperationAtOrBelow(relPath);
                     if (pendingDescendant!==undefined) {
@@ -12449,7 +13608,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             }
                         }
                     } else {
+                        observedRemoteDirectoryIdentity =
+                            await this.resolveRemoteFolderPathIdentity(fromUri);
                         this.requireSyncSession(generation);
+                        if (!observedRemoteDirectoryIdentity) {
+                            throw new Error(
+                                'Could not resolve the authoritative Overleaf folder identity for ' +
+                                    relPath,
+                            );
+                        }
                         await this.runSessionIO(
                             generation,
                             () => vscode.workspace.fs.createDirectory(toUri),
@@ -14033,7 +15200,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.initialPullStatus = 'complete';
             this.partialPullToastGeneration = undefined;
         }
-        this.completeUnavailableBaselineIfResolved();
+        this.completeTrustedBaselineIfResolved();
         await this.persistSyncManifest(false, activeGeneration);
         if (this.isSyncSessionActive(activeGeneration)) {
             await this.refreshCleanOpenReplicaDocumentsFromDisk(activeGeneration);
@@ -14255,7 +15422,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.initialPullStatus = 'complete';
         this.status = {status: 'idle', message: ''};
         this.partialPullToastGeneration = undefined;
-        this.completeUnavailableBaselineIfResolved();
+        this.completeTrustedBaselineIfResolved();
         await this.persistSyncManifest(false, generation);
         // User opted in: the failed paths are now ignored, so it is safe to
         // arm the local watcher for the rest of the project.

@@ -79,8 +79,10 @@ class FakeVirtualFileSystem {
         const relPath = this.relativeKey(uri);
         const fileName = path.basename(uri.fsPath);
         let isDirectory = false;
+        let exists = false;
         try {
             isDirectory = (await vscode.workspace.fs.stat(uri)).type===vscode.FileType.Directory;
+            exists = true;
         } catch {
             isDirectory = false;
         }
@@ -88,6 +90,13 @@ class FakeVirtualFileSystem {
             ? 'folder'
             : /\.tex$/i.test(fileName) ? 'doc' : 'file';
         const parentRelPath = relPath==='/' ? '/' : path.posix.dirname(relPath);
+        if (exists) {
+            this.entityIds.set(relPath, this.entityIds.get(relPath) ?? relPath);
+            this.entityIds.set(
+                parentRelPath,
+                this.entityIds.get(parentRelPath) ?? parentRelPath,
+            );
+        }
         return {
             parentFolder: {
                 _id: this.entityIds.get(parentRelPath) ?? parentRelPath,
@@ -106,35 +115,104 @@ class FakeVirtualFileSystem {
         };
     }
 
+    _resolveById(entityId: string) {
+        for (const [relPath, id] of this.entityIds) {
+            if (id!==entityId) { continue; }
+            const fileName = path.posix.basename(relPath);
+            const isFolder = relPath==='/' || !path.extname(fileName);
+            return {
+                parentFolder: {
+                    _id: this.entityIds.get(path.posix.dirname(relPath))
+                        ?? path.posix.dirname(relPath),
+                    name: path.posix.basename(path.posix.dirname(relPath)),
+                    _type: 'folder',
+                },
+                fileEntity: {
+                    _id: id,
+                    name: fileName,
+                    _type: isFolder ? 'folder' : (/\.tex$/i.test(fileName) ? 'doc' : 'file'),
+                    linkedFileData: null,
+                    created: new Date(0).toISOString(),
+                },
+                fileType: isFolder ? 'folder' : (/\.tex$/i.test(fileName) ? 'doc' : 'file'),
+                path: relPath,
+            };
+        }
+        return undefined;
+    }
+
     async rename(
         oldUri: vscode.Uri,
         newUri: vscode.Uri,
         force: boolean,
-        expectedEntity?: {id: string; type: 'doc' | 'file'},
+        expectedEntity?: {id: string; type: 'doc' | 'file' | 'folder'; parentId?: string},
     ) {
         const oldKey = this.relativeKey(oldUri);
-        const actualType = /\.tex$/i.test(path.basename(oldUri.fsPath)) ? 'doc' : 'file';
+        let actualType: 'doc' | 'file' | 'folder';
+        try {
+            actualType = (await vscode.workspace.fs.stat(oldUri)).type===vscode.FileType.Directory
+                ? 'folder'
+                : (/\.tex$/i.test(path.basename(oldUri.fsPath)) ? 'doc' : 'file');
+        } catch {
+            throw vscode.FileSystemError.FileNotFound(oldUri);
+        }
         if (
             expectedEntity
             && (
                 (this.entityIds.get(oldKey) ?? oldKey)!==expectedEntity.id
                 || actualType!==expectedEntity.type
+                || (
+                    expectedEntity.parentId!==undefined
+                    && (this.entityIds.get(path.posix.dirname(oldKey)) ?? path.posix.dirname(oldKey))!==expectedEntity.parentId
+                )
             )
         ) {
             throw vscode.FileSystemError.Unavailable('unexpected remote entity');
-        }
-        if (!await pathExists(oldUri)) {
-            throw vscode.FileSystemError.FileNotFound(oldUri);
         }
         if (!force && await pathExists(newUri)) {
             throw vscode.FileSystemError.FileExists(newUri);
         }
         await vscode.workspace.fs.rename(oldUri, newUri, {overwrite: force});
         const newKey = this.relativeKey(newUri);
-        const entityId = this.entityIds.get(oldKey);
-        this.entityIds.delete(oldKey);
-        if (entityId!==undefined) {
-            this.entityIds.set(newKey, entityId);
+        const movedIds = [...this.entityIds.entries()]
+            .filter(([key]) => key===oldKey || key.startsWith(oldKey+'/'));
+        for (const [key, id] of movedIds) {
+            this.entityIds.delete(key);
+            this.entityIds.set(newKey + key.slice(oldKey.length), id);
+        }
+        if (movedIds.length===0) {
+            this.entityIds.set(newKey, oldKey);
+        }
+    }
+
+    async remove(
+        uri: vscode.Uri,
+        recursive: boolean,
+        expectedEntity?: {id: string; type: 'doc' | 'file' | 'folder'; parentId?: string},
+    ) {
+        const resolved = await this._resolveUri(uri);
+        if (
+            expectedEntity
+            && (
+                resolved.fileType!==expectedEntity.type
+                || resolved.fileEntity._id!==expectedEntity.id
+                || (
+                    expectedEntity.parentId!==undefined
+                    && resolved.parentFolder._id!==expectedEntity.parentId
+                )
+            )
+        ) {
+            throw vscode.FileSystemError.Unavailable('unexpected remote entity');
+        }
+        if (!await pathExists(uri)) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
+        await vscode.workspace.fs.delete(uri, {recursive});
+        const key = this.relativeKey(uri);
+        for (const pathKey of [...this.entityIds.keys()]) {
+            if (pathKey===key || pathKey.startsWith(key+'/')) {
+                this.entityIds.delete(pathKey);
+            }
         }
     }
 
@@ -3148,7 +3226,7 @@ suite('Select Project Folder Local Replica', function () {
             oldUri: vscode.Uri,
             newUri: vscode.Uri,
             force: boolean,
-            expectedEntity?: {id: string; type: 'doc' | 'file'},
+            expectedEntity?: {id: string; type: 'doc' | 'file' | 'folder'; parentId?: string},
         ) => {
             if (interruptedAfterRename) {
                 interruptedAfterRename = false;
@@ -3269,7 +3347,7 @@ suite('Select Project Folder Local Replica', function () {
         );
         const interruptedManifest = JSON.parse(await readText(manifestUri));
         const pending = interruptedManifest.pendingOperations['/main.tex'];
-        assert.strictEqual(interruptedManifest.version, 6);
+        assert.strictEqual(interruptedManifest.version, 7);
         assert.strictEqual(pending.kind, 'update');
         assert.strictEqual(pending.localKind, 'file');
         assert.strictEqual(pending.localRevision, sha1('offline local update'));
@@ -3391,7 +3469,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), false);
     });
 
-    test('migrates a version 2 manifest to the version 6 identity schema', async () => {
+    test('migrates a version 2 manifest to the version 7 identity schema', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-v3-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-v3-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -3413,11 +3491,11 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 6);
+        assert.strictEqual(migratedManifest.version, 7);
         assert.deepStrictEqual(migratedManifest.pendingOperations, {});
     });
 
-    test('records remote entity and stable local inode identities in manifest v6', async () => {
+    test('records remote entity and stable local inode identities in manifest v7', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-identity-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-identity-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -3436,7 +3514,7 @@ suite('Select Project Folder Local Replica', function () {
             REPLICA_SETTINGS_DIR,
             'sync-manifest.json',
         )));
-        assert.strictEqual(manifest.version, 6);
+        assert.strictEqual(manifest.version, 7);
         assert.deepStrictEqual(manifest.files['/main.tex'].remoteEntity, {id: 'doc-main', type: 'doc'});
         assert.deepStrictEqual(manifest.files['/figure.png'].remoteEntity, {id: 'file-figure', type: 'file'});
         for (const entry of [
@@ -9131,6 +9209,295 @@ suite('Select Project Folder Local Replica', function () {
         );
     });
 
+    test('journals an exact folder identity before staging a local recursive delete', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-rmdir-journal-remote-');
+        const localRoot = await tempDir('sr-overleaf-rmdir-journal-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteChapter = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const localChapter = vscode.Uri.joinPath(localRoot, 'chapter');
+        await writeText(vscode.Uri.joinPath(remoteChapter, 'main.tex'), 'baseline');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('chapter', 'chapter-folder-id');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.delete(localChapter, {recursive: true});
+
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let enterStage!: () => void;
+        let releaseStage!: () => void;
+        const stageEntered = new Promise<void>(resolve => { enterStage = resolve; });
+        const stageRelease = new Promise<void>(resolve => { releaseStage = resolve; });
+        (fakeVfs as any).rename = async (...args: any[]) => {
+            if (args[3]?.type==='folder') {
+                enterStage();
+                await stageRelease;
+            }
+            return (originalRename as any)(...args);
+        };
+
+        const internals = scm as any;
+        const sync = internals.applySync(
+            'push', 'delete', '/chapter', localChapter, remoteChapter,
+        ) as Promise<Events['scmSyncCompleteEvent']>;
+        await stageEntered;
+        const pending = internals.syncManifest.pendingOperations['/chapter'];
+        assert.strictEqual(pending.kind, 'rmdir');
+        assert.deepStrictEqual(pending.targetEntity, {id: 'chapter-folder-id', type: 'folder'});
+        assert.deepStrictEqual(pending.parentEntity, {id: '/', type: 'folder'});
+        const operation = JSON.parse(await fs.readFile(
+            internals.remoteDeleteOperationRecordPath(pending.stageOperationId), 'utf8',
+        ));
+        assert.deepStrictEqual(operation.folderGuard, {
+            entity: {id: 'chapter-folder-id', type: 'folder'},
+            parent: {id: '/', type: 'folder'},
+            pendingOperationId: pending.id,
+        });
+        assert.strictEqual(await readText(vscode.Uri.joinPath(remoteChapter, 'main.tex')), 'baseline');
+
+        releaseStage();
+        const event = await sync;
+        assert.strictEqual(event.outcome, 'success');
+        assert.strictEqual(await pathExists(remoteChapter), false);
+        assert.strictEqual(internals.syncManifest.pendingOperations['/chapter'], undefined);
+    });
+    test('replays a journaled local folder delete on reconnect without another watcher event', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-rmdir-reconnect-remote-');
+        const localRoot = await tempDir('sr-overleaf-rmdir-reconnect-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteChapter = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const localChapter = vscode.Uri.joinPath(localRoot, 'chapter');
+        await writeText(vscode.Uri.joinPath(remoteChapter, 'main.tex'), 'baseline');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const triggers = await scm.triggers;
+        const internals = scm as any;
+        // This test injects the durable intent itself; suppress the unrelated
+        // filesystem-watch echo so the reconnect path is the sole actor.
+        const originalSyncToVFS = internals.syncToVFS;
+        internals.syncToVFS = () => Promise.resolve();
+        try {
+            await vscode.workspace.fs.delete(localChapter, {recursive: true});
+            fakeVfs.setConnectionState('disconnected');
+            const pending = await internals.journalPendingLocalDirectoryDelete('/chapter');
+            assert.strictEqual(pending.kind, 'rmdir');
+            assert.strictEqual(scm.status.status, 'offline');
+            assert.strictEqual(await pathExists(remoteChapter), true);
+
+            fakeVfs.setConnectionState('connected');
+            await waitUntil(() => (
+                internals.syncManifest.pendingOperations['/chapter']===undefined
+                && scm.status.status==='idle'
+            ));
+            assert.strictEqual(await pathExists(remoteChapter), false);
+            assert.strictEqual(internals.syncConflicts.has('/chapter'), false);
+        } finally {
+            internals.syncToVFS = originalSyncToVFS;
+            triggers.forEach(trigger => trigger.dispose());
+        }
+    });
+    test('blocks a same-tree remote folder replacement with a different entity id', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-rmdir-replacement-remote-');
+        const localRoot = await tempDir('sr-overleaf-rmdir-replacement-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteChapter = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const localChapter = vscode.Uri.joinPath(localRoot, 'chapter');
+        await writeText(vscode.Uri.joinPath(remoteChapter, 'main.tex'), 'baseline');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('chapter', 'chapter-original-id');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.delete(localChapter, {recursive: true});
+
+        const originalHasChanges = (scm as any).remoteDirectoryHasChanges.bind(scm);
+        let replaced = false;
+        (scm as any).remoteDirectoryHasChanges = async (relPath: string, generation: number) => {
+            const changed = await originalHasChanges(relPath, generation);
+            if (!replaced && relPath==='/chapter') {
+                replaced = true;
+                await vscode.workspace.fs.delete(remoteChapter, {recursive: true});
+                await writeText(vscode.Uri.joinPath(remoteChapter, 'main.tex'), 'baseline');
+                fakeVfs.setEntityId('chapter', 'chapter-replacement-id');
+            }
+            return changed;
+        };
+
+        const event = await (scm as any).applySync(
+            'push', 'delete', '/chapter', localChapter, remoteChapter,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(replaced, true);
+        assert.strictEqual(await readText(vscode.Uri.joinPath(remoteChapter, 'main.tex')), 'baseline');
+        const resolved = await fakeVfs._resolveUri(remoteChapter);
+        assert.strictEqual(resolved.fileEntity._id, 'chapter-replacement-id');
+        assert.strictEqual((scm as any).syncManifest.pendingOperations['/chapter'].kind, 'rmdir');
+        assert.strictEqual((scm as any).syncConflicts.has('/chapter'), true);
+    });
+    test('checks the recorded folder parent immediately before staging', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-rmdir-parent-guard-remote-');
+        const localRoot = await tempDir('sr-overleaf-rmdir-parent-guard-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteChapter = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const localChapter = vscode.Uri.joinPath(localRoot, 'chapter');
+        await writeText(vscode.Uri.joinPath(remoteChapter, 'main.tex'), 'baseline');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('', 'root-parent-before-stage');
+        fakeVfs.setEntityId('chapter', 'chapter-parent-guard-id');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.delete(localChapter, {recursive: true});
+
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let parentChangedAtMutationBoundary = false;
+        (fakeVfs as any).rename = async (...args: any[]) => {
+            if (!parentChangedAtMutationBoundary && args[3]?.type==='folder') {
+                parentChangedAtMutationBoundary = true;
+                fakeVfs.setEntityId('', 'root-parent-replaced-before-stage');
+            }
+            return (originalRename as any)(...args);
+        };
+
+        const event = await (scm as any).applySync(
+            'push', 'delete', '/chapter', localChapter, remoteChapter,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(parentChangedAtMutationBoundary, true);
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(await readText(vscode.Uri.joinPath(remoteChapter, 'main.tex')), 'baseline');
+        assert.strictEqual((await fakeVfs._resolveUri(remoteChapter)).fileEntity._id, 'chapter-parent-guard-id');
+        assert.strictEqual((scm as any).syncConflicts.has('/chapter'), true);
+    });
+    test('accepts a guarded folder delete when its final delete response is lost', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-rmdir-delete-response-remote-');
+        const localRoot = await tempDir('sr-overleaf-rmdir-delete-response-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteChapter = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const localChapter = vscode.Uri.joinPath(localRoot, 'chapter');
+        await writeText(vscode.Uri.joinPath(remoteChapter, 'main.tex'), 'baseline');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.delete(localChapter, {recursive: true});
+
+        const originalRemove = fakeVfs.remove.bind(fakeVfs);
+        let loseResponseOnce = true;
+        let removeCalls = 0;
+        (fakeVfs as any).remove = async (...args: any[]) => {
+            removeCalls += 1;
+            await (originalRemove as any)(...args);
+            if (loseResponseOnce) {
+                loseResponseOnce = false;
+                throw new Error('simulated lost guarded folder delete response');
+            }
+        };
+
+        const event = await (scm as any).applySync(
+            'push', 'delete', '/chapter', localChapter, remoteChapter,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(event.outcome, 'success');
+        assert.strictEqual(removeCalls, 1);
+        assert.strictEqual(await pathExists(remoteChapter), false);
+        assert.strictEqual((scm as any).syncManifest.pendingOperations['/chapter'], undefined);
+    });
+    test('restores a staged folder after restart when the local folder was recreated', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-rmdir-restart-recreate-remote-');
+        const localRoot = await tempDir('sr-overleaf-rmdir-restart-recreate-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteChapter = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const localChapter = vscode.Uri.joinPath(localRoot, 'chapter');
+        await writeText(vscode.Uri.joinPath(remoteChapter, 'main.tex'), 'remote baseline');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('chapter', 'chapter-recovery-id');
+        const first = createSCM(remoteRoot, localRoot, fakeVfs);
+        await first.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.delete(localChapter, {recursive: true});
+
+        const firstInternals = first as any;
+        const pending = await firstInternals.journalPendingLocalDirectoryDelete('/chapter');
+        await firstInternals.createRemoteDeleteOperationRecord({
+            version: 1,
+            id: pending.stageOperationId,
+            relPath: '/chapter',
+            stagingRelPath: pending.stagingRelPath,
+            expectedRevision: pending.remoteRevision,
+            folderGuard: {
+                entity: pending.targetEntity,
+                parent: pending.parentEntity,
+                pendingOperationId: pending.id,
+            },
+            createdAt: new Date().toISOString(),
+        });
+        await fakeVfs.rename(
+            remoteChapter,
+            fakeVfs.pathToUri(pending.stagingRelPath),
+            false,
+            {id: 'chapter-recovery-id', type: 'folder'},
+        );
+        first.deactivate();
+
+        await writeText(vscode.Uri.joinPath(localChapter, 'local-recreated.tex'), 'local recreation');
+        const restarted = createSCM(remoteRoot, localRoot, fakeVfs);
+        assert.strictEqual(
+            await restarted.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.strictEqual(
+            await readText(vscode.Uri.joinPath(localChapter, 'local-recreated.tex')),
+            'local recreation',
+        );
+        assert.strictEqual(
+            await readText(vscode.Uri.joinPath(remoteChapter, 'main.tex')),
+            'remote baseline',
+        );
+        assert.strictEqual((restarted as any).syncConflicts.has('/chapter'), true);
+        assert.strictEqual(
+            await pathExists(fakeVfs.pathToUri(pending.stagingRelPath)),
+            false,
+        );
+    });
+    test('accepts a guarded folder delete when its staging rename response is lost', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-rmdir-rename-response-remote-');
+        const localRoot = await tempDir('sr-overleaf-rmdir-rename-response-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteChapter = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const localChapter = vscode.Uri.joinPath(localRoot, 'chapter');
+        await writeText(vscode.Uri.joinPath(remoteChapter, 'main.tex'), 'baseline');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('chapter', 'chapter-rename-response-id');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.delete(localChapter, {recursive: true});
+
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let loseResponseOnce = true;
+        let renameCalls = 0;
+        (fakeVfs as any).rename = async (...args: any[]) => {
+            renameCalls += 1;
+            await (originalRename as any)(...args);
+            if (loseResponseOnce) {
+                loseResponseOnce = false;
+                throw new Error('simulated lost guarded folder stage response');
+            }
+        };
+
+        const event = await (scm as any).applySync(
+            'push', 'delete', '/chapter', localChapter, remoteChapter,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(event.outcome, 'success');
+        assert.strictEqual(renameCalls, 1);
+        assert.strictEqual(await pathExists(remoteChapter), false);
+        assert.strictEqual((scm as any).syncManifest.pendingOperations['/chapter'], undefined);
+    });
     test('blocks a local folder delete when Overleaf changes after remote validation', async () => {
         const remoteRoot = await tempDir('sr-overleaf-push-delete-race-remote-');
         const localRoot = await tempDir('sr-overleaf-push-delete-race-local-');
@@ -9141,6 +9508,8 @@ suite('Select Project Folder Local Replica', function () {
         await writeText(vscode.Uri.joinPath(remoteChapter, 'main.tex'), 'baseline');
         const scm = createSCM(remoteRoot, localRoot);
         await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        assert.strictEqual((scm as any).isTrackedDirectory('/chapter'), true);
+        assert.ok((scm as any).syncManifest?.directories['/chapter']?.remoteEntity);
         await vscode.workspace.fs.delete(localChapter, {recursive: true});
 
         const originalHasChanges = (scm as any).remoteDirectoryHasChanges.bind(scm);
@@ -9163,6 +9532,7 @@ suite('Select Project Folder Local Replica', function () {
         ) as Events['scmSyncCompleteEvent'];
 
         assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(injected, true, 'the remote-validation race hook must have run');
         assert.strictEqual(
             await readText(vscode.Uri.joinPath(remoteChapter, 'collaborator.tex')),
             'preserve remote',
@@ -9310,14 +9680,11 @@ suite('Select Project Folder Local Replica', function () {
             '/main.tex',
             generation,
         );
-        const operationId = (firstScm as any).remoteDeleteOperationId(
-            '/main.tex',
-            expected.revision,
-        );
-        const stagingRelPath = (firstScm as any).remoteDeleteStagingPath(
-            '/main.tex',
-            expected.revision,
-        );
+        // Serialized exactly as a release-v0.16.1 file-delete journal. Do
+        // not derive it through the current helper: an upgrade must recover
+        // the old stage naming convention byte-for-byte.
+        const operationId = sha1(`/main.tex\0${expected.revision}`).slice(0, 24);
+        const stagingRelPath = `/.sr-overleaf-delete-${operationId}`;
         await (firstScm as any).createRemoteDeleteOperationRecord({
             version: 1,
             id: operationId,
