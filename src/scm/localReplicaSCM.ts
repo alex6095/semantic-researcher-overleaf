@@ -551,6 +551,19 @@ interface PendingEvent {
     latestUri: vscode.Uri;
 }
 
+// A VFS event deferred behind a folder move belongs to one exact durable
+// journal. The transient intermediate basename is not globally unique, so
+// source/destination coverage alone must never let an old conflicted move
+// replay its event through a later unrelated move.
+interface DeferredRemoteDirectoryMoveEvent extends Pick<
+    PendingEvent,
+    'latestType' | 'latestUri'
+> {
+    sourceRelPath: string;
+    destinationRelPath: string;
+    operationId: string;
+}
+
 // A folder-resolution transaction moves whole local trees. Keep newly observed
 // watcher work under that tree out of ordinary per-path queues until the
 // transaction has either rebuilt its canonical manifest or remained blocked.
@@ -966,6 +979,20 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         string,
         Pick<PendingEvent, 'latestType' | 'latestUri'>
     >();
+    // The VFS emits both its direct mutation notification and socket events.
+    // For a cross-parent basename change the server necessarily exposes a
+    // short-lived intermediate path. Keep those remote events until the
+    // durable folder-move journal has either rekeyed the manifest or remains
+    // unresolved; they are reclassified from the final authoritative tree.
+    private deferredRemoteEventsDuringDirectoryMove = new Map<
+        string,
+        DeferredRemoteDirectoryMoveEvent
+    >();
+    // A directory rename can surface child Create/Change events before the
+    // watcher reports its destination root. Serialize discovery by that
+    // untracked root so the first child event cannot be misclassified as a
+    // new remote file while the same tree is being claimed as a move.
+    private pendingLocalDirectoryMoveDiscoveries = new Map<string, Promise<boolean>>();
     private folderConflictResolutionFences = new Map<string, FolderConflictResolutionFence>();
     private inFlightSessionIO = new Set<Promise<unknown>>();
     private localGuardCleanupPromises = new Map<string, Promise<void>>();
@@ -2260,6 +2287,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         this.pendingLocalMoveDeletes.clear();
         this.deferredLocalEventsDuringDirectoryMove.clear();
+        this.deferredRemoteEventsDuringDirectoryMove.clear();
+        this.pendingLocalDirectoryMoveDiscoveries.clear();
         this.pendingInitialDocumentSubscriptions.clear();
         this.startupReplayGeneration = undefined;
         this.startupReplayPromise = undefined;
@@ -8410,6 +8439,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 throw retryError;
             }
         }
+        // A conflicted move no longer owns its transient socket paths. Release
+        // only events tagged with that exact journal, otherwise an old
+        // /final-style intermediate event can leak into a later move.
+        this.reclassifyDeferredRemoteEventsForDirectoryMoveConflict(relPath, generation);
     }
 
     private async clearSyncConflict(
@@ -12541,6 +12574,43 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         }
         return undefined;
     }
+
+    // A cross-parent basename change is performed by Overleaf as rename then
+    // move. The socket can therefore emit the old-parent intermediate as well
+    // as the source and final destination. These events carry no independent
+    // local intent while our durable folder-move journal is proving that exact
+    // entity; defer them and replay from the final VFS tree after rekeying.
+    private pendingDirectoryMoveCoveringRemoteEvent(
+        relPath: string,
+    ): {sourceRelPath: string; record: SyncManifestPendingDirectoryMoveOperation} | undefined {
+        for (const [sourceRelPath, operation] of Object.entries(
+            this.syncManifest?.pendingOperations ?? {},
+        )) {
+            if (
+                operation.kind!=='directory-move'
+                || this.touchesSyncConflict(sourceRelPath)
+                || this.touchesSyncConflict(operation.destinationRelPath)
+            ) {
+                // A retained conflicted journal is recovery evidence, not an
+                // active owner of a new socket event. In particular, another
+                // live move can share its transient rename basename.
+                continue;
+            }
+            const coveredPaths = [
+                sourceRelPath,
+                operation.destinationRelPath,
+                ...this.pendingLocalMoveIntermediateRelPaths(
+                    sourceRelPath,
+                    operation.destinationRelPath,
+                ),
+            ];
+            if (coveredPaths.some(path => this.isPathAtOrBelow(relPath, path))) {
+                return {sourceRelPath, record: operation};
+            }
+        }
+        return undefined;
+    }
+
     private replayDeferredLocalEventsAfterDirectoryMove(
         destinationRelPath: string,
         generation: number,
@@ -12561,6 +12631,101 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         }
     }
 
+
+    private deferRemoteEventDuringDirectoryMove(
+        relPath: string,
+        vfsUri: vscode.Uri,
+        type: 'update' | 'delete',
+        generation = this.syncGeneration,
+    ): boolean {
+        if (!this.isSyncSessionActive(generation)) { return false; }
+        const pendingDirectoryMove = this.pendingDirectoryMoveCoveringRemoteEvent(relPath);
+        if (pendingDirectoryMove===undefined) { return false; }
+        this.deferredRemoteEventsDuringDirectoryMove.set(relPath, {
+            sourceRelPath: pendingDirectoryMove.sourceRelPath,
+            destinationRelPath: pendingDirectoryMove.record.destinationRelPath,
+            operationId: pendingDirectoryMove.record.id,
+            latestType: type,
+            latestUri: vfsUri,
+        });
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [remote event deferred:pending-folder-move] ' +
+            relPath + ' under ' + pendingDirectoryMove.sourceRelPath +
+            ' -> ' + pendingDirectoryMove.record.destinationRelPath,
+        );
+        return true;
+    }
+
+    private replayDeferredRemoteEventsAfterDirectoryMove(
+        sourceRelPath: string,
+        record: SyncManifestPendingDirectoryMoveOperation,
+        generation: number,
+        reason: 'accepted' | 'conflict' = 'accepted',
+    ): void {
+        if (!this.isSyncSessionActive(generation)) { return; }
+        const deferred = [...this.deferredRemoteEventsDuringDirectoryMove]
+            .filter(([, pending]) =>
+                pending.operationId===record.id
+                && pending.sourceRelPath===sourceRelPath
+                && pending.destinationRelPath===record.destinationRelPath,
+            );
+        if (deferred.length===0) { return; }
+        for (const [relPath] of deferred) {
+            this.deferredRemoteEventsDuringDirectoryMove.delete(relPath);
+        }
+        // A conflict is created inside a per-path queue. Let that task settle
+        // before the reclassification queues ordinary remote work again.
+        const replay = () => {
+            if (!this.isSyncSessionActive(generation)) { return; }
+            for (const [relPath, pending] of deferred) {
+                getOutputChannel().appendLine(
+                    new Date().toISOString() +
+                    (reason==='accepted'
+                        ? ' [remote event replay:folder-move] '
+                        : ' [remote event reclassified:folder-move-conflict] ') +
+                    relPath,
+                );
+                this.syncFromVFS(pending.latestUri, pending.latestType);
+            }
+        };
+        if (reason==='conflict') {
+            setTimeout(replay, 0);
+        } else {
+            replay();
+        }
+    }
+
+    private reclassifyDeferredRemoteEventsForDirectoryMoveConflict(
+        conflictRelPath: string,
+        generation = this.syncGeneration,
+    ): void {
+        if (!this.isSyncSessionActive(generation)) { return; }
+        for (const [sourceRelPath, operation] of Object.entries(
+            this.syncManifest?.pendingOperations ?? {},
+        )) {
+            if (operation.kind!=='directory-move') { continue; }
+            const coveredPaths = [
+                sourceRelPath,
+                operation.destinationRelPath,
+                ...this.pendingLocalMoveIntermediateRelPaths(
+                    sourceRelPath,
+                    operation.destinationRelPath,
+                ),
+            ];
+            if (!coveredPaths.some(path =>
+                this.isPathAtOrBelow(conflictRelPath, path)
+                || this.isPathAtOrBelow(path, conflictRelPath),
+            )) {
+                continue;
+            }
+            this.replayDeferredRemoteEventsAfterDirectoryMove(
+                sourceRelPath,
+                operation,
+                generation,
+                'conflict',
+            );
+        }
+    }
 
     private touchesSyncConflict(relPath: string): boolean {
         return [...this.syncConflicts.keys()].some(path =>
@@ -16386,6 +16551,11 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
             throw new Error('Local Replica folder move journal changed before final acknowledgement.');
         }
         this.releasePendingLocalMoveDelete(sourceRelPath);
+        this.replayDeferredRemoteEventsAfterDirectoryMove(
+            sourceRelPath,
+            record,
+            generation,
+        );
         this.replayDeferredLocalEventsAfterDirectoryMove(
             destinationRelPath,
             generation,
@@ -16945,6 +17115,101 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
     }
 
 
+    // A creator can be an agent or compiler that writes again while its
+    // initial upload is awaiting the server response. Once the exact created
+    // entity and its original bytes are proven, that later local state is a
+    // normal guarded update/delete intent, not evidence that a collaborator
+    // won a same-name create race. Convert the durable create record before
+    // scheduling the follow-up so a reload cannot forget the entity binding.
+    private async promoteAcceptedPendingLocalFileCreateForLocalAdvance(
+        relPath: string,
+        record: SyncManifestPendingFileCreateOperation,
+        remoteIdentity: RemoteFilePathIdentity,
+        remoteContent: Uint8Array,
+        localState: PathRevision,
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        if (
+            !record.createdEntity
+            || !this.remoteFilePathIdentityMatches(
+                remoteIdentity,
+                record.createdEntity,
+                record.parentEntity,
+            )
+            || (localState.kind!=='file' && localState.kind!=='missing')
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'The accepted local file create could not be converted to a guarded follow-up intent.',
+            );
+        }
+        const current = this.syncManifest?.pendingOperations[relPath];
+        if (
+            !current
+            || current.kind!=='create'
+            || current.id!==record.id
+            || !current.createdEntity
+            || !this.remoteMoveEntityMatches(current.createdEntity, record.createdEntity)
+            || !this.remoteFolderIdentityMatches(current.parentEntity, record.parentEntity)
+        ) {
+            throw new Error(
+                'Local Replica file-create journal changed before its advanced local state was retained.',
+            );
+        }
+        const now = new Date().toISOString();
+        const promoted: SyncManifestPendingFileOperation = {
+            version: 2,
+            id: record.id,
+            kind: localState.kind==='file' ? 'update' : 'delete',
+            localKind: localState.kind==='file' ? 'file' : 'missing',
+            localRevision: localState.kind==='file'
+                ? localState.revision
+                : DELETE_DIGEST,
+            remoteKind: 'file',
+            remoteRevision: contentDigest(remoteContent),
+            targetEntity: {...record.createdEntity},
+            parentEntity: {...record.parentEntity},
+            createdAt: record.createdAt,
+            updatedAt: now,
+        };
+        this.syncManifest!.pendingOperations[relPath] = promoted;
+        // The manifest entry deliberately remains absent until a local
+        // snapshot matches its recorded bytes. baseCache is still the exact
+        // remote baseline, and the pending update carries the entity/parent
+        // proof required to upload the advanced local state safely.
+        this.removeSyncManifestEntry(relPath);
+        this.baseCache[relPath] = remoteContent;
+        this.seenLocalEntities.add(relPath);
+        this.setBypassCache(relPath, remoteContent, 'push');
+        this.clearRemoteDelete(relPath);
+        this.locallyDivergedPaths.add(relPath);
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+        // A real watcher event for the advanced bytes may already be queued.
+        // Its classifier reads the current path at execution time, so it is a
+        // stronger coalesced intent than manufacturing a second retry that can
+        // outlive teardown. If no event exists (for example a shell write on a
+        // degraded watcher), retain the durable retry ourselves.
+        if (!this.pendingLocalEvents.has(relPath)) {
+            this.scheduleLocalPushRetry(
+                relPath,
+                this.localUri(relPath),
+                'local-advanced-during-push',
+                generation,
+                localState.kind==='file' ? 'update' : 'delete',
+            );
+        }
+        getOutputChannel().appendLine(
+            new Date().toISOString() +
+            ' [pending file create advanced] ' +
+            relPath +
+            ' entity=' +
+            record.createdEntity.type +
+            ':' +
+            record.createdEntity.id,
+        );
+    }
+
     private async finalizeAcceptedPendingLocalFileCreate(
         relPath: string,
         record: SyncManifestPendingFileCreateOperation,
@@ -16965,23 +17230,43 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
                 'Overleaf file identity changed before the pending local create was verified.',
             );
         }
-        const [localState, remoteState] = await Promise.all([
+        let [localState, remoteState, verifiedIdentity] = await Promise.all([
             this.captureLocalPathRevision(relPath, generation),
             this.captureRemotePathRevision(relPath, generation),
+            this.resolveRemoteFilePathIdentity(this.vfs.pathToUri(relPath)),
         ]);
         this.requireSyncSession(generation);
         if (
-            localState.kind!=='file'
-            || localState.revision!==record.localRevision
-            || localState.content===undefined
-            || remoteState.kind!=='file'
+            remoteState.kind!=='file'
             || remoteState.revision!==record.localRevision
-            || !bytesEqual(localState.content, content)
+            || !this.remoteFilePathIdentityMatches(
+                verifiedIdentity,
+                record.createdEntity,
+                record.parentEntity,
+            )
         ) {
             throw new RemoteDocumentMergeConflictError(
-                'Local or Overleaf file contents changed before the pending local create was verified.',
+                'Overleaf changed the created file before its final postcondition was observed.',
             );
         }
+        const localMatchesCreatedRevision = (
+            localState.kind==='file'
+            && localState.revision===record.localRevision
+            && localState.content!==undefined
+            && bytesEqual(localState.content, content)
+        );
+        if (!localMatchesCreatedRevision) {
+            await this.promoteAcceptedPendingLocalFileCreateForLocalAdvance(
+                relPath,
+                record,
+                verifiedIdentity!,
+                content,
+                localState,
+                generation,
+            );
+            return;
+        }
+
         const stable = await this.recordSyncManifestEntry(
             relPath,
             this.vfs.pathToUri(relPath),
@@ -16990,9 +17275,38 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         );
         this.requireSyncSession(generation);
         if (!stable) {
-            throw new RemoteDocumentMergeConflictError(
-                'The local file changed while its pending create was being finalized.',
+            // recordSyncManifestEntry intentionally refuses to bless a path
+            // whose inode/bytes advanced while it was reading. Re-read both
+            // sides, retain the proven entity in a v2 update/delete journal,
+            // and let the keyed watcher retry the newest local state.
+            [localState, remoteState, verifiedIdentity] = await Promise.all([
+                this.captureLocalPathRevision(relPath, generation),
+                this.captureRemotePathRevision(relPath, generation),
+                this.resolveRemoteFilePathIdentity(this.vfs.pathToUri(relPath)),
+            ]);
+            this.requireSyncSession(generation);
+            if (
+                remoteState.kind!=='file'
+                || remoteState.revision!==record.localRevision
+                || !this.remoteFilePathIdentityMatches(
+                    verifiedIdentity,
+                    record.createdEntity,
+                    record.parentEntity,
+                )
+            ) {
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf changed while an advanced local file create was being finalized.',
+                );
+            }
+            await this.promoteAcceptedPendingLocalFileCreateForLocalAdvance(
+                relPath,
+                record,
+                verifiedIdentity!,
+                content,
+                localState,
+                generation,
             );
+            return;
         }
         // recordSyncManifestEntry has asynchronous local and remote reads. Make
         // the journal's exact entity/parent proof the final acceptance test.
@@ -17035,26 +17349,54 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         );
     }
 
+    private async refreshPendingLocalFileCreateForAdvancedLocalState(
+        relPath: string,
+        record: SyncManifestPendingFileCreateOperation,
+        localRevision: string,
+        generation = this.syncGeneration,
+    ): Promise<SyncManifestPendingFileCreateOperation> {
+        this.requireSyncSession(generation);
+        const current = this.syncManifest?.pendingOperations[relPath];
+        if (
+            !current
+            || current.kind!=='create'
+            || current.id!==record.id
+            || current.createdEntity!==undefined
+            || !this.remoteFolderIdentityMatches(current.parentEntity, record.parentEntity)
+        ) {
+            throw new Error(
+                'Local Replica file-create journal changed before its latest local revision was retained.',
+            );
+        }
+        if (current.localRevision===localRevision) {
+            return current;
+        }
+        const refreshed: SyncManifestPendingFileCreateOperation = {
+            ...current,
+            localRevision,
+            updatedAt: new Date().toISOString(),
+        };
+        this.syncManifest!.pendingOperations[relPath] = refreshed;
+        this.locallyDivergedPaths.add(relPath);
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+        getOutputChannel().appendLine(
+            new Date().toISOString() +
+            ' [pending file create refreshed] ' +
+            relPath +
+            ' local=' +
+            localRevision.slice(0, 12),
+        );
+        return refreshed;
+    }
+
     private async reconcilePendingLocalFileCreate(
         relPath: string,
         record: SyncManifestPendingFileCreateOperation,
         generation = this.syncGeneration,
     ): Promise<boolean> {
         this.requireSyncSession(generation);
-        const localState = await this.captureLocalPathRevision(relPath, generation);
-        if (
-            localState.kind!=='file'
-            || localState.revision!==record.localRevision
-            || localState.content===undefined
-        ) {
-            await this.markSyncConflict(
-                relPath,
-                'A pending local file create cannot replay because the local file changed or disappeared',
-                localState.kind==='file' ? localState.content : undefined,
-                generation,
-            );
-            return false;
-        }
+        let localState = await this.captureLocalPathRevision(relPath, generation);
         const remoteState = await this.captureRemotePathRevision(relPath, generation);
         this.requireSyncSession(generation);
         if (remoteState.kind==='file') {
@@ -17065,6 +17407,7 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
             if (
                 record.createdEntity!==undefined
                 && remoteState.revision===record.localRevision
+                && remoteState.content!==undefined
                 && this.remoteFilePathIdentityMatches(
                     actual,
                     record.createdEntity,
@@ -17072,7 +17415,11 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
                 )
             ) {
                 await this.finalizeAcceptedPendingLocalFileCreate(
-                    relPath, record, actual!, localState.content, generation,
+                    relPath,
+                    record,
+                    actual!,
+                    remoteState.content,
+                    generation,
                 );
                 return true;
             }
@@ -17081,7 +17428,7 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
                 record.createdEntity===undefined
                     ? 'Overleaf file appeared after an unacknowledged local create; its identity is not proven'
                     : 'Overleaf file identity or contents changed while the local create was being verified',
-                localState.content,
+                localState.kind==='file' ? localState.content : undefined,
                 generation,
                 remoteState,
             );
@@ -17091,7 +17438,7 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
             await this.markSyncConflict(
                 relPath,
                 'Overleaf path changed type while the local file create was pending',
-                localState.content,
+                localState.kind==='file' ? localState.content : undefined,
                 generation,
                 remoteState,
             );
@@ -17101,11 +17448,55 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
             await this.markSyncConflict(
                 relPath,
                 'The exact Overleaf file created for this local intent disappeared before it was verified',
-                localState.content,
+                localState.kind==='file' ? localState.content : undefined,
                 generation,
                 remoteState,
             );
             return false;
+        }
+        if (localState.kind==='missing') {
+            await this.removePendingLocalFileCreate(
+                relPath,
+                'the local create was withdrawn before Overleaf was mutated',
+                generation,
+                record,
+            );
+            this.locallyDivergedPaths.delete(relPath);
+            return true;
+        }
+        if (localState.kind!=='file' || localState.content===undefined) {
+            await this.markSyncConflict(
+                relPath,
+                'A pending local file create changed to an unsupported local path type',
+                undefined,
+                generation,
+                remoteState,
+            );
+            return false;
+        }
+        if (localState.revision!==record.localRevision) {
+            record = await this.refreshPendingLocalFileCreateForAdvancedLocalState(
+                relPath,
+                record,
+                localState.revision,
+                generation,
+            );
+            localState = await this.captureLocalPathRevision(relPath, generation);
+            this.requireSyncSession(generation);
+            if (
+                localState.kind!=='file'
+                || localState.content===undefined
+                || localState.revision!==record.localRevision
+            ) {
+                await this.markSyncConflict(
+                    relPath,
+                    'The local file kept changing while its pending create was refreshed',
+                    localState.kind==='file' ? localState.content : undefined,
+                    generation,
+                    remoteState,
+                );
+                return false;
+            }
         }
         const parentRelPath = nodePath.posix.dirname(relPath);
         const parentIdentity = await this.resolveRemoteFolderPathIdentity(
@@ -17185,6 +17576,7 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         );
         return true;
     }
+
     // Parent and child watcher events are independent queues. A child may
     // discover the parent after the mkdir POST but before its ID is persisted;
     // share that exact reconciliation rather than interpreting the half-finished
@@ -19630,7 +20022,8 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
             | 'unstable-read'
             | 'local-advanced-during-push'
             | 'local-advanced-before-echo-delete'
-            | 'compile-tree-advanced',
+            | 'compile-tree-advanced'
+            | 'unresolved-parent',
         generation: number,
         observedType: 'update' | 'delete' = 'update',
     ): void {
@@ -21915,6 +22308,9 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         // bypassSync check rejects them — wasting socket traffic and adding
         // retry/reconnect pressure during compile cycles.
         if (this.matchIgnorePatterns(relPath)) { return; }
+        if (this.deferRemoteEventDuringDirectoryMove(relPath, vfsUri, type, generation)) {
+            return;
+        }
         if (this.deferFolderConflictResolutionEvent(
             'remote',
             relPath,
@@ -21937,14 +22333,45 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
             const pending = this.pendingVfsEvents.get(relPath);
             if (!pending) { return; } // disposed or already drained
             this.pendingVfsEvents.delete(relPath);
+            // The event may have arrived just before the local watcher
+            // journaled a folder move. Re-check after debounce rather than
+            // letting an already queued pull bypass that durable fence.
+            if (this.deferRemoteEventDuringDirectoryMove(
+                relPath,
+                pending.latestUri,
+                pending.latestType,
+                generation,
+            )) {
+                return;
+            }
             const localUri = this.localUri(relPath);
             void this.enqueueSync(
                 relPath,
                 async () => {
+                    if (this.deferRemoteEventDuringDirectoryMove(
+                        relPath,
+                        pending.latestUri,
+                        pending.latestType,
+                        generation,
+                    )) {
+                        return undefined;
+                    }
                     let currentType = pending.latestType;
                     try {
                         currentType = await this.remoteTargetEventType(pending.latestUri);
                         this.requireSyncSession(generation);
+                        // A move can be journaled while the remote stat above
+                        // waits. It owns this path until it is accepted or
+                        // becomes a durable conflict, so never apply the stale
+                        // pull classification through its tree.
+                        if (this.deferRemoteEventDuringDirectoryMove(
+                            relPath,
+                            pending.latestUri,
+                            currentType,
+                            generation,
+                        )) {
+                            return undefined;
+                        }
                     } catch (error) {
                         this.retainRemotePullIntentAfterClassificationFailure(
                             relPath,
@@ -22349,6 +22776,70 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
     }
 
 
+    // A directory move often produces a child event first. Find the outermost
+    // local, untracked ancestor and let its inode/tree digest claim the
+    // matching missing tracked directory before the child can be journaled as
+    // a standalone create/update. Normal files beneath a tracked folder never
+    // enter this path.
+    private localDirectoryMoveDestinationRoot(
+        relPath: string,
+    ): string | undefined {
+        const manifest = this.syncManifest;
+        if (!manifest) { return undefined; }
+        let current = relPath;
+        let root: string | undefined;
+        while (current!=='/') {
+            if (
+                manifest.files[current]!==undefined
+                || manifest.directories[current]!==undefined
+                || manifest.pendingOperations[current]!==undefined
+            ) {
+                break;
+            }
+            root = current;
+            current = nodePath.posix.dirname(current);
+        }
+        return root;
+    }
+
+    private async tryApplyLocalDirectoryMoveFromDescendant(
+        relPath: string,
+        generation: number,
+    ): Promise<boolean> {
+        const destinationRoot = this.localDirectoryMoveDestinationRoot(relPath);
+        if (!destinationRoot) { return false; }
+        const existing = this.pendingLocalDirectoryMoveDiscoveries.get(destinationRoot);
+        if (existing) { return existing; }
+        let discovery!: Promise<boolean>;
+        discovery = this.tryApplyLocalDirectoryMove(
+            destinationRoot,
+            this.localUri(destinationRoot),
+            generation,
+        ).finally(() => {
+            if (this.pendingLocalDirectoryMoveDiscoveries.get(destinationRoot)===discovery) {
+                this.pendingLocalDirectoryMoveDiscoveries.delete(destinationRoot);
+            }
+        });
+        this.pendingLocalDirectoryMoveDiscoveries.set(destinationRoot, discovery);
+        return discovery;
+    }
+
+    // A child event whose direct parent has not acquired an authoritative
+    // folder identity must wait. This happens for a local recursive create
+    // (and is deliberately checked after the inode/tree move claim above).
+    // Let the parent mkdir/move settle instead of emitting a doomed child push.
+    private unresolvedLocalParentDirectory(relPath: string): string | undefined {
+        const parentRelPath = nodePath.posix.dirname(relPath);
+        if (parentRelPath==='/') { return undefined; }
+        const entry = this.syncManifest?.directories[parentRelPath];
+        const operation = this.syncManifest?.pendingOperations[parentRelPath];
+        return (
+            entry?.remoteEntity!==undefined
+            && entry.parentEntity!==undefined
+            && operation===undefined
+        ) ? undefined : parentRelPath;
+    }
+
     private async findLocalMoveSourceForDestination(
         destinationRelPath: string,
         destinationContent: Uint8Array,
@@ -22495,6 +22986,12 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
             generation,
         );
         if (!source) { return false; }
+        // Claim the exact inode/digest pair before any remote proof awaits.
+        // A sibling watcher queue may otherwise let the short source-delete
+        // candidate expire while this destination is waiting on a remote
+        // read. The matched destination is already a durable local fact; a
+        // failed remote proof will become a conflict, never a second delete.
+        this.releasePendingLocalMoveDelete(source.relPath);
         const sourceRemoteState = await this.captureMoveSourceRemoteStateOrDefer(
             source.relPath,
             source.entry,
@@ -22685,6 +23182,36 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
                         new Date().toISOString() + ' [local event deferred:pending-folder-move] ' +
                         relPath + ' under ' + pendingDirectoryMove.sourceRelPath +
                         ' -> ' + pendingDirectoryMove.record.destinationRelPath,
+                    );
+                    return undefined;
+                }
+                if (
+                    currentType==='update'
+                    && await this.tryApplyLocalDirectoryMoveFromDescendant(
+                        relPath,
+                        generation,
+                    )
+                ) {
+                    // The event was the pre-move tree itself. The completed
+                    // move rekeys its manifest state; an in-flight move keeps
+                    // its descendant events deferred through the existing
+                    // pendingDirectoryMoveCovering path.
+                    return undefined;
+                }
+                const unresolvedParent = currentType==='update'
+                    ? this.unresolvedLocalParentDirectory(relPath)
+                    : undefined;
+                if (unresolvedParent!==undefined) {
+                    getOutputChannel().appendLine(
+                        new Date().toISOString() + ' [local event deferred:unresolved-parent] ' +
+                        relPath + ' under ' + unresolvedParent,
+                    );
+                    this.scheduleLocalPushRetry(
+                        relPath,
+                        pending.latestUri,
+                        'unresolved-parent',
+                        generation,
+                        'update',
                     );
                     return undefined;
                 }

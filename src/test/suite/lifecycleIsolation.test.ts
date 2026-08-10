@@ -1678,6 +1678,19 @@ suite('Extension host and lifecycle isolation', () => {
                 '/Project/archive/images/plot.png',
             ].sort(),
         );
+
+        assert.strictEqual(
+            internals._resolveById('folder-figures')?.path.replace(/\/+$/, ''),
+            '/archive/images',
+        );
+        notifications.length = 0;
+        // Socket delivery can echo the two API calls after the local cache has
+        // already reached its final location. Those echoes must be idempotent.
+        handlers!.onFileRenamed('folder-figures', 'images');
+        handlers!.onFileMoved('folder-figures', 'folder-archive');
+        assert.strictEqual(notifications.length, 0);
+        assert.strictEqual(internals._resolveById('folder-figures')?.path.replace(/\/+$/, ''), '/archive/images');
+        assert.strictEqual(archive.folders.filter(folder => folder === figures).length, 1);
     });
 
     test('removes a remotely deleted nested folder from the cached VFS tree', () => {

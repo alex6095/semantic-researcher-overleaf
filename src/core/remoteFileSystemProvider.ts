@@ -884,6 +884,10 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const res = this._resolveById(entityId);
                 if (res) {
                     const {fileEntity} = res;
+                    // rename() updates this cache before a delayed socket echo
+                    // can arrive. Replaying the same basename change would only
+                    // emit a false delete/create pair, so it is an idempotent no-op.
+                    if (fileEntity.name===newName) { return; }
                     const oldPathWithoutTrailingSlash = res.path.replace(/\/+$/, '');
                     const parentPath = oldPathWithoutTrailingSlash.slice(
                         0,
@@ -914,6 +918,11 @@ export class VirtualFileSystem extends vscode.Disposable {
                 const newPath = this._resolveById(folderId);
                 if (oldPath && newPath) {
                     const newParentFolder = newPath.fileEntity as FolderEntity;
+                    // A successful local rename/move already placed this exact
+                    // entity in its destination parent. A delayed socket echo
+                    // must not insert (a no-op) and then remove it from that
+                    // same parent, which would corrupt the cached project tree.
+                    if (oldPath.parentFolder._id===newParentFolder._id) { return; }
                     this.insertEntity(newParentFolder, oldPath.fileType, oldPath.fileEntity);
                     this.removeEntity(oldPath.parentFolder, oldPath.fileType, oldPath.fileEntity);
                     this.notify([

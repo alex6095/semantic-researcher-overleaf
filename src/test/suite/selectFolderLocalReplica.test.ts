@@ -4148,6 +4148,325 @@ suite('Select Project Folder Local Replica', function () {
         assert.deepStrictEqual(scm.syncManifest.pendingOperations, {});
     });
 
+
+    test('claims a folder move before a child watcher event becomes a standalone operation', async function () {
+        this.timeout(20_000);
+        const remoteRoot = await tempDir('sr-overleaf-folder-move-child-first-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-move-child-first-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteSource = vscode.Uri.joinPath(remoteRoot, 'draft');
+        const remoteArchive = vscode.Uri.joinPath(remoteRoot, 'archive');
+        const remoteDestination = vscode.Uri.joinPath(remoteArchive, 'final');
+        const localSource = vscode.Uri.joinPath(localRoot, 'draft');
+        const localDestination = vscode.Uri.joinPath(localRoot, 'archive', 'final');
+        const localChild = vscode.Uri.joinPath(localDestination, 'nested', 'main.tex');
+        await writeText(vscode.Uri.joinPath(remoteSource, 'nested', 'main.tex'), 'child-first folder move');
+        await vscode.workspace.fs.createDirectory(remoteArchive);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('draft', 'folder-child-first-source');
+        fakeVfs.setEntityId('draft/nested', 'folder-child-first-nested');
+        fakeVfs.setEntityId('draft/nested/main.tex', 'doc-child-first-main');
+        fakeVfs.setEntityId('archive', 'folder-child-first-archive');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        let fileMoveJournals = 0;
+        const originalJournalFileMove = scm.journalPendingLocalFileMove.bind(scm);
+        scm.journalPendingLocalFileMove = async (...args: unknown[]) => {
+            fileMoveJournals += 1;
+            return originalJournalFileMove(...args);
+        };
+        try {
+            await vscode.workspace.fs.rename(localSource, localDestination, {overwrite: false});
+            // Real local watchers may deliver a descendant Change/Create before
+            // either the root destination or source unlink. It must claim the
+            // enclosing inode/tree move rather than journal a file mutation.
+            await scm.syncToVFS(localChild, 'update');
+            await scm.syncToVFS(localSource, 'delete');
+            await scm.syncToVFS(localDestination, 'update');
+            await new Promise<void>(resolve => setTimeout(resolve, 900));
+            await scm.drainPendingSyncWork();
+        } finally {
+            scm.journalPendingLocalFileMove = originalJournalFileMove;
+        }
+
+        assert.strictEqual(fileMoveJournals, 0);
+        assert.strictEqual(await pathExists(remoteSource), false);
+        assert.strictEqual(
+            await readText(vscode.Uri.joinPath(remoteDestination, 'nested', 'main.tex')),
+            'child-first folder move',
+        );
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(remoteDestination)).fileEntity._id,
+            'folder-child-first-source',
+        );
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(vscode.Uri.joinPath(remoteDestination, 'nested'))).fileEntity._id,
+            'folder-child-first-nested',
+        );
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(vscode.Uri.joinPath(remoteDestination, 'nested', 'main.tex'))).fileEntity._id,
+            'doc-child-first-main',
+        );
+        assert.strictEqual(scm.syncManifest.directories['/draft'], undefined);
+        assert.strictEqual(scm.syncManifest.files['/draft/nested/main.tex'], undefined);
+        assert.strictEqual(
+            scm.syncManifest.directories['/archive/final'].remoteEntity.id,
+            'folder-child-first-source',
+        );
+        assert.strictEqual(
+            scm.syncManifest.files['/archive/final/nested/main.tex'].remoteEntity.id,
+            'doc-child-first-main',
+        );
+        assert.deepStrictEqual(scm.syncManifest.pendingOperations, {});
+        assert.strictEqual(scm.syncConflicts.has('/archive/final'), false);
+    });
+
+
+    test('defers transient remote folder-move events until the local journal finalizes', async function () {
+        this.timeout(20_000);
+        const remoteRoot = await tempDir('sr-overleaf-folder-move-remote-echo-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-move-remote-echo-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteSource = vscode.Uri.joinPath(remoteRoot, 'draft');
+        const remoteArchive = vscode.Uri.joinPath(remoteRoot, 'archive');
+        const remoteDestination = vscode.Uri.joinPath(remoteArchive, 'final');
+        const localSource = vscode.Uri.joinPath(localRoot, 'draft');
+        const localDestination = vscode.Uri.joinPath(localRoot, 'archive', 'final');
+        await writeText(
+            vscode.Uri.joinPath(remoteSource, 'nested', 'main.tex'),
+            'remote echo fence',
+        );
+        await vscode.workspace.fs.createDirectory(remoteArchive);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('draft', 'folder-remote-echo-source');
+        fakeVfs.setEntityId('draft/nested', 'folder-remote-echo-nested');
+        fakeVfs.setEntityId('draft/nested/main.tex', 'doc-remote-echo-main');
+        fakeVfs.setEntityId('archive', 'folder-remote-echo-archive');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        // A stale conflicted move may have the same root-level intermediate
+        // basename. It is retained as evidence but cannot fence the live move.
+        scm.syncManifest.pendingOperations['/stale'] = {
+            id: 'stale-conflicted-folder-move',
+            kind: 'directory-move',
+            destinationRelPath: '/stale-archive/final',
+        };
+        scm.syncConflicts.set('/stale-archive/final', 'stale test conflict');
+
+        const remoteEventUri = (relPath: string) => vscode.Uri.parse(
+            ROOT_NAME + '://test-server/Select%20Folder%20Test/' + relPath +
+            '?user=test-user&project=test-project',
+        );
+        const originalRemoteTargetEventType = scm.remoteTargetEventType.bind(scm);
+        scm.remoteTargetEventType = async (uri: vscode.Uri) => {
+            if (uri.path.includes('/final')) { return 'delete'; }
+            return originalRemoteTargetEventType(uri);
+        };
+        const originalApplySync = scm.applySync.bind(scm);
+        let pullBeforeFinalization = 0;
+        let finalized = false;
+        scm.applySync = async (...args: unknown[]) => {
+            if (args[0]==='pull' && !finalized) {
+                pullBeforeFinalization += 1;
+            }
+            return originalApplySync(...args);
+        };
+        const originalFinalize = scm.finalizeAcceptedLocalDirectoryMove.bind(scm);
+        scm.finalizeAcceptedLocalDirectoryMove = async (...args: unknown[]) => {
+            assert.strictEqual(pullBeforeFinalization, 0);
+            const result = await originalFinalize(...args);
+            finalized = true;
+            return result;
+        };
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let injected = false;
+        fakeVfs.rename = async (...args: Parameters<FakeVirtualFileSystem['rename']>) => {
+            if (!injected) {
+                injected = true;
+                // The first server operation renames /draft to the temporary
+                // old-parent path /final before moving it under /archive.
+                // It and its child path must not become pull work while the
+                // folder-move journal is still proving the final entity.
+                assert.ok(scm.pendingDirectoryMoveCoveringRemoteEvent('/draft/nested'));
+                assert.ok(scm.pendingDirectoryMoveCoveringRemoteEvent('/archive/final/nested'));
+                const intermediateFence = scm.pendingDirectoryMoveCoveringRemoteEvent('/final/nested');
+                assert.strictEqual(intermediateFence?.sourceRelPath, '/draft');
+                scm.syncFromVFS(remoteEventUri('final'), 'update');
+                scm.syncFromVFS(remoteEventUri('final/nested'), 'update');
+                scm.syncFromVFS(remoteEventUri('final/nested/main.tex'), 'update');
+                delete scm.syncManifest.pendingOperations['/stale'];
+                scm.syncConflicts.delete('/stale-archive/final');
+                await new Promise<void>(resolve => setTimeout(resolve, 400));
+            }
+            return originalRename(...args);
+        };
+        try {
+            await vscode.workspace.fs.rename(localSource, localDestination, {overwrite: false});
+            await scm.syncToVFS(localSource, 'delete');
+            await scm.syncToVFS(localDestination, 'update');
+            await new Promise<void>(resolve => setTimeout(resolve, 1_000));
+            await scm.drainPendingSyncWork();
+        } finally {
+            fakeVfs.rename = originalRename;
+            scm.finalizeAcceptedLocalDirectoryMove = originalFinalize;
+            scm.applySync = originalApplySync;
+            scm.remoteTargetEventType = originalRemoteTargetEventType;
+        }
+
+        assert.strictEqual(injected, true);
+        assert.strictEqual(finalized, true);
+        assert.strictEqual(pullBeforeFinalization, 0);
+        assert.strictEqual(await pathExists(vscode.Uri.joinPath(remoteRoot, 'final')), false);
+        assert.strictEqual(
+            await readText(vscode.Uri.joinPath(remoteDestination, 'nested', 'main.tex')),
+            'remote echo fence',
+        );
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(remoteDestination)).fileEntity._id,
+            'folder-remote-echo-source',
+        );
+        assert.deepStrictEqual(scm.syncManifest.pendingOperations, {});
+        assert.strictEqual(scm.syncConflicts.has('/archive/final'), false);
+        assert.strictEqual(scm.deferredRemoteEventsDuringDirectoryMove.size, 0);
+    });
+
+
+    test('fences a debounced remote folder-move echo after its journal appears and reclassifies it on conflict', async function () {
+        this.timeout(20_000);
+        const remoteRoot = await tempDir('sr-overleaf-folder-move-debounce-fence-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-move-debounce-fence-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        await writeText(
+            vscode.Uri.joinPath(remoteRoot, 'draft', 'nested', 'main.tex'),
+            'debounced remote echo',
+        );
+        await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(remoteRoot, 'archive'));
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('draft', 'folder-debounce-source');
+        fakeVfs.setEntityId('draft/nested', 'folder-debounce-nested');
+        fakeVfs.setEntityId('draft/nested/main.tex', 'doc-debounce-main');
+        fakeVfs.setEntityId('archive', 'folder-debounce-archive');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const remoteEventUri = vscode.Uri.parse(
+            ROOT_NAME + '://test-server/Select%20Folder%20Test/final/nested/main.tex' +
+            '?user=test-user&project=test-project',
+        );
+        const originalRemoteTargetEventType = scm.remoteTargetEventType.bind(scm);
+        const originalApplySync = scm.applySync.bind(scm);
+        let pullCalls = 0;
+        scm.remoteTargetEventType = async () => 'delete';
+        scm.applySync = async (...args: unknown[]) => {
+            if (args[0]==='pull') {
+                pullCalls += 1;
+            }
+            return undefined;
+        };
+        try {
+            // This socket event precedes the local move journal and is already
+            // debounced. The timer must re-check the journal before it turns
+            // into stale pull work.
+            scm.syncFromVFS(remoteEventUri, 'update');
+            assert.strictEqual(
+                scm.pendingVfsEvents.has('/final/nested/main.tex'),
+                true,
+            );
+
+            const sourceEntry = scm.syncManifest.directories['/draft'];
+            const destinationParent = scm.syncManifest.directories['/archive'].remoteEntity;
+            const sourceRevision = scm.manifestDirectoryRevision('/draft');
+            assert.ok(sourceEntry);
+            assert.ok(destinationParent);
+            assert.ok(sourceRevision);
+            const record = await scm.journalPendingLocalDirectoryMove(
+                '/draft',
+                '/archive/final',
+                sourceEntry,
+                sourceRevision,
+                destinationParent,
+            );
+
+            await new Promise<void>(resolve => setTimeout(resolve, 450));
+            assert.strictEqual(pullCalls, 0);
+            const deferred = scm.deferredRemoteEventsDuringDirectoryMove
+                .get('/final/nested/main.tex');
+            assert.strictEqual(deferred?.operationId, record.id);
+            assert.strictEqual(deferred?.sourceRelPath, '/draft');
+            assert.strictEqual(deferred?.destinationRelPath, '/archive/final');
+
+            // Once the move becomes a durable conflict, its tag is released
+            // and the same remote event is reclassified. It cannot remain in
+            // the map to be replayed by a later /final intermediate move.
+            await scm.markSyncConflict(
+                '/archive/final',
+                'test-only folder move conflict',
+            );
+            await new Promise<void>(resolve => setTimeout(resolve, 450));
+            assert.strictEqual(
+                scm.deferredRemoteEventsDuringDirectoryMove.size,
+                0,
+            );
+            assert.strictEqual(pullCalls, 1);
+        } finally {
+            scm.applySync = originalApplySync;
+            scm.remoteTargetEventType = originalRemoteTargetEventType;
+        }
+    });
+
+
+    test('defers child watcher events until local parent folders are replicated', async function () {
+        this.timeout(20_000);
+        const remoteRoot = await tempDir('sr-overleaf-recursive-create-remote-');
+        const localRoot = await tempDir('sr-overleaf-recursive-create-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const localTree = vscode.Uri.joinPath(localRoot, 'generated');
+        const localNested = vscode.Uri.joinPath(localTree, 'nested');
+        const localChild = vscode.Uri.joinPath(localNested, 'main.tex');
+        const remoteNested = vscode.Uri.joinPath(remoteRoot, 'generated', 'nested');
+        const remoteChild = vscode.Uri.joinPath(remoteNested, 'main.tex');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.createDirectory(localNested);
+        await writeText(localChild, 'recursive local create');
+        let childPushBeforeParent = false;
+        const originalApplySync = scm.applySync.bind(scm);
+        scm.applySync = async (...args: unknown[]) => {
+            if (
+                args[0]==='push'
+                && args[2]==='/generated/nested/main.tex'
+                && !(await pathExists(remoteNested))
+            ) {
+                childPushBeforeParent = true;
+            }
+            return originalApplySync(...args);
+        };
+        try {
+            // File-system watcher ordering is intentionally child-first.
+            await scm.syncToVFS(localChild, 'update');
+            await scm.syncToVFS(localNested, 'update');
+            await scm.syncToVFS(localTree, 'update');
+            await new Promise<void>(resolve => setTimeout(resolve, 1_200));
+            await scm.drainPendingSyncWork();
+        } finally {
+            scm.applySync = originalApplySync;
+        }
+
+        assert.strictEqual(childPushBeforeParent, false);
+        assert.strictEqual(await readText(remoteChild), 'recursive local create');
+        assert.deepStrictEqual(scm.syncManifest.pendingOperations, {});
+        assert.strictEqual(scm.syncConflicts.has('/generated'), false);
+        assert.strictEqual(scm.syncConflicts.has('/generated/nested/main.tex'), false);
+    });
+
     test('keeps an accepted folder move journal when a conflict arrives before final rekey', async function () {
         this.timeout(20_000);
         const remoteRoot = await tempDir('sr-overleaf-folder-move-final-conflict-remote-');
@@ -4950,6 +5269,62 @@ suite('Select Project Folder Local Replica', function () {
             assert.strictEqual(scm.status.status, 'idle');
         } finally {
             triggers.forEach(trigger => trigger.dispose());
+        }
+    });
+
+    test('keeps a delayed binary local move from racing its held source delete', async function () {
+        this.timeout(20_000);
+        const remoteRoot = await tempDir('sr-overleaf-local-move-delayed-source-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-move-delayed-source-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteOld = vscode.Uri.joinPath(remoteRoot, 'draft.png');
+        const remoteNew = vscode.Uri.joinPath(remoteRoot, 'final.png');
+        const localOld = vscode.Uri.joinPath(localRoot, 'draft.png');
+        const localNew = vscode.Uri.joinPath(localRoot, 'final.png');
+        const png = Buffer.from([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+            0x00, 0x00, 0x00, 0x00,
+        ]);
+        await writeBytes(remoteOld, png);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('', 'delayed-move-root');
+        fakeVfs.setEntityId('draft.png', 'delayed-move-file');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const internals = scm as any;
+        const originalCapture = internals.captureMoveSourceRemoteStateOrDefer.bind(scm);
+        let captureEntered = false;
+        internals.captureMoveSourceRemoteStateOrDefer = async (...args: unknown[]) => {
+            captureEntered = true;
+            await new Promise<void>(resolve => setTimeout(resolve, 800));
+            return originalCapture(...args);
+        };
+        try {
+            await vscode.workspace.fs.rename(localOld, localNew, {overwrite: false});
+            const sourceSync = internals.syncToVFS(localOld, 'delete');
+            const destinationSync = internals.syncToVFS(localNew, 'update');
+            await waitUntil(() => captureEntered, 3_000);
+            // This deliberately outlasts the 500ms delete-candidate timer.
+            // If the destination does not claim its matching source before
+            // waiting for remote proof, an ordinary delete journal overwrites
+            // the move and leaves a false conflict.
+            await new Promise<void>(resolve => setTimeout(resolve, 650));
+            await Promise.all([sourceSync, destinationSync]);
+            await internals.drainPendingSyncWork();
+
+            assert.strictEqual(await pathExists(remoteOld), false);
+            assert.deepStrictEqual(await readBytes(remoteNew), png);
+            assert.strictEqual(
+                (await fakeVfs._resolveUri(remoteNew)).fileEntity._id,
+                'delayed-move-file',
+            );
+            assert.strictEqual(internals.syncConflicts.get('/draft.png'), undefined);
+            assert.strictEqual(internals.syncConflicts.get('/final.png'), undefined);
+            assert.deepStrictEqual(internals.syncManifest.pendingOperations, {});
+        } finally {
+            internals.captureMoveSourceRemoteStateOrDefer = originalCapture;
         }
     });
 
@@ -6031,7 +6406,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(await pathExists(remoteFile), false);
     });
 
-    test('keeps a pending local file create when the agent advances its local bytes', async () => {
+    test('replays an agent-advanced local file create with the latest bytes', async () => {
         const remoteRoot = await tempDir('sr-overleaf-file-create-advance-remote-');
         const localRoot = await tempDir('sr-overleaf-file-create-advance-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -6051,12 +6426,9 @@ suite('Select Project Folder Local Replica', function () {
         await writeText(localFile, 'agent revision two');
         await internals.reconcilePendingFilePushOperations();
 
-        assert.match(internals.syncConflicts.get('/agent.tex'), /local file changed/i);
-        assert.strictEqual(
-            internals.syncManifest.pendingOperations['/agent.tex'].kind,
-            'create',
-        );
-        assert.strictEqual(await pathExists(remoteFile), false);
+        assert.strictEqual(internals.syncConflicts.get('/agent.tex'), undefined);
+        assert.strictEqual(internals.syncManifest.pendingOperations['/agent.tex'], undefined);
+        assert.strictEqual(await readText(remoteFile), 'agent revision two');
         assert.strictEqual(await readText(localFile), 'agent revision two');
     });
     test('journals and verifies a local folder create by authoritative entity id', async () => {
@@ -15319,11 +15691,20 @@ suite('Select Project Folder Local Replica', function () {
                 () => destinationWrites>=2 && inFlightDestinationWrites===0,
                 5000,
             );
+            await new Promise<void>(resolve => setTimeout(resolve, 350));
             assert.strictEqual((await rootPush).outcome, 'success');
             assert.strictEqual(maxInFlightDestinationWrites, 1);
             assert.strictEqual(
                 await readText(vscode.Uri.joinPath(remoteRoot, 'destination', 'chapter.tex')),
                 'second local revision',
+            );
+            // The initial create is proven by its exact entity, then the
+            // second writer revision becomes a normal guarded update. It must
+            // not survive as a false same-name-create conflict or journal.
+            assert.strictEqual((scm as any).syncConflicts.has('/destination/chapter.tex'), false);
+            assert.strictEqual(
+                (scm as any).syncManifest.pendingOperations['/destination/chapter.tex'],
+                undefined,
             );
         } finally {
             releaseFirstWrite();
