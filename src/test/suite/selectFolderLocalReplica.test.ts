@@ -505,6 +505,7 @@ suite('Select Project Folder Local Replica', function () {
     let originalShowWarningMessage: typeof vscode.window.showWarningMessage;
     let originalShowInformationMessage: typeof vscode.window.showInformationMessage;
     let originalShowErrorMessage: typeof vscode.window.showErrorMessage;
+    let originalShowQuickPick: typeof vscode.window.showQuickPick;
     test('filters configured extension output folders, not source PDF filenames', () => {
         assert.strictEqual(isLocalReplicaCompileOutputPath('/.output/output.pdf'), true);
         assert.strictEqual(isLocalReplicaCompileOutputPath('/main.pdf'), false);
@@ -555,6 +556,46 @@ suite('Select Project Folder Local Replica', function () {
         },
     } as vscode.Memento;
 
+    async function createBinaryConflictFixture(
+        prefix: string,
+        relativePath = 'figure.png',
+    ) {
+        const remoteRoot = await tempDir('sr-overleaf-' + prefix + '-remote-');
+        const localRoot = await tempDir('sr-overleaf-' + prefix + '-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const relPath = '/' + relativePath.split('/').filter(Boolean).join('/');
+        const segments = relPath.split('/').filter(Boolean);
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, ...segments);
+        const localImage = vscode.Uri.joinPath(localRoot, ...segments);
+        const baseline = Buffer.from([1, 2, 3]);
+        const localContent = Buffer.from([4, 5, 6]);
+        const remoteContent = Buffer.from([7, 8, 9]);
+        await writeBytes(remoteImage, baseline);
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, localContent);
+        await writeBytes(remoteImage, remoteContent);
+        const conflict = await (scm as any).applySync(
+            'pull',
+            'update',
+            relPath,
+            remoteImage,
+            localImage,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflict.outcome, 'blocked');
+        assert.ok((scm as any).syncConflicts.has(relPath));
+        return {
+            scm,
+            relPath,
+            remoteRoot,
+            localRoot,
+            remoteImage,
+            localImage,
+            localContent,
+            remoteContent,
+        };
+    }
+
     setup(() => {
         localReplicaWorkspaceState.clear();
         restoreLocalReplicaWorkspaceContext = localReplicaWorkspace.configureLocalReplicaWorkspace({
@@ -564,6 +605,7 @@ suite('Select Project Folder Local Replica', function () {
         originalShowWarningMessage = vscode.window.showWarningMessage;
         originalShowInformationMessage = vscode.window.showInformationMessage;
         originalShowErrorMessage = vscode.window.showErrorMessage;
+        originalShowQuickPick = vscode.window.showQuickPick;
         originalShowTextDocument = vscode.window.showTextDocument;
         originalCreateFileSystemWatcher = vscode.workspace.createFileSystemWatcher;
         originalExecuteCommand = vscode.commands.executeCommand;
@@ -584,6 +626,7 @@ suite('Select Project Folder Local Replica', function () {
         (vscode.window as any).showWarningMessage = originalShowWarningMessage;
         (vscode.window as any).showInformationMessage = originalShowInformationMessage;
         (vscode.window as any).showErrorMessage = originalShowErrorMessage;
+        (vscode.window as any).showQuickPick = originalShowQuickPick;
         (vscode.window as any).showTextDocument = originalShowTextDocument;
         (vscode.workspace as any).createFileSystemWatcher = originalCreateFileSystemWatcher;
         (vscode.commands as any).executeCommand = originalExecuteCommand;
@@ -3867,7 +3910,7 @@ suite('Select Project Folder Local Replica', function () {
         );
         const interruptedManifest = JSON.parse(await readText(manifestUri));
         const pending = interruptedManifest.pendingOperations['/main.tex'];
-        assert.strictEqual(interruptedManifest.version, 9);
+        assert.strictEqual(interruptedManifest.version, 10);
         assert.strictEqual(pending.kind, 'update');
         assert.strictEqual(pending.localKind, 'file');
         assert.strictEqual(pending.localRevision, sha1('offline local update'));
@@ -3989,7 +4032,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), false);
     });
 
-    test('migrates a version 2 manifest to the version 9 identity schema', async () => {
+    test('migrates a version 2 manifest to the version 10 resolution schema', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-v3-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-v3-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -4011,11 +4054,11 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 9);
+        assert.strictEqual(migratedManifest.version, 10);
         assert.deepStrictEqual(migratedManifest.pendingOperations, {});
     });
 
-    test('records remote entity and stable local inode identities in manifest v9', async () => {
+    test('records remote entity and stable local inode identities in manifest v10', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-identity-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-identity-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -4034,7 +4077,7 @@ suite('Select Project Folder Local Replica', function () {
             REPLICA_SETTINGS_DIR,
             'sync-manifest.json',
         )));
-        assert.strictEqual(manifest.version, 9);
+        assert.strictEqual(manifest.version, 10);
         assert.deepStrictEqual(manifest.files['/main.tex'].remoteEntity, {id: 'doc-main', type: 'doc'});
         assert.deepStrictEqual(manifest.files['/figure.png'].remoteEntity, {id: 'file-figure', type: 'file'});
         for (const entry of [
@@ -5476,6 +5519,528 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(
             (scm as any).syncManifest.conflicts['/figure.png'].remoteRevision,
             sha1(secondRemote),
+        );
+    });
+
+    test('applies verified Overleaf binary state locally without mutating Overleaf', async () => {
+        const fixture = await createBinaryConflictFixture('keep-overleaf-binary');
+
+        const result = await fixture.scm.resolveConflictWithOverleafState(
+            '/figure.png',
+            false,
+        );
+
+        assert.strictEqual(result.resolved, true);
+        assert.strictEqual(result.artifactRelPath, undefined);
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.remoteContent);
+        assert.deepStrictEqual(await readBytes(fixture.remoteImage), fixture.remoteContent);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/figure.png'), false);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.conflicts['/figure.png'],
+            undefined,
+        );
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.conflictResolutions['/figure.png'],
+            undefined,
+        );
+        const history = (fixture.scm as any).syncManifest.conflictResolutionHistory;
+        assert.strictEqual(history.at(-1).choice, 'keep-overleaf');
+        assert.strictEqual(history.at(-1).outcome, 'completed');
+        assert.strictEqual(history.at(-1).artifactRelPath, undefined);
+    });
+
+    test('preserves a binary local conflict copy in ignored metadata for Keep Both', async () => {
+        const fixture = await createBinaryConflictFixture('keep-both-binary');
+
+        const result = await fixture.scm.resolveConflictWithOverleafState(
+            '/figure.png',
+            true,
+        );
+
+        assert.strictEqual(result.resolved, true);
+        assert.match(
+            result.artifactRelPath!,
+            /^\/\.semantic-researcher-overleaf\/conflicts\/[a-f0-9]{32}\/local\/figure\.png$/,
+        );
+        const artifact = uriForRelPath(fixture.localRoot, result.artifactRelPath!);
+        assert.deepStrictEqual(await readBytes(artifact), fixture.localContent);
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.remoteContent);
+        assert.deepStrictEqual(await readBytes(fixture.remoteImage), fixture.remoteContent);
+        assert.strictEqual(
+            await pathExists(vscode.Uri.joinPath(
+                fixture.remoteRoot,
+                REPLICA_SETTINGS_DIR,
+                'conflicts',
+            )),
+            false,
+        );
+        const history = (fixture.scm as any).syncManifest.conflictResolutionHistory;
+        assert.strictEqual(history.at(-1).choice, 'keep-both');
+        assert.strictEqual(history.at(-1).outcome, 'completed');
+        assert.strictEqual(history.at(-1).artifactRelPath, result.artifactRelPath);
+    });
+
+    test('applies a verified Overleaf binary deletion and preserves the local copy for Keep Both', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-keep-both-delete-remote-');
+        const localRoot = await tempDir('sr-overleaf-keep-both-delete-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        const localContent = Buffer.from([4, 5, 6]);
+        await writeBytes(remoteImage, Buffer.from([1, 2, 3]));
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, localContent);
+        await vscode.workspace.fs.delete(remoteImage);
+
+        const conflict = await (scm as any).applySync(
+            'pull',
+            'delete',
+            '/figure.png',
+            remoteImage,
+            localImage,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflict.outcome, 'blocked');
+
+        const result = await scm.resolveConflictWithOverleafState('/figure.png', true);
+
+        assert.strictEqual(result.resolved, true);
+        assert.ok(result.artifactRelPath);
+        assert.strictEqual(await pathExists(localImage), false);
+        assert.strictEqual(await pathExists(remoteImage), false);
+        assert.deepStrictEqual(
+            await readBytes(uriForRelPath(localRoot, result.artifactRelPath!)),
+            localContent,
+        );
+        assert.strictEqual((scm as any).syncConflicts.has('/figure.png'), false);
+    });
+
+    test('refuses Keep Overleaf after a same-byte local atomic recreate changes inode', async () => {
+        const fixture = await createBinaryConflictFixture('keep-overleaf-inode');
+        const originalWrite = (fixture.scm as any).writeLocalFileIfRevision.bind(fixture.scm);
+        let injected = false;
+        (fixture.scm as any).writeLocalFileIfRevision = async (
+            relPath: string,
+            ...args: unknown[]
+        ) => {
+            if (relPath==='/figure.png' && !injected) {
+                injected = true;
+                const replacement = vscode.Uri.joinPath(
+                    fixture.localRoot,
+                    'same-content-atomic-replace.tmp',
+                );
+                await writeBytes(replacement, fixture.localContent);
+                await fs.rename(replacement.fsPath, fixture.localImage.fsPath);
+            }
+            return originalWrite(relPath, ...args);
+        };
+
+        const result = await fixture.scm.resolveConflictWithOverleafState(
+            '/figure.png',
+            false,
+        );
+
+        assert.strictEqual(injected, true);
+        assert.strictEqual(result.resolved, false);
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.localContent);
+        assert.deepStrictEqual(await readBytes(fixture.remoteImage), fixture.remoteContent);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/figure.png'), true);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.conflictResolutions['/figure.png'].phase,
+            'blocked',
+        );
+    });
+
+    test('blocks Keep Both before local mutation when Overleaf advances during its proof', async () => {
+        const fixture = await createBinaryConflictFixture('keep-both-remote-proof');
+        const secondRemote = Buffer.from([10, 11, 12]);
+        const fakeVfs = (fixture.scm as any).vfs;
+        const originalReconnect = fakeVfs.reconnect.bind(fakeVfs);
+        let injected = false;
+        fakeVfs.reconnect = async (reason?: string) => {
+            if (
+                !injected
+                && reason==='verify remote conflict decision: /figure.png'
+            ) {
+                injected = true;
+                await writeBytes(fixture.remoteImage, secondRemote);
+            }
+            return originalReconnect(reason);
+        };
+
+        const result = await fixture.scm.resolveConflictWithOverleafState(
+            '/figure.png',
+            true,
+        );
+
+        assert.strictEqual(injected, true);
+        assert.strictEqual(result.resolved, false);
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.localContent);
+        assert.deepStrictEqual(await readBytes(fixture.remoteImage), secondRemote);
+        const record = (fixture.scm as any).syncManifest.conflictResolutions['/figure.png'];
+        assert.strictEqual(record.phase, 'blocked');
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.conflicts['/figure.png'].remoteRevision,
+            sha1(secondRemote),
+        );
+        assert.strictEqual(
+            await pathExists(uriForRelPath(fixture.localRoot, record.artifactRelPath)),
+            false,
+        );
+    });
+
+    test('keeps the conflict open when Overleaf advances after canonical local replacement', async () => {
+        const fixture = await createBinaryConflictFixture('keep-both-final-remote-race');
+        const secondRemote = Buffer.from([10, 11, 12]);
+        const originalWrite = (fixture.scm as any).writeLocalFileIfRevision.bind(fixture.scm);
+        let injected = false;
+        (fixture.scm as any).writeLocalFileIfRevision = async (
+            relPath: string,
+            ...args: unknown[]
+        ) => {
+            const written = await originalWrite(relPath, ...args);
+            if (relPath==='/figure.png' && written && !injected) {
+                injected = true;
+                await writeBytes(fixture.remoteImage, secondRemote);
+            }
+            return written;
+        };
+
+        const result = await fixture.scm.resolveConflictWithOverleafState(
+            '/figure.png',
+            true,
+        );
+
+        assert.strictEqual(injected, true);
+        assert.strictEqual(result.resolved, false);
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.remoteContent);
+        assert.deepStrictEqual(await readBytes(fixture.remoteImage), secondRemote);
+        const record = (fixture.scm as any).syncManifest.conflictResolutions['/figure.png'];
+        assert.strictEqual(record.phase, 'blocked');
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.conflicts['/figure.png'].remoteRevision,
+            sha1(secondRemote),
+        );
+        assert.deepStrictEqual(
+            await readBytes(uriForRelPath(fixture.localRoot, record.artifactRelPath)),
+            fixture.localContent,
+        );
+    });
+
+    test('recovers a local-preserved Keep Both transaction after restart', async () => {
+        const fixture = await createBinaryConflictFixture('keep-both-restart');
+        const originalInstall = (fixture.scm as any)
+            .installConflictResolutionRemoteState.bind(fixture.scm);
+        (fixture.scm as any).installConflictResolutionRemoteState = async () => false;
+
+        try {
+            await fixture.scm.resolveConflictWithOverleafState('/figure.png', true);
+        } finally {
+            (fixture.scm as any).installConflictResolutionRemoteState = originalInstall;
+        }
+        const interrupted = (fixture.scm as any).syncManifest
+            .conflictResolutions['/figure.png'];
+        assert.strictEqual(interrupted.phase, 'local-preserved');
+        assert.deepStrictEqual(
+            await readBytes(uriForRelPath(fixture.localRoot, interrupted.artifactRelPath)),
+            fixture.localContent,
+        );
+
+        await fixture.scm.deactivate();
+        const restarted = createSCM(fixture.remoteRoot, fixture.localRoot);
+        assert.strictEqual(
+            await restarted.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.remoteContent);
+        assert.deepStrictEqual(await readBytes(fixture.remoteImage), fixture.remoteContent);
+        assert.deepStrictEqual(
+            await readBytes(uriForRelPath(fixture.localRoot, interrupted.artifactRelPath)),
+            fixture.localContent,
+        );
+        assert.strictEqual((restarted as any).syncConflicts.has('/figure.png'), false);
+        assert.strictEqual(
+            (restarted as any).syncManifest.conflictResolutions['/figure.png'],
+            undefined,
+        );
+        const history = (restarted as any).syncManifest.conflictResolutionHistory;
+        assert.strictEqual(history.at(-1).choice, 'keep-both');
+        assert.strictEqual(history.at(-1).outcome, 'completed');
+    });
+
+    test('recovers Keep Both when canonical local replacement finished before its phase persisted', async () => {
+        const fixture = await createBinaryConflictFixture('keep-both-canonical-write-restart');
+        const originalSetPhase = (fixture.scm as any).setConflictResolutionPhase.bind(fixture.scm);
+        (fixture.scm as any).setConflictResolutionPhase = (
+            ...args: unknown[]
+        ) => args[1]==='canonical-applied'
+            ? false
+            : originalSetPhase(...args);
+
+        let result: any;
+        try {
+            result = await fixture.scm.resolveConflictWithOverleafState(
+                '/figure.png',
+                true,
+            );
+        } finally {
+            (fixture.scm as any).setConflictResolutionPhase = originalSetPhase;
+        }
+
+        assert.strictEqual(result.resolved, false);
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.remoteContent);
+        const interrupted = (fixture.scm as any).syncManifest
+            .conflictResolutions['/figure.png'];
+        assert.strictEqual(interrupted.phase, 'local-preserved');
+        assert.deepStrictEqual(
+            await readBytes(uriForRelPath(fixture.localRoot, interrupted.artifactRelPath)),
+            fixture.localContent,
+        );
+
+        await fixture.scm.deactivate();
+        const restarted = createSCM(fixture.remoteRoot, fixture.localRoot);
+        assert.strictEqual(
+            await restarted.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.remoteContent);
+        assert.strictEqual((restarted as any).syncConflicts.has('/figure.png'), false);
+        assert.strictEqual(
+            (restarted as any).syncManifest.conflictResolutions['/figure.png'],
+            undefined,
+        );
+        assert.strictEqual(
+            (restarted as any).syncManifest.conflictResolutionHistory.at(-1).outcome,
+            'completed',
+        );
+    });
+
+    test('recovers Keep Overleaf when canonical local deletion finished before its phase persisted', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-canonical-delete-remote-');
+        const localRoot = await tempDir('sr-overleaf-canonical-delete-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        await writeBytes(remoteImage, Buffer.from([1, 2, 3]));
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, Buffer.from([4, 5, 6]));
+        await vscode.workspace.fs.delete(remoteImage);
+        const conflict = await (scm as any).applySync(
+            'pull',
+            'delete',
+            '/figure.png',
+            remoteImage,
+            localImage,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflict.outcome, 'blocked');
+
+        const originalSetPhase = (scm as any).setConflictResolutionPhase.bind(scm);
+        (scm as any).setConflictResolutionPhase = (...args: unknown[]) =>
+            args[1]==='canonical-applied'
+                ? false
+                : originalSetPhase(...args);
+        let result: any;
+        try {
+            result = await scm.resolveConflictWithOverleafState('/figure.png');
+        } finally {
+            (scm as any).setConflictResolutionPhase = originalSetPhase;
+        }
+
+        assert.strictEqual(result.resolved, false);
+        assert.strictEqual(await pathExists(localImage), false);
+        assert.strictEqual(
+            (scm as any).syncManifest.conflictResolutions['/figure.png'].phase,
+            'prepared',
+        );
+
+        await scm.deactivate();
+        const restarted = createSCM(remoteRoot, localRoot);
+        assert.strictEqual(
+            await restarted.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.strictEqual(await pathExists(localImage), false);
+        assert.strictEqual(await pathExists(remoteImage), false);
+        assert.strictEqual((restarted as any).syncConflicts.has('/figure.png'), false);
+        assert.strictEqual(
+            (restarted as any).syncManifest.conflictResolutions['/figure.png'],
+            undefined,
+        );
+        assert.strictEqual(
+            (restarted as any).syncManifest.conflictResolutionHistory.at(-1).outcome,
+            'completed',
+        );
+    });
+
+    test('defers file conflict choices while a covering directory move is pending', async () => {
+        const fixture = await createBinaryConflictFixture(
+            'conflict-covering-directory-move',
+            'dir/figure.png',
+        );
+        (fixture.scm as any).syncManifest.pendingOperations['/dir'] = {
+            id: 'pending-directory-move',
+            kind: 'directory-move',
+            destinationRelPath: '/newdir',
+        };
+
+        for (const preserveLocal of [false, true]) {
+            const result = await fixture.scm.resolveConflictWithOverleafState(
+                fixture.relPath,
+                preserveLocal,
+            );
+            assert.strictEqual(result.resolved, false);
+        }
+
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.localContent);
+        assert.deepStrictEqual(await readBytes(fixture.remoteImage), fixture.remoteContent);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.conflictResolutions[fixture.relPath],
+            undefined,
+        );
+    });
+
+    test('defers a prepared conflict resolution when a covering directory move arrives before replacement', async () => {
+        const fixture = await createBinaryConflictFixture(
+            'conflict-directory-move-before-install',
+            'dir/figure.png',
+        );
+        const originalInstall = (fixture.scm as any)
+            .installConflictResolutionRemoteState.bind(fixture.scm);
+        (fixture.scm as any).installConflictResolutionRemoteState = async (
+            ...args: unknown[]
+        ) => {
+            (fixture.scm as any).syncManifest.pendingOperations['/dir'] = {
+                id: 'pending-directory-move-before-install',
+                kind: 'directory-move',
+                destinationRelPath: '/newdir',
+            };
+            return originalInstall(...args);
+        };
+
+        let result: any;
+        try {
+            result = await fixture.scm.resolveConflictWithOverleafState(
+                fixture.relPath,
+                true,
+            );
+        } finally {
+            (fixture.scm as any).installConflictResolutionRemoteState = originalInstall;
+        }
+
+        assert.strictEqual(result.resolved, false);
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.localContent);
+        assert.deepStrictEqual(await readBytes(fixture.remoteImage), fixture.remoteContent);
+        const record = (fixture.scm as any).syncManifest
+            .conflictResolutions[fixture.relPath];
+        assert.strictEqual(record.phase, 'local-preserved');
+        assert.deepStrictEqual(
+            await readBytes(uriForRelPath(fixture.localRoot, record.artifactRelPath)),
+            fixture.localContent,
+        );
+    });
+
+    test('blocks a directory-move journal that intersects an active conflict-resolution transaction', async () => {
+        const fixture = await createBinaryConflictFixture(
+            'directory-move-active-resolution',
+            'dir/figure.png',
+        );
+        const originalInstall = (fixture.scm as any)
+            .installConflictResolutionRemoteState.bind(fixture.scm);
+        (fixture.scm as any).installConflictResolutionRemoteState = async () => false;
+        try {
+            const result = await fixture.scm.resolveConflictWithOverleafState(
+                fixture.relPath,
+                true,
+            );
+            assert.strictEqual(result.resolved, false);
+        } finally {
+            (fixture.scm as any).installConflictResolutionRemoteState = originalInstall;
+        }
+
+        const sourceEntry = (fixture.scm as any).syncManifest.directories['/dir'];
+        assert.ok(sourceEntry?.parentEntity);
+        const localRevision = (await (fixture.scm as any).captureLocalPathRevision(
+            '/dir',
+        )).revision;
+        await assert.rejects(
+            () => (fixture.scm as any).journalPendingLocalDirectoryMove(
+                '/dir',
+                '/newdir',
+                sourceEntry,
+                localRevision,
+                sourceEntry.parentEntity,
+            ),
+            /active Local Replica conflict-resolution transaction/,
+        );
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.pendingOperations['/dir'],
+            undefined,
+        );
+    });
+
+    test('does not offer Keep Both when the conflicted local path is missing', async () => {
+        const fixture = await createBinaryConflictFixture('keep-both-missing-local');
+        await vscode.workspace.fs.delete(fixture.localImage);
+        const setting = (fixture.scm as any).settingItems.find((item: any) =>
+            /Resolve a Local Replica sync conflict/.test(item.label),
+        );
+        assert.ok(setting);
+
+        let quickPickCount = 0;
+        (vscode.window as any).showQuickPick = async (items: unknown) => {
+            if (quickPickCount++===0) {
+                return fixture.relPath;
+            }
+            assert.deepStrictEqual(
+                (items as Array<{choice: string}>).map(item => item.choice),
+                ['keep-local', 'keep-overleaf'],
+            );
+            return undefined;
+        };
+        await setting.callback();
+
+        assert.strictEqual(await pathExists(fixture.localImage), false);
+        assert.deepStrictEqual(await readBytes(fixture.remoteImage), fixture.remoteContent);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has(fixture.relPath), true);
+    });
+
+    test('leaves conflict state unchanged on resolution picker cancellation and routes Keep Both', async () => {
+        const fixture = await createBinaryConflictFixture('keep-both-picker');
+        const setting = (fixture.scm as any).settingItems.find((item: any) =>
+            /Resolve a Local Replica sync conflict/.test(item.label),
+        );
+        assert.ok(setting);
+
+        let picks: unknown[] = [undefined];
+        (vscode.window as any).showQuickPick = async () => picks.shift();
+        await setting.callback();
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.localContent);
+        assert.deepStrictEqual(await readBytes(fixture.remoteImage), fixture.remoteContent);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/figure.png'), true);
+
+        picks = ['/figure.png', undefined];
+        await setting.callback();
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.localContent);
+        assert.deepStrictEqual(await readBytes(fixture.remoteImage), fixture.remoteContent);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/figure.png'), true);
+
+        picks = ['/figure.png', {choice: 'keep-both'}];
+        (vscode.window as any).showWarningMessage = async (
+            ...args: unknown[]
+        ) => args.at(-1);
+        (vscode.window as any).showInformationMessage = async () => undefined;
+        await setting.callback();
+
+        assert.deepStrictEqual(await readBytes(fixture.localImage), fixture.remoteContent);
+        assert.deepStrictEqual(await readBytes(fixture.remoteImage), fixture.remoteContent);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/figure.png'), false);
+        const history = (fixture.scm as any).syncManifest.conflictResolutionHistory;
+        assert.strictEqual(history.at(-1).choice, 'keep-both');
+        assert.strictEqual(
+            await pathExists(uriForRelPath(fixture.localRoot, history.at(-1).artifactRelPath)),
+            true,
         );
     });
 
