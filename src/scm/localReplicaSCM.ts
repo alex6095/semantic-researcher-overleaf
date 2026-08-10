@@ -8796,18 +8796,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (fileResolution!==undefined) {
             return 'a file conflict-resolution transaction intersects the folder: ' + fileResolution;
         }
-        const folderResolution = Object.entries(
-            this.syncManifest?.folderConflictResolutions ?? {},
-        ).find(([path, candidate]) =>
-            candidate.id!==record.id
-            && (
-                this.isPathAtOrBelow(path, record.conflictPath)
-                || this.isPathAtOrBelow(record.conflictPath, path)
-            ),
+        const folderResolution = this.activeFolderConflictResolutionIntersectingPaths(
+            record.conflictPath,
+            record.conflictPath,
+            record.id,
         );
         if (folderResolution!==undefined) {
             return 'a folder conflict-resolution transaction intersects the folder: ' +
-                folderResolution[0];
+                folderResolution;
         }
         const otherConflict = [...this.syncConflicts.keys()].find(path =>
             path!==record.conflictPath
@@ -10220,6 +10216,29 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 || this.isPathAtOrBelow(firstRelPath, conflictPath)
                 || this.isPathAtOrBelow(conflictPath, secondRelPath)
                 || this.isPathAtOrBelow(secondRelPath, conflictPath)
+            ) {
+                return conflictPath + ' (' + record.choice + ')';
+            }
+        }
+        return undefined;
+    }
+
+    private activeFolderConflictResolutionIntersectingPaths(
+        firstRelPath: string,
+        secondRelPath: string,
+        ignoreResolutionId?: string,
+    ): string | undefined {
+        for (const [conflictPath, record] of Object.entries(
+            this.syncManifest?.folderConflictResolutions ?? {},
+        )) {
+            if (
+                record.id!==ignoreResolutionId
+                && (
+                    this.isPathAtOrBelow(conflictPath, firstRelPath)
+                    || this.isPathAtOrBelow(firstRelPath, conflictPath)
+                    || this.isPathAtOrBelow(conflictPath, secondRelPath)
+                    || this.isPathAtOrBelow(secondRelPath, conflictPath)
+                )
             ) {
                 return conflictPath + ' (' + record.choice + ')';
             }
@@ -13398,6 +13417,32 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             throw new RemoteDocumentMergeConflictError(
                 'A descendant operation appeared while the folder move was being acknowledged: ' +
                 pendingDescendant,
+            );
+        }
+        // The remote move is already accepted when this finalizer runs, but a
+        // watcher or a conflict-resolution transaction can have arrived since
+        // its earlier inspection. Do not rekey ordinary state around that new
+        // durable evidence; retain the move journal for a later guarded replay.
+        const activeFileResolution = this.activeConflictResolutionIntersectingPaths(
+            sourceRelPath,
+            destinationRelPath,
+        );
+        const activeFolderResolution = this.activeFolderConflictResolutionIntersectingPaths(
+            sourceRelPath,
+            destinationRelPath,
+        );
+        const activeConflict = this.syncConflictIntersectingPaths(
+            sourceRelPath,
+            destinationRelPath,
+        );
+        if (
+            activeFileResolution!==undefined
+            || activeFolderResolution!==undefined
+            || activeConflict!==undefined
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'A conflict or conflict-resolution transaction appeared while the folder move was being acknowledged: ' +
+                (activeFileResolution ?? activeFolderResolution ?? activeConflict),
             );
         }
         const movePath = (path: string) => destinationRelPath + path.slice(sourceRelPath.length);

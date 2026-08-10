@@ -3297,6 +3297,81 @@ suite('Select Project Folder Local Replica', function () {
         assert.deepStrictEqual(scm.syncManifest.pendingOperations, {});
     });
 
+    test('keeps an accepted folder move journal when a conflict arrives before final rekey', async function () {
+        this.timeout(20_000);
+        const remoteRoot = await tempDir('sr-overleaf-folder-move-final-conflict-remote-');
+        const localRoot = await tempDir('sr-overleaf-folder-move-final-conflict-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteSource = vscode.Uri.joinPath(remoteRoot, 'draft');
+        const remoteArchive = vscode.Uri.joinPath(remoteRoot, 'archive');
+        const remoteDestination = vscode.Uri.joinPath(remoteArchive, 'final');
+        const localSource = vscode.Uri.joinPath(localRoot, 'draft');
+        const localDestination = vscode.Uri.joinPath(localRoot, 'archive', 'final');
+        await writeText(vscode.Uri.joinPath(remoteSource, 'main.tex'), 'finalization fence');
+        await vscode.workspace.fs.createDirectory(remoteArchive);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('draft', 'folder-final-conflict-source');
+        fakeVfs.setEntityId('archive', 'folder-final-conflict-parent');
+        fakeVfs.setEntityId('draft/main.tex', 'doc-final-conflict-child');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const originalFinalize = scm.finalizeAcceptedLocalDirectoryMove.bind(scm);
+        let injected = false;
+        scm.finalizeAcceptedLocalDirectoryMove = async (...args: unknown[]) => {
+            if (!injected) {
+                injected = true;
+                await scm.markSyncConflict(
+                    '/draft/main.tex',
+                    'test conflict injected at accepted folder-move finalization',
+                );
+            }
+            return originalFinalize(...args);
+        };
+        try {
+            await vscode.workspace.fs.rename(localSource, localDestination, {overwrite: false});
+            await scm.syncToVFS(localSource, 'delete');
+            await scm.syncToVFS(localDestination, 'update');
+            await new Promise<void>(resolve => setTimeout(resolve, 700));
+            await scm.drainPendingSyncWork();
+        } finally {
+            scm.finalizeAcceptedLocalDirectoryMove = originalFinalize;
+        }
+
+        assert.strictEqual(injected, true);
+        assert.strictEqual(await pathExists(remoteSource), false);
+        assert.strictEqual(
+            await readText(vscode.Uri.joinPath(remoteDestination, 'main.tex')),
+            'finalization fence',
+        );
+        assert.strictEqual(await pathExists(localSource), false);
+        assert.strictEqual(await pathExists(localDestination), true);
+        assert.strictEqual(
+            scm.syncManifest.pendingOperations['/draft'].kind,
+            'directory-move',
+        );
+        assert.ok(scm.syncManifest.directories['/draft']);
+        assert.strictEqual(scm.syncManifest.directories['/archive/final'], undefined);
+        assert.ok(scm.syncConflicts.has('/draft/main.tex'));
+        assert.ok(scm.syncManifest.conflicts['/draft/main.tex']);
+
+        await scm.deactivate();
+        const restarted = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        assert.strictEqual(
+            await restarted.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.strictEqual(
+            restarted.syncManifest.pendingOperations['/draft'].kind,
+            'directory-move',
+        );
+        assert.ok(restarted.syncManifest.directories['/draft']);
+        assert.strictEqual(restarted.syncManifest.directories['/archive/final'], undefined);
+        assert.ok(restarted.syncConflicts.has('/draft/main.tex'));
+        assert.ok(restarted.syncManifest.conflicts['/draft/main.tex']);
+    });
+
     test('replays a journaled local folder move on reconnect without another watcher event', async function () {
         this.timeout(20_000);
         const remoteRoot = await tempDir('sr-overleaf-local-folder-move-reconnect-remote-');
