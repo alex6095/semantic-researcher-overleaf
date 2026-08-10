@@ -222,8 +222,52 @@ interface SyncManifestConflictResolutionHistoryEntry {
     completedAt: string;
 }
 
+type SyncManifestFolderConflictResolutionChoice = 'keep-overleaf' | 'keep-both';
+type SyncManifestFolderConflictResolutionPhase =
+    | 'prepared'
+    | 'remote-staged'
+    | 'local-preserved'
+    | 'canonical-applied'
+    | 'blocked';
+
+// Folder resolution is deliberately separate from file resolution. Its local
+// operation is a guarded root-tree rename/swap, not a file write, and the
+// record binds the remote root/parent identity whenever a remote folder exists.
+interface SyncManifestFolderConflictResolution {
+    version: 1;
+    id: string;
+    conflictPath: string;
+    choice: SyncManifestFolderConflictResolutionChoice;
+    localKind: 'directory' | 'missing';
+    localRevision: string;
+    localIdentity?: LocalReadIdentity;
+    remoteKind: 'directory' | 'missing';
+    remoteRevision: string;
+    remoteEntity?: SyncManifestRemoteFolderIdentity;
+    remoteParentEntity?: SyncManifestRemoteFolderIdentity;
+    artifactRelPath?: string;
+    guardRelPath?: string;
+    stageRelPath?: string;
+    phase: SyncManifestFolderConflictResolutionPhase;
+    createdAt: string;
+    updatedAt: string;
+}
+
+interface SyncManifestFolderConflictResolutionHistoryEntry {
+    version: 1;
+    id: string;
+    conflictPath: string;
+    choice: SyncManifestFolderConflictResolutionChoice;
+    localRevision: string;
+    remoteRevision: string;
+    artifactRelPath?: string;
+    guardRelPath?: string;
+    outcome: 'completed' | 'superseded' | 'blocked';
+    completedAt: string;
+}
+
 interface SyncManifest {
-    version: 10;
+    version: 11;
     projectUri: string;
     baselineComplete: boolean;
     files: Record<string, SyncManifestEntry>;
@@ -231,6 +275,8 @@ interface SyncManifest {
     conflicts: Record<string, SyncManifestConflictEntry>;
     conflictResolutions: Record<string, SyncManifestConflictResolution>;
     conflictResolutionHistory: SyncManifestConflictResolutionHistoryEntry[];
+    folderConflictResolutions: Record<string, SyncManifestFolderConflictResolution>;
+    folderConflictResolutionHistory: SyncManifestFolderConflictResolutionHistoryEntry[];
     pendingOperations: Record<string, SyncManifestPendingOperation>;
 }
 
@@ -485,6 +531,17 @@ type StableConflictLocalState =
         kind: 'file';
         revision: string;
         content: Uint8Array;
+        identity: LocalReadIdentity;
+    }
+    | {
+        kind: 'missing';
+        revision: typeof DELETE_DIGEST;
+    };
+
+type StableFolderConflictLocalState =
+    | {
+        kind: 'directory';
+        revision: string;
         identity: LocalReadIdentity;
     }
     | {
@@ -771,6 +828,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private static readonly compileQuiescenceMs = 250;
     private static readonly remoteDeleteConflictWindowMs = 5_000;
     private static readonly maxConflictResolutionHistoryEntries = 20;
+    private static readonly maxFolderConflictResolutionHistoryEntries = 20;
     // How long a watcher-observed update may keep looking for a path that has
     // momentarily vanished before the absence is accepted as a real deletion.
     // An atomic rename replacement closes in microseconds; this only has to
@@ -3628,7 +3686,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private emptySyncManifest(baselineComplete = true): SyncManifest {
         return {
-            version: 10,
+            version: 11,
             projectUri: stringifyOverleafUri(this.vfs.origin),
             baselineComplete,
             files: {},
@@ -3636,6 +3694,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             conflicts: {},
             conflictResolutions: {},
             conflictResolutionHistory: [],
+            folderConflictResolutions: {},
+            folderConflictResolutionHistory: [],
             pendingOperations: {},
         };
     }
@@ -3860,6 +3920,108 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && this.isValidRecordedPathRevision(entry.localRevision)
             && this.isValidRecordedPathRevision(entry.remoteRevision)
             && validArtifact
+            && (
+                entry.outcome==='completed'
+                || entry.outcome==='superseded'
+                || entry.outcome==='blocked'
+            )
+            && typeof entry.completedAt==='string'
+            && Number.isFinite(Date.parse(entry.completedAt));
+    }
+
+    private isValidSyncManifestFolderConflictResolution(
+        value: unknown,
+    ): value is SyncManifestFolderConflictResolution {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const entry = value as Partial<SyncManifestFolderConflictResolution>;
+        const validLocal = (
+            entry.localKind==='directory'
+            && /^directory:[a-f0-9]{40}$/.test(entry.localRevision ?? '')
+            && this.isValidLocalReadIdentity(entry.localIdentity)
+        ) || (
+            entry.localKind==='missing'
+            && entry.localRevision===DELETE_DIGEST
+            && entry.localIdentity===undefined
+        );
+        const validRemote = (
+            entry.remoteKind==='directory'
+            && /^directory:[a-f0-9]{40}$/.test(entry.remoteRevision ?? '')
+            && this.isValidSyncManifestFolderIdentity(entry.remoteEntity)
+            && this.isValidSyncManifestFolderIdentity(entry.remoteParentEntity)
+            && typeof entry.stageRelPath==='string'
+            && this.isCanonicalReplicaRelPath(entry.stageRelPath)
+            && entry.stageRelPath.startsWith(
+                '/' + REPLICA_SETTINGS_DIR + '/conflicts/' + entry.id + '/',
+            )
+        ) || (
+            entry.remoteKind==='missing'
+            && entry.remoteRevision===DELETE_DIGEST
+            && entry.remoteEntity===undefined
+            && entry.remoteParentEntity===undefined
+            && entry.stageRelPath===undefined
+        );
+        const storedTreePath = (path: unknown, kind: 'artifact' | 'guard') =>
+            typeof path==='string'
+            && this.isCanonicalReplicaRelPath(path)
+            && path.startsWith(
+                '/' + REPLICA_SETTINGS_DIR + '/conflicts/' + entry.id + '/' + kind,
+            );
+        const validPreservedLocal = entry.localKind==='missing'
+            ? entry.artifactRelPath===undefined && entry.guardRelPath===undefined
+            : entry.choice==='keep-both'
+                ? storedTreePath(entry.artifactRelPath, 'artifact')
+                    && entry.guardRelPath===undefined
+                : entry.artifactRelPath===undefined
+                    && storedTreePath(entry.guardRelPath, 'guard');
+        return entry.version===1
+            && typeof entry.id==='string'
+            && /^[a-f0-9]{32}$/.test(entry.id)
+            && typeof entry.conflictPath==='string'
+            && this.isCanonicalReplicaRelPath(entry.conflictPath)
+            && (entry.choice==='keep-overleaf' || entry.choice==='keep-both')
+            && validLocal
+            && validRemote
+            && validPreservedLocal
+            && (
+                entry.phase==='prepared'
+                || entry.phase==='remote-staged'
+                || entry.phase==='local-preserved'
+                || entry.phase==='canonical-applied'
+                || entry.phase==='blocked'
+            )
+            && typeof entry.createdAt==='string'
+            && Number.isFinite(Date.parse(entry.createdAt))
+            && typeof entry.updatedAt==='string'
+            && Number.isFinite(Date.parse(entry.updatedAt));
+    }
+
+    private isValidSyncManifestFolderConflictResolutionHistoryEntry(
+        value: unknown,
+    ): value is SyncManifestFolderConflictResolutionHistoryEntry {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const entry = value as Partial<SyncManifestFolderConflictResolutionHistoryEntry>;
+        const validStoredPath = (path: unknown, kind: 'artifact' | 'guard') =>
+            path===undefined || (
+                typeof path==='string'
+                && this.isCanonicalReplicaRelPath(path)
+                && path.startsWith(
+                    '/' + REPLICA_SETTINGS_DIR + '/conflicts/' + entry.id + '/' + kind,
+                )
+            );
+        return entry.version===1
+            && typeof entry.id==='string'
+            && /^[a-f0-9]{32}$/.test(entry.id)
+            && typeof entry.conflictPath==='string'
+            && this.isCanonicalReplicaRelPath(entry.conflictPath)
+            && (entry.choice==='keep-overleaf' || entry.choice==='keep-both')
+            && this.isValidRecordedPathRevision(entry.localRevision)
+            && this.isValidRecordedPathRevision(entry.remoteRevision)
+            && validStoredPath(entry.artifactRelPath, 'artifact')
+            && validStoredPath(entry.guardRelPath, 'guard')
             && (
                 entry.outcome==='completed'
                 || entry.outcome==='superseded'
@@ -4137,6 +4299,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 conflicts?: Record<string, SyncManifestConflictEntry>;
                 conflictResolutions?: Record<string, SyncManifestConflictResolution>;
                 conflictResolutionHistory?: SyncManifestConflictResolutionHistoryEntry[];
+                folderConflictResolutions?: Record<string, SyncManifestFolderConflictResolution>;
+                folderConflictResolutionHistory?: SyncManifestFolderConflictResolutionHistoryEntry[];
                 pendingOperations?: Record<string, SyncManifestPendingOperation>;
             };
             let sameProject = false;
@@ -4146,7 +4310,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } catch {
                 sameProject = false;
             }
-            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10)
+            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11)
                 && sameProject
                 && (manifest.baselineComplete===undefined || typeof manifest.baselineComplete==='boolean')
                 && this.isValidSyncManifestRecord<SyncManifestEntry>(
@@ -4171,7 +4335,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     )
                 )
                 && (
-                    manifest.version!==10
+                    manifest.version!==10 && manifest.version!==11
                     || (
                         this.isValidSyncManifestRecord<SyncManifestConflictResolution>(
                             manifest.conflictResolutions,
@@ -4186,6 +4350,25 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             <=LocalReplicaSCMProvider.maxConflictResolutionHistoryEntries
                         && manifest.conflictResolutionHistory.every(entry =>
                             this.isValidSyncManifestConflictResolutionHistoryEntry(entry),
+                        )
+                    )
+                )
+                && (
+                    manifest.version!==11
+                    || (
+                        this.isValidSyncManifestRecord<SyncManifestFolderConflictResolution>(
+                            manifest.folderConflictResolutions,
+                            (value): value is SyncManifestFolderConflictResolution =>
+                                this.isValidSyncManifestFolderConflictResolution(value),
+                        )
+                        && Object.entries(manifest.folderConflictResolutions!).every(
+                            ([relPath, entry]) => entry.conflictPath===relPath,
+                        )
+                        && Array.isArray(manifest.folderConflictResolutionHistory)
+                        && manifest.folderConflictResolutionHistory.length
+                            <=LocalReplicaSCMProvider.maxFolderConflictResolutionHistoryEntries
+                        && manifest.folderConflictResolutionHistory.every(entry =>
+                            this.isValidSyncManifestFolderConflictResolutionHistoryEntry(entry),
                         )
                     )
                 )
@@ -4205,7 +4388,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (validShape) {
                 this.requireSyncSession(generation);
                 this.syncManifest = {
-                    version: 10,
+                    version: 11,
                     projectUri,
                     baselineComplete: manifest.baselineComplete!==false,
                     files: manifest.files!,
@@ -4213,13 +4396,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         ? manifest.directories
                         : {},
                     conflicts: manifest.conflicts ?? {},
-                    conflictResolutions: manifest.version===10
+                    conflictResolutions: manifest.version===10 || manifest.version===11
                         ? manifest.conflictResolutions!
                         : {},
-                    conflictResolutionHistory: manifest.version===10
+                    conflictResolutionHistory: manifest.version===10 || manifest.version===11
                         ? manifest.conflictResolutionHistory!
                         : [],
-                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10
+                    folderConflictResolutions: manifest.version===11
+                        ? manifest.folderConflictResolutions!
+                        : {},
+                    folderConflictResolutionHistory: manifest.version===11
+                        ? manifest.folderConflictResolutionHistory!
+                        : [],
+                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11
                         ? manifest.pendingOperations!
                         : {},
                 };
@@ -4247,11 +4436,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     ? 'unavailable'
                     : 'trusted';
                 this.syncManifestRevision += 1;
-                this.syncManifestDirty = manifest.version!==10
+                this.syncManifestDirty = manifest.version!==11
                     || manifest.directories===undefined
                     || manifest.conflicts===undefined
                     || manifest.conflictResolutions===undefined
                     || manifest.conflictResolutionHistory===undefined
+                    || manifest.folderConflictResolutions===undefined
+                    || manifest.folderConflictResolutionHistory===undefined
                     || manifest.baselineComplete===undefined
                     || manifest.projectUri!==projectUri;
                 return;
@@ -8285,6 +8476,726 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return result ?? {resolved: false};
     }
 
+    private hasDirtyOpenReplicaDocumentAtOrBelow(relPath: string): boolean {
+        const target = this.localUri(relPath);
+        if (target.scheme==='file' && this.baseUri.scheme==='file') {
+            const targetPath = LocalReplicaSCMProvider.comparableFsPath(target.fsPath);
+            return vscode.workspace.textDocuments.some(document =>
+                document.isDirty
+                && document.uri.scheme==='file'
+                && (
+                    LocalReplicaSCMProvider.comparableFsPath(document.uri.fsPath)===targetPath
+                    || LocalReplicaSCMProvider.comparableFsPath(document.uri.fsPath)
+                        .startsWith(targetPath + nodePath.sep)
+                ),
+            );
+        }
+        const targetUri = target.toString();
+        return vscode.workspace.textDocuments.some(document =>
+            document.isDirty
+            && (
+                document.uri.toString()===targetUri
+                || document.uri.toString().startsWith(targetUri + '/')
+            ),
+        );
+    }
+
+    private async captureStableFolderConflictLocalState(
+        relPath: string,
+        generation = this.syncGeneration,
+    ): Promise<StableFolderConflictLocalState | undefined> {
+        this.requireSyncSession(generation);
+        const targetPath = this.localUri(relPath).fsPath;
+        const before = await this.captureLocalPathIdentity(targetPath);
+        let current: PathRevision;
+        try {
+            current = await this.captureLocalPathRevision(relPath, generation);
+        } catch (error) {
+            if (
+                LocalReplicaSCMProvider.isFileNotFoundError(error)
+                || LocalReplicaSCMProvider.isLocalReadUnstable(error)
+            ) {
+                return undefined;
+            }
+            throw error;
+        }
+        if (current.kind==='missing') {
+            return {kind: 'missing', revision: DELETE_DIGEST};
+        }
+        if (current.kind!=='directory' || before===undefined) {
+            return undefined;
+        }
+        const after = await this.captureLocalPathIdentity(targetPath);
+        if (after===undefined || !this.localReadIdentityEquals(before, after)) {
+            return undefined;
+        }
+        return {
+            kind: 'directory',
+            revision: current.revision,
+            identity: after,
+        };
+    }
+
+    private folderConflictResolutionLocalStateMatches(
+        record: SyncManifestFolderConflictResolution,
+        local: StableFolderConflictLocalState,
+    ): boolean {
+        if (
+            record.localKind!==local.kind
+            || record.localRevision!==local.revision
+        ) {
+            return false;
+        }
+        return record.localKind!=='directory'
+            || (
+                local.kind==='directory'
+                && record.localIdentity!==undefined
+                && this.localReadIdentityEquals(record.localIdentity, local.identity)
+            );
+    }
+
+    private localReadIdentitySameObject(
+        left: LocalReadIdentity,
+        right: LocalReadIdentity,
+    ): boolean {
+        // A durable rename changes ctime on the root directory, so its
+        // post-rename confirmation is object identity rather than a stale
+        // timestamp equality. The recursively captured digest proves contents.
+        return left.dev===right.dev && left.ino===right.ino;
+    }
+
+    private folderConflictStoredRelPath(
+        record: SyncManifestFolderConflictResolution,
+    ): string | undefined {
+        return record.choice==='keep-both'
+            ? record.artifactRelPath
+            : record.guardRelPath;
+    }
+
+    private async folderConflictStoredTreeMatches(
+        record: SyncManifestFolderConflictResolution,
+        generation: number,
+    ): Promise<boolean> {
+        if (record.localKind==='missing') {
+            return true;
+        }
+        const storedRelPath = this.folderConflictStoredRelPath(record);
+        if (storedRelPath===undefined || record.localIdentity===undefined) {
+            return false;
+        }
+        const stored = await this.captureLocalPathRevision(storedRelPath, generation);
+        if (
+            stored.kind!=='directory'
+            || stored.revision!==record.localRevision
+        ) {
+            return false;
+        }
+        const identity = await this.captureLocalPathIdentity(
+            this.localUri(storedRelPath).fsPath,
+        );
+        return identity!==undefined
+            && this.localReadIdentitySameObject(record.localIdentity, identity);
+    }
+
+    private async folderConflictResolutionBlocker(
+        record: SyncManifestFolderConflictResolution,
+        local: StableFolderConflictLocalState,
+        remote: PathRevision,
+        generation: number,
+    ): Promise<string | undefined> {
+        if (this.hasDirtyOpenReplicaDocumentAtOrBelow(record.conflictPath)) {
+            return 'a local editor has unsaved text under the folder';
+        }
+        const pending = this.pendingOperationIntersectingPaths(
+            record.conflictPath,
+            record.conflictPath,
+        );
+        if (pending!==undefined) {
+            return 'a pending Local Replica operation intersects the folder: ' + pending;
+        }
+        const fileResolution = this.activeConflictResolutionIntersectingPaths(
+            record.conflictPath,
+            record.conflictPath,
+        );
+        if (fileResolution!==undefined) {
+            return 'a file conflict-resolution transaction intersects the folder: ' + fileResolution;
+        }
+        const folderResolution = Object.entries(
+            this.syncManifest?.folderConflictResolutions ?? {},
+        ).find(([path, candidate]) =>
+            candidate.id!==record.id
+            && (
+                this.isPathAtOrBelow(path, record.conflictPath)
+                || this.isPathAtOrBelow(record.conflictPath, path)
+            ),
+        );
+        if (folderResolution!==undefined) {
+            return 'a folder conflict-resolution transaction intersects the folder: ' +
+                folderResolution[0];
+        }
+        const otherConflict = [...this.syncConflicts.keys()].find(path =>
+            path!==record.conflictPath
+            && (
+                this.isPathAtOrBelow(path, record.conflictPath)
+                || this.isPathAtOrBelow(record.conflictPath, path)
+            ),
+        );
+        if (otherConflict!==undefined) {
+            return 'an unresolved descendant or ancestor conflict intersects the folder: ' +
+                otherConflict;
+        }
+        if (this.hasRelatedFailedInitialPull(record.conflictPath)) {
+            return 'an initial pull under the folder is incomplete';
+        }
+        const pendingSubscription = [...this.pendingInitialDocumentSubscriptions].find(path =>
+            this.isPathAtOrBelow(path, record.conflictPath)
+            || this.isPathAtOrBelow(record.conflictPath, path),
+        );
+        if (pendingSubscription!==undefined) {
+            return 'a document subscription is still being verified: ' + pendingSubscription;
+        }
+        const inFlightQueue = [...this.syncQueues.keys()].find(path =>
+            path!==record.conflictPath
+            && (
+                this.isPathAtOrBelow(path, record.conflictPath)
+                || this.isPathAtOrBelow(record.conflictPath, path)
+            ),
+        );
+        if (inFlightQueue!==undefined) {
+            return 'a sync queue is still active under the folder: ' + inFlightQueue;
+        }
+        if (local.kind==='directory') {
+            const ignored = await this.findIgnoredDescendant(
+                this.localUri(record.conflictPath),
+                record.conflictPath,
+                generation,
+            );
+            if (ignored!==undefined) {
+                return 'the local folder contains ignored content: ' + ignored;
+            }
+        }
+        if (remote.kind==='directory') {
+            const ignored = await this.findIgnoredDescendant(
+                this.vfs.pathToUri(record.conflictPath),
+                record.conflictPath,
+                generation,
+            );
+            if (ignored!==undefined) {
+                return 'the Overleaf folder contains ignored content: ' + ignored;
+            }
+        }
+        return undefined;
+    }
+
+    private setFolderConflictResolutionPhase(
+        record: SyncManifestFolderConflictResolution,
+        phase: SyncManifestFolderConflictResolutionPhase,
+    ): boolean {
+        const current = this.syncManifest?.folderConflictResolutions[record.conflictPath];
+        if (!current || current.id!==record.id) {
+            return false;
+        }
+        current.phase = phase;
+        current.updatedAt = new Date().toISOString();
+        this.markSyncManifestDirty();
+        return true;
+    }
+
+    private archiveFolderConflictResolution(
+        record: SyncManifestFolderConflictResolution,
+        outcome: SyncManifestFolderConflictResolutionHistoryEntry['outcome'],
+    ): boolean {
+        const manifest = this.syncManifest;
+        const current = manifest?.folderConflictResolutions[record.conflictPath];
+        if (!manifest || !current || current.id!==record.id) {
+            return false;
+        }
+        manifest.folderConflictResolutionHistory.push({
+            version: 1,
+            id: current.id,
+            conflictPath: current.conflictPath,
+            choice: current.choice,
+            localRevision: current.localRevision,
+            remoteRevision: current.remoteRevision,
+            artifactRelPath: current.artifactRelPath,
+            guardRelPath: current.guardRelPath,
+            outcome,
+            completedAt: new Date().toISOString(),
+        });
+        if (
+            manifest.folderConflictResolutionHistory.length
+            > LocalReplicaSCMProvider.maxFolderConflictResolutionHistoryEntries
+        ) {
+            manifest.folderConflictResolutionHistory.splice(
+                0,
+                manifest.folderConflictResolutionHistory.length
+                    - LocalReplicaSCMProvider.maxFolderConflictResolutionHistoryEntries,
+            );
+        }
+        delete manifest.folderConflictResolutions[record.conflictPath];
+        this.markSyncManifestDirty();
+        return true;
+    }
+
+    private async blockFolderConflictResolution(
+        record: SyncManifestFolderConflictResolution,
+        reason: string,
+        generation: number,
+        remoteState?: PathRevision,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        if (!this.setFolderConflictResolutionPhase(record, 'blocked')) {
+            return;
+        }
+        await this.markSyncConflict(
+            record.conflictPath,
+            reason,
+            undefined,
+            generation,
+            remoteState,
+        );
+        await this.persistSyncManifest(true, generation);
+    }
+
+    private async verifyFolderConflictResolutionRemoteState(
+        record: SyncManifestFolderConflictResolution,
+        generation: number,
+    ): Promise<PathRevision | undefined> {
+        this.requireSyncSession(generation);
+        await this.refreshRemoteStateForReconciliation(
+            record.conflictPath,
+            generation,
+            'verify remote folder conflict decision',
+        );
+        const remote = await this.captureRemotePathRevision(
+            record.conflictPath,
+            generation,
+        );
+        this.requireSyncSession(generation);
+        let matches = remote.kind===record.remoteKind
+            && remote.revision===record.remoteRevision;
+        if (matches && remote.kind==='directory') {
+            const identity = await this.resolveRemoteFolderPathIdentity(
+                this.vfs.pathToUri(record.conflictPath),
+            );
+            this.requireSyncSession(generation);
+            matches = record.remoteEntity!==undefined
+                && record.remoteParentEntity!==undefined
+                && this.remoteFolderPathIdentityMatches(
+                    identity,
+                    record.remoteEntity,
+                    record.remoteParentEntity,
+                );
+        }
+        if (matches) {
+            return remote;
+        }
+        await this.blockFolderConflictResolution(
+            record,
+            'Overleaf changed after the folder conflict decision was recorded; the newer remote tree was preserved',
+            generation,
+            remote,
+        );
+        return undefined;
+    }
+
+    private async preserveFolderConflictLocalTree(
+        record: SyncManifestFolderConflictResolution,
+        local: StableFolderConflictLocalState,
+        remote: PathRevision,
+        generation: number,
+    ): Promise<boolean> {
+        if (record.localKind==='missing') {
+            if (!this.setFolderConflictResolutionPhase(record, 'local-preserved')) {
+                return false;
+            }
+            await this.persistSyncManifest(true, generation);
+            return true;
+        }
+        if (
+            local.kind!=='directory'
+            || !this.folderConflictResolutionLocalStateMatches(record, local)
+        ) {
+            await this.blockFolderConflictResolution(
+                record,
+                'The local folder changed before it could be preserved; neither tree was replaced',
+                generation,
+                remote,
+            );
+            return false;
+        }
+        const storedRelPath = this.folderConflictStoredRelPath(record);
+        if (storedRelPath===undefined) {
+            await this.blockFolderConflictResolution(
+                record,
+                'The protected local folder destination is missing from the durable decision',
+                generation,
+                remote,
+            );
+            return false;
+        }
+        const existing = await this.captureLocalPathRevision(storedRelPath, generation);
+        if (existing.kind!=='missing') {
+            if (
+                existing.kind==='directory'
+                && existing.revision===record.localRevision
+                && await this.folderConflictStoredTreeMatches(record, generation)
+            ) {
+                const target = await this.captureLocalPathRevision(
+                    record.conflictPath,
+                    generation,
+                );
+                if (target.kind==='missing') {
+                    if (!this.setFolderConflictResolutionPhase(record, 'local-preserved')) {
+                        return false;
+                    }
+                    await this.persistSyncManifest(true, generation);
+                    return true;
+                }
+            }
+            await this.blockFolderConflictResolution(
+                record,
+                'The protected local folder destination already contains a different tree; neither tree was replaced',
+                generation,
+                remote,
+            );
+            return false;
+        }
+        const current = await this.captureStableFolderConflictLocalState(
+            record.conflictPath,
+            generation,
+        );
+        if (
+            current===undefined
+            || !this.folderConflictResolutionLocalStateMatches(record, current)
+        ) {
+            await this.blockFolderConflictResolution(
+                record,
+                'The local folder changed or could not be read stably before it was preserved',
+                generation,
+                remote,
+            );
+            return false;
+        }
+        await this.ensureParentDirectory(storedRelPath, generation);
+        try {
+            await this.renameDurably(
+                this.localUri(record.conflictPath).fsPath,
+                this.localUri(storedRelPath).fsPath,
+            );
+        } catch (error) {
+            await this.blockFolderConflictResolution(
+                record,
+                'The local folder could not be moved to protected storage: ' +
+                    formatUnknownError(error),
+                generation,
+                remote,
+            );
+            return false;
+        }
+        if (!await this.folderConflictStoredTreeMatches(record, generation)) {
+            await this.restoreStagedPathWithoutOverwrite(
+                this.localUri(storedRelPath).fsPath,
+                this.localUri(record.conflictPath).fsPath,
+                record.conflictPath,
+                'directory',
+                'the local folder changed during preservation',
+                this.localUri(storedRelPath).fsPath,
+            );
+            await this.blockFolderConflictResolution(
+                record,
+                'The local folder changed during protected preservation; neither tree was replaced',
+                generation,
+                remote,
+            );
+            return false;
+        }
+        if (!this.setFolderConflictResolutionPhase(record, 'local-preserved')) {
+            return false;
+        }
+        await this.persistSyncManifest(true, generation);
+        return true;
+    }
+
+    private async finalizeMissingFolderConflictResolution(
+        record: SyncManifestFolderConflictResolution,
+        generation: number,
+    ): Promise<LocalReplicaConflictResolutionResult> {
+        const remote = await this.verifyFolderConflictResolutionRemoteState(
+            record,
+            generation,
+        );
+        if (remote===undefined || remote.kind!=='missing') {
+            return {resolved: false, artifactRelPath: record.artifactRelPath};
+        }
+        if (this.hasDirtyOpenReplicaDocumentAtOrBelow(record.conflictPath)) {
+            await this.blockFolderConflictResolution(
+                record,
+                'A local editor became dirty before the Overleaf folder deletion was finalized; no tree was discarded',
+                generation,
+                remote,
+            );
+            return {resolved: false, artifactRelPath: record.artifactRelPath};
+        }
+        const target = await this.captureLocalPathRevision(
+            record.conflictPath,
+            generation,
+        );
+        if (
+            target.kind!=='missing'
+            || !await this.folderConflictStoredTreeMatches(record, generation)
+        ) {
+            await this.blockFolderConflictResolution(
+                record,
+                'The local canonical folder or protected preserved tree changed before finalization',
+                generation,
+                remote,
+            );
+            return {resolved: false, artifactRelPath: record.artifactRelPath};
+        }
+        if (!this.archiveFolderConflictResolution(record, 'completed')) {
+            return {resolved: false, artifactRelPath: record.artifactRelPath};
+        }
+        await this.clearSyncConflict(record.conflictPath, generation);
+        this.clearReplicaState(record.conflictPath, true);
+        await this.persistSyncManifest(true, generation);
+        await this.refreshCleanOpenReplicaDocumentsFromDisk(generation);
+        getOutputChannel().appendLine(
+            new Date().toISOString()
+            + ' [folder conflict resolution complete] '
+            + record.conflictPath
+            + ': '
+            + record.choice,
+        );
+        return {
+            resolved: true,
+            artifactRelPath: record.choice==='keep-both'
+                ? record.artifactRelPath
+                : undefined,
+        };
+    }
+
+    private async resumeFolderConflictResolution(
+        record: SyncManifestFolderConflictResolution,
+        generation: number,
+    ): Promise<LocalReplicaConflictResolutionResult> {
+        this.requireSyncSession(generation);
+        const active = this.syncManifest?.folderConflictResolutions[record.conflictPath];
+        if (!active || active.id!==record.id || record.phase==='blocked') {
+            return {resolved: false, artifactRelPath: record.artifactRelPath};
+        }
+        if (!this.syncConflicts.has(record.conflictPath)) {
+            this.archiveFolderConflictResolution(record, 'superseded');
+            await this.persistSyncManifest(true, generation);
+            return {resolved: false, artifactRelPath: record.artifactRelPath};
+        }
+        const remote = await this.verifyFolderConflictResolutionRemoteState(
+            record,
+            generation,
+        );
+        if (remote===undefined || remote.kind!=='missing') {
+            return {resolved: false, artifactRelPath: record.artifactRelPath};
+        }
+        const current = await this.captureStableFolderConflictLocalState(
+            record.conflictPath,
+            generation,
+        );
+        if (current===undefined) {
+            await this.blockFolderConflictResolution(
+                record,
+                'The local folder could not be read stably while resuming the decision',
+                generation,
+                remote,
+            );
+            return {resolved: false, artifactRelPath: record.artifactRelPath};
+        }
+        const blocker = await this.folderConflictResolutionBlocker(
+            record,
+            current,
+            remote,
+            generation,
+        );
+        if (blocker!==undefined) {
+            getOutputChannel().appendLine(
+                new Date().toISOString()
+                + ' [folder conflict resolution deferred] '
+                + record.conflictPath
+                + ': '
+                + blocker,
+            );
+            return {resolved: false, artifactRelPath: record.artifactRelPath};
+        }
+
+        if (record.phase==='prepared') {
+            if (
+                record.localKind==='directory'
+                && current.kind==='missing'
+                && await this.folderConflictStoredTreeMatches(record, generation)
+            ) {
+                if (!this.setFolderConflictResolutionPhase(record, 'local-preserved')) {
+                    return {resolved: false, artifactRelPath: record.artifactRelPath};
+                }
+                await this.persistSyncManifest(true, generation);
+            } else if (!await this.preserveFolderConflictLocalTree(
+                record,
+                current,
+                remote,
+                generation,
+            )) {
+                return {resolved: false, artifactRelPath: record.artifactRelPath};
+            }
+        }
+
+        if (record.phase==='local-preserved') {
+            const target = await this.captureLocalPathRevision(
+                record.conflictPath,
+                generation,
+            );
+            if (
+                target.kind!=='missing'
+                || !await this.folderConflictStoredTreeMatches(record, generation)
+            ) {
+                await this.blockFolderConflictResolution(
+                    record,
+                    'The local canonical folder changed after preservation and before accepting the Overleaf deletion',
+                    generation,
+                    remote,
+                );
+                return {resolved: false, artifactRelPath: record.artifactRelPath};
+            }
+            if (!this.setFolderConflictResolutionPhase(record, 'canonical-applied')) {
+                return {resolved: false, artifactRelPath: record.artifactRelPath};
+            }
+            await this.persistSyncManifest(true, generation);
+        }
+        if (record.phase==='canonical-applied') {
+            return this.finalizeMissingFolderConflictResolution(record, generation);
+        }
+        return {resolved: false, artifactRelPath: record.artifactRelPath};
+    }
+
+    private async reconcilePersistedFolderConflictResolutionTransactions(
+        generation = this.syncGeneration,
+    ): Promise<number> {
+        let resolved = 0;
+        for (const record of Object.values(
+            this.syncManifest?.folderConflictResolutions ?? {},
+        )) {
+            this.requireSyncSession(generation);
+            if (!this.syncConflicts.has(record.conflictPath)) {
+                this.archiveFolderConflictResolution(record, 'superseded');
+                continue;
+            }
+            if (record.phase==='blocked') {
+                continue;
+            }
+            const result = await this.enqueueSync(
+                record.conflictPath,
+                () => this.resumeFolderConflictResolution(record, generation),
+                generation,
+            ) as LocalReplicaConflictResolutionResult | undefined;
+            if (result?.resolved) {
+                resolved += 1;
+            }
+        }
+        if (this.syncManifestDirty) {
+            await this.persistSyncManifest(true, generation);
+        }
+        return resolved;
+    }
+
+    public async resolveMissingFolderConflictWithOverleafState(
+        relPath: string,
+        preserveLocal = false,
+    ): Promise<LocalReplicaConflictResolutionResult> {
+        const generation = this.syncGeneration;
+        this.requireSyncSession(generation);
+        const confinedRelPath = this.normalizeConfinedRelPath(
+            relPath,
+            'resolve missing folder conflict using Overleaf state',
+        );
+        if (
+            confinedRelPath===undefined
+            || !this.syncConflicts.has(confinedRelPath)
+            || !this.syncManifest
+        ) {
+            return {resolved: false};
+        }
+        const result = await this.enqueueSync(
+            confinedRelPath,
+            async () => {
+                const proof = await this.prepareConflictResolutionProof(
+                    confinedRelPath,
+                    confinedRelPath,
+                    generation,
+                    true,
+                );
+                if (proof===undefined || proof.remoteState.kind!=='missing') {
+                    return {resolved: false};
+                }
+                const local = await this.captureStableFolderConflictLocalState(
+                    confinedRelPath,
+                    generation,
+                );
+                if (local===undefined || local.kind!=='directory') {
+                    return {resolved: false};
+                }
+                const id = crypto.randomBytes(16).toString('hex');
+                const choice: SyncManifestFolderConflictResolutionChoice = preserveLocal
+                    ? 'keep-both'
+                    : 'keep-overleaf';
+                const record: SyncManifestFolderConflictResolution = {
+                    version: 1,
+                    id,
+                    conflictPath: confinedRelPath,
+                    choice,
+                    localKind: local.kind,
+                    localRevision: local.revision,
+                    localIdentity: local.identity,
+                    remoteKind: 'missing',
+                    remoteRevision: DELETE_DIGEST,
+                    artifactRelPath: choice==='keep-both'
+                        ? '/' + REPLICA_SETTINGS_DIR + '/conflicts/' + id
+                            + '/artifact' + confinedRelPath
+                        : undefined,
+                    guardRelPath: choice==='keep-overleaf'
+                        ? '/' + REPLICA_SETTINGS_DIR + '/conflicts/' + id
+                            + '/guard' + confinedRelPath
+                        : undefined,
+                    phase: 'prepared',
+                    createdAt: new Date().toISOString(),
+                    updatedAt: new Date().toISOString(),
+                };
+                const blocker = await this.folderConflictResolutionBlocker(
+                    record,
+                    local,
+                    proof.remoteState,
+                    generation,
+                );
+                if (blocker!==undefined) {
+                    getOutputChannel().appendLine(
+                        new Date().toISOString()
+                        + ' [folder conflict resolution deferred] '
+                        + confinedRelPath
+                        + ': '
+                        + blocker,
+                    );
+                    return {resolved: false};
+                }
+                const existing = this.syncManifest?.folderConflictResolutions[confinedRelPath];
+                if (existing) {
+                    this.archiveFolderConflictResolution(existing, 'superseded');
+                }
+                this.syncManifest!.folderConflictResolutions[confinedRelPath] = record;
+                this.markSyncManifestDirty();
+                await this.persistSyncManifest(true, generation);
+                return this.resumeFolderConflictResolution(record, generation);
+            },
+            generation,
+        ) as LocalReplicaConflictResolutionResult | undefined;
+        return result ?? {resolved: false};
+    }
+
     private async refreshConflictRemoteProof(
         conflictPath: string,
         generation = this.syncGeneration,
@@ -8433,6 +9344,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         const staleResolution = this.syncManifest?.conflictResolutions[relPath];
         if (staleResolution) {
             this.archiveConflictResolution(staleResolution, 'superseded');
+        }
+        const staleFolderResolution = this.syncManifest?.folderConflictResolutions[relPath];
+        if (staleFolderResolution) {
+            this.archiveFolderConflictResolution(staleFolderResolution, 'superseded');
         }
         const ancestorConflicts = [...this.syncConflicts.keys()]
             .filter(path => this.isPathAtOrBelow(relPath, path))
@@ -13790,6 +14705,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             // startup file loop can infer this decision. Re-drive only paths
             // whose local revision changed, and let applySync re-verify the
             // persisted Overleaf revision before it mutates or clears anything.
+            await this.reconcilePersistedFolderConflictResolutionTransactions(generation);
+            this.requireSyncSession(generation);
             await this.reconcilePersistedConflictResolutionTransactions(generation);
             this.requireSyncSession(generation);
             await this.reconcilePersistedConflictChoicesOnStartup(generation);

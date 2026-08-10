@@ -556,6 +556,53 @@ suite('Select Project Folder Local Replica', function () {
         },
     } as vscode.Memento;
 
+    async function createFolderDeleteConflictFixture(prefix: string) {
+        const remoteRoot = await tempDir('sr-overleaf-' + prefix + '-remote-');
+        const localRoot = await tempDir('sr-overleaf-' + prefix + '-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteFolder = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const remoteImage = vscode.Uri.joinPath(remoteFolder, 'figures', 'a.png');
+        const remotePdf = vscode.Uri.joinPath(remoteFolder, 'paper.pdf');
+        const localFolder = vscode.Uri.joinPath(localRoot, 'chapter');
+        const localImage = vscode.Uri.joinPath(localFolder, 'figures', 'a.png');
+        const localPdf = vscode.Uri.joinPath(localFolder, 'paper.pdf');
+        const localZip = vscode.Uri.joinPath(localFolder, 'local-only.zip');
+        const remoteImageContent = Buffer.from([1, 2, 3]);
+        const remotePdfContent = Buffer.from([4, 5, 6]);
+        const localPdfContent = Buffer.from([7, 8, 9]);
+        const localZipContent = Buffer.from([10, 11, 12]);
+        await writeBytes(remoteImage, remoteImageContent);
+        await writeBytes(remotePdf, remotePdfContent);
+        await vscode.workspace.fs.createDirectory(vscode.Uri.joinPath(remoteFolder, 'empty'));
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localPdf, localPdfContent);
+        await vscode.workspace.fs.delete(localImage);
+        await writeBytes(localZip, localZipContent);
+        await vscode.workspace.fs.delete(remoteFolder, {recursive: true});
+
+        const conflict = await (scm as any).applySync(
+            'pull',
+            'delete',
+            '/chapter',
+            remoteFolder,
+            localFolder,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflict.outcome, 'blocked');
+        assert.ok((scm as any).syncConflicts.has('/chapter'));
+        return {
+            scm,
+            remoteRoot,
+            localRoot,
+            remoteFolder,
+            localFolder,
+            localPdf,
+            localZip,
+            localPdfContent,
+            localZipContent,
+        };
+    }
+
     async function createBinaryConflictFixture(
         prefix: string,
         relativePath = 'figure.png',
@@ -3910,7 +3957,7 @@ suite('Select Project Folder Local Replica', function () {
         );
         const interruptedManifest = JSON.parse(await readText(manifestUri));
         const pending = interruptedManifest.pendingOperations['/main.tex'];
-        assert.strictEqual(interruptedManifest.version, 10);
+        assert.strictEqual(interruptedManifest.version, 11);
         assert.strictEqual(pending.kind, 'update');
         assert.strictEqual(pending.localKind, 'file');
         assert.strictEqual(pending.localRevision, sha1('offline local update'));
@@ -4054,11 +4101,11 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 10);
+        assert.strictEqual(migratedManifest.version, 11);
         assert.deepStrictEqual(migratedManifest.pendingOperations, {});
     });
 
-    test('records remote entity and stable local inode identities in manifest v10', async () => {
+    test('records remote entity and stable local inode identities in manifest v11', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-identity-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-identity-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -4077,7 +4124,7 @@ suite('Select Project Folder Local Replica', function () {
             REPLICA_SETTINGS_DIR,
             'sync-manifest.json',
         )));
-        assert.strictEqual(manifest.version, 10);
+        assert.strictEqual(manifest.version, 11);
         assert.deepStrictEqual(manifest.files['/main.tex'].remoteEntity, {id: 'doc-main', type: 'doc'});
         assert.deepStrictEqual(manifest.files['/figure.png'].remoteEntity, {id: 'file-figure', type: 'file'});
         for (const entry of [
@@ -5519,6 +5566,146 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(
             (scm as any).syncManifest.conflicts['/figure.png'].remoteRevision,
             sha1(secondRemote),
+        );
+    });
+
+    test('keeps both folder trees when accepting a verified Overleaf folder deletion', async () => {
+        const fixture = await createFolderDeleteConflictFixture('folder-keep-both-delete');
+
+        const result = await fixture.scm.resolveMissingFolderConflictWithOverleafState(
+            '/chapter',
+            true,
+        );
+
+        assert.strictEqual(result.resolved, true);
+        assert.match(
+            result.artifactRelPath!,
+            /^\/\.semantic-researcher-overleaf\/conflicts\/[a-f0-9]{32}\/artifact\/chapter$/,
+        );
+        assert.strictEqual(await pathExists(fixture.localFolder), false);
+        assert.strictEqual(await pathExists(fixture.remoteFolder), false);
+        const artifact = uriForRelPath(fixture.localRoot, result.artifactRelPath!);
+        assert.deepStrictEqual(
+            await readBytes(vscode.Uri.joinPath(artifact, 'paper.pdf')),
+            fixture.localPdfContent,
+        );
+        assert.deepStrictEqual(
+            await readBytes(vscode.Uri.joinPath(artifact, 'local-only.zip')),
+            fixture.localZipContent,
+        );
+        assert.strictEqual(
+            await pathExists(vscode.Uri.joinPath(artifact, 'figures', 'a.png')),
+            false,
+        );
+        assert.strictEqual(
+            await pathExists(vscode.Uri.joinPath(artifact, 'empty')),
+            true,
+        );
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/chapter'), false);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.folderConflictResolutions['/chapter'],
+            undefined,
+        );
+        const history = (fixture.scm as any).syncManifest.folderConflictResolutionHistory;
+        assert.strictEqual(history.at(-1).choice, 'keep-both');
+        assert.strictEqual(history.at(-1).outcome, 'completed');
+    });
+
+    test('uses a private retained guard when accepting a verified Overleaf folder deletion', async () => {
+        const fixture = await createFolderDeleteConflictFixture('folder-keep-overleaf-delete');
+
+        const result = await fixture.scm.resolveMissingFolderConflictWithOverleafState(
+            '/chapter',
+            false,
+        );
+
+        assert.strictEqual(result.resolved, true);
+        assert.strictEqual(result.artifactRelPath, undefined);
+        assert.strictEqual(await pathExists(fixture.localFolder), false);
+        assert.strictEqual(await pathExists(fixture.remoteFolder), false);
+        const history = (fixture.scm as any).syncManifest.folderConflictResolutionHistory;
+        const guard = history.at(-1).guardRelPath;
+        assert.match(
+            guard,
+            /^\/\.semantic-researcher-overleaf\/conflicts\/[a-f0-9]{32}\/guard\/chapter$/,
+        );
+        assert.deepStrictEqual(
+            await readBytes(uriForRelPath(fixture.localRoot, guard + '/paper.pdf')),
+            fixture.localPdfContent,
+        );
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/chapter'), false);
+    });
+
+    test('recovers a folder Keep Both deletion after its canonical phase persistence is interrupted', async () => {
+        const fixture = await createFolderDeleteConflictFixture('folder-keep-both-restart');
+        const originalSetPhase = (fixture.scm as any)
+            .setFolderConflictResolutionPhase.bind(fixture.scm);
+        (fixture.scm as any).setFolderConflictResolutionPhase = (
+            ...args: unknown[]
+        ) => args[1]==='canonical-applied'
+            ? false
+            : originalSetPhase(...args);
+
+        let result: any;
+        try {
+            result = await fixture.scm.resolveMissingFolderConflictWithOverleafState(
+                '/chapter',
+                true,
+            );
+        } finally {
+            (fixture.scm as any).setFolderConflictResolutionPhase = originalSetPhase;
+        }
+
+        assert.strictEqual(result.resolved, false);
+        assert.strictEqual(await pathExists(fixture.localFolder), false);
+        const interrupted = (fixture.scm as any).syncManifest
+            .folderConflictResolutions['/chapter'];
+        assert.strictEqual(interrupted.phase, 'local-preserved');
+        assert.deepStrictEqual(
+            await readBytes(uriForRelPath(
+                fixture.localRoot,
+                interrupted.artifactRelPath + '/paper.pdf',
+            )),
+            fixture.localPdfContent,
+        );
+
+        await fixture.scm.deactivate();
+        const restarted = createSCM(fixture.remoteRoot, fixture.localRoot);
+        assert.strictEqual(
+            await restarted.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.strictEqual(await pathExists(fixture.localFolder), false);
+        assert.strictEqual(await pathExists(fixture.remoteFolder), false);
+        assert.strictEqual((restarted as any).syncConflicts.has('/chapter'), false);
+        assert.strictEqual(
+            (restarted as any).syncManifest.folderConflictResolutions['/chapter'],
+            undefined,
+        );
+        assert.strictEqual(
+            (restarted as any).syncManifest.folderConflictResolutionHistory.at(-1).outcome,
+            'completed',
+        );
+    });
+
+    test('defers missing-folder conflict resolution before local mutation when a child operation is pending', async () => {
+        const fixture = await createFolderDeleteConflictFixture('folder-keep-both-pending');
+        (fixture.scm as any).syncManifest.pendingOperations['/chapter/paper.pdf'] = {
+            id: 'pending-folder-child',
+            kind: 'update',
+        };
+
+        const result = await fixture.scm.resolveMissingFolderConflictWithOverleafState(
+            '/chapter',
+            true,
+        );
+
+        assert.strictEqual(result.resolved, false);
+        assert.strictEqual(await pathExists(fixture.localFolder), true);
+        assert.deepStrictEqual(await readBytes(fixture.localPdf), fixture.localPdfContent);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.folderConflictResolutions['/chapter'],
+            undefined,
         );
     });
 
