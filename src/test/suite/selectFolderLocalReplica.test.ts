@@ -6701,6 +6701,84 @@ suite('Select Project Folder Local Replica', function () {
         );
     });
 
+    test('recovers a folder deletion when local preservation phase persistence is interrupted', async () => {
+        for (const preserveLocal of [true, false]) {
+            const fixture = await createFolderDeleteConflictFixture(
+                'folder-delete-preserve-phase-' + (preserveLocal ? 'both' : 'overleaf'),
+            );
+            const originalSetPhase = (fixture.scm as any)
+                .setFolderConflictResolutionPhase.bind(fixture.scm);
+            (fixture.scm as any).setFolderConflictResolutionPhase = (
+                ...args: unknown[]
+            ) => args[1]==='local-preserved'
+                ? false
+                : originalSetPhase(...args);
+
+            let result: any;
+            try {
+                result = await fixture.scm.resolveMissingFolderConflictWithOverleafState(
+                    '/chapter',
+                    preserveLocal,
+                );
+            } finally {
+                (fixture.scm as any).setFolderConflictResolutionPhase = originalSetPhase;
+            }
+
+            assert.strictEqual(result.resolved, false, String(preserveLocal));
+            const interrupted = (fixture.scm as any).syncManifest
+                .folderConflictResolutions['/chapter'];
+            assert.strictEqual(interrupted.phase, 'prepared', String(preserveLocal));
+            assert.strictEqual(await pathExists(fixture.localFolder), false, String(preserveLocal));
+            assert.strictEqual(await pathExists(fixture.remoteFolder), false, String(preserveLocal));
+            const storedRelPath = preserveLocal
+                ? interrupted.artifactRelPath
+                : interrupted.guardRelPath;
+            assert.deepStrictEqual(
+                await readBytes(uriForRelPath(
+                    fixture.localRoot,
+                    storedRelPath + '/paper.pdf',
+                )),
+                fixture.localPdfContent,
+                String(preserveLocal),
+            );
+            const persisted = JSON.parse(Buffer.from(
+                await vscode.workspace.fs.readFile((fixture.scm as any).syncManifestUri),
+            ).toString('utf8'));
+            assert.strictEqual(
+                persisted.folderConflictResolutions['/chapter'].phase,
+                'prepared',
+                String(preserveLocal),
+            );
+
+            await fixture.scm.deactivate();
+            const restarted = createSCM(fixture.remoteRoot, fixture.localRoot);
+            assert.strictEqual(
+                await restarted.initializeLocalReplica({preserveExistingLocalFiles: true}),
+                true,
+                String(preserveLocal),
+            );
+            assert.strictEqual(await pathExists(fixture.localFolder), false, String(preserveLocal));
+            assert.strictEqual(await pathExists(fixture.remoteFolder), false, String(preserveLocal));
+            assert.deepStrictEqual(
+                await readBytes(uriForRelPath(
+                    fixture.localRoot,
+                    storedRelPath + '/paper.pdf',
+                )),
+                fixture.localPdfContent,
+                String(preserveLocal),
+            );
+            assert.strictEqual((restarted as any).syncConflicts.has('/chapter'), false);
+            assert.strictEqual(
+                (restarted as any).syncManifest.folderConflictResolutions['/chapter'],
+                undefined,
+                String(preserveLocal),
+            );
+            const history = (restarted as any).syncManifest.folderConflictResolutionHistory.at(-1);
+            assert.strictEqual(history.choice, preserveLocal ? 'keep-both' : 'keep-overleaf');
+            assert.strictEqual(history.outcome, 'completed');
+        }
+    });
+
     test('defers missing-folder conflict resolution before local mutation when a child operation is pending', async () => {
         const fixture = await createFolderDeleteConflictFixture('folder-keep-both-pending');
         (fixture.scm as any).syncManifest.pendingOperations['/chapter/paper.pdf'] = {
