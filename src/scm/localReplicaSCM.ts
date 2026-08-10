@@ -6834,6 +6834,31 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return [...this.syncConflicts.keys()].some(path => this.isPathAtOrBelow(path, relPath));
     }
 
+    /**
+     * A recursive tree delete must not consume a subtree while a durable child
+     * intent still needs its original path or destination. Pending move
+     * destinations matter too: deleting a folder that a move is entering
+     * would otherwise erase the move's verified destination precondition.
+     */
+    private pendingOperationAtOrBelow(relPath: string): string | undefined {
+        for (const [sourceRelPath, operation] of Object.entries(
+            this.syncManifest?.pendingOperations ?? {},
+        )) {
+            if (this.isPathAtOrBelow(sourceRelPath, relPath)) {
+                return operation.kind==='move'
+                    ? `${sourceRelPath} -> ${operation.destinationRelPath} (${operation.kind})`
+                    : `${sourceRelPath} (${operation.kind})`;
+            }
+            if (
+                operation.kind==='move'
+                && this.isPathAtOrBelow(operation.destinationRelPath, relPath)
+            ) {
+                return `${sourceRelPath} -> ${operation.destinationRelPath} (${operation.kind})`;
+            }
+        }
+        return undefined;
+    }
+
     private touchesSyncConflict(relPath: string): boolean {
         return [...this.syncConflicts.keys()].some(path =>
             this.isPathAtOrBelow(relPath, path)
@@ -11275,6 +11300,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 let expectedRemoteDeleteRevision: string | undefined;
                 let localDeleteState: PathRevision | undefined;
                 let remoteDeleteState: PathRevision | undefined;
+
+                if (directoryDelete) {
+                    const pendingDescendant = this.pendingOperationAtOrBelow(relPath);
+                    if (pendingDescendant!==undefined) {
+                        getOutputChannel().appendLine(
+                            `${new Date().toISOString()} [folder delete deferred:pending-descendant] ` +
+                            `${relPath}: ${pendingDescendant}`,
+                        );
+                        outcome = 'blocked';
+                        errorMessage = 'unresolved descendant local operation';
+                        return;
+                    }
+                }
 
                 // Layer 3 — suppress a pull-delete for a path we never
                 // authoritatively replicated. The cascade starts here: a VFS

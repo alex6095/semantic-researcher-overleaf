@@ -4115,6 +4115,83 @@ suite('Select Project Folder Local Replica', function () {
             /folder was deleted|sync conflict/i,
         );
     });
+    test('blocks a remote folder delete while a child journal operation remains unresolved', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-pending-child-pull-remote-');
+        const localRoot = await tempDir('sr-overleaf-pending-child-pull-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteChapter = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const localChapter = vscode.Uri.joinPath(localRoot, 'chapter');
+        const remoteChild = vscode.Uri.joinPath(remoteChapter, 'main.tex');
+        const localChild = vscode.Uri.joinPath(localChapter, 'main.tex');
+        await writeText(remoteChild, 'baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        const generation = internals.syncGeneration as number;
+        const remoteBeforeDelete = await internals.captureRemotePathRevision(
+            '/chapter/main.tex', generation,
+        );
+        await internals.journalPendingFilePushOperation(
+            '/chapter/main.tex',
+            'update',
+            sha1('baseline'),
+            remoteBeforeDelete,
+            generation,
+        );
+        await vscode.workspace.fs.delete(remoteChapter, {recursive: true});
+
+        const event = await internals.applySync(
+            'pull', 'delete', '/chapter', remoteChapter, localChapter,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(event.error, 'unresolved descendant local operation');
+        assert.strictEqual(await readText(localChild), 'baseline');
+        assert.strictEqual(
+            internals.syncManifest.pendingOperations['/chapter/main.tex'].kind,
+            'update',
+        );
+    });
+
+    test('blocks a local folder delete while a child move destination remains unresolved', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-pending-child-push-remote-');
+        const localRoot = await tempDir('sr-overleaf-pending-child-push-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const remoteSource = vscode.Uri.joinPath(remoteRoot, 'outside.tex');
+        const remoteChapter = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const localChapter = vscode.Uri.joinPath(localRoot, 'chapter');
+        await writeText(remoteSource, 'baseline');
+        await writeText(vscode.Uri.joinPath(remoteChapter, 'main.tex'), 'chapter baseline');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const internals = scm as any;
+        const generation = internals.syncGeneration as number;
+        const sourceEntry = internals.syncManifest.files['/outside.tex'];
+        const sourceRemoteState = await internals.captureRemotePathRevision(
+            '/outside.tex', generation,
+        );
+        await internals.journalPendingLocalFileMove(
+            '/outside.tex',
+            '/chapter/moved.tex',
+            sourceEntry,
+            sourceRemoteState,
+            generation,
+        );
+        await vscode.workspace.fs.delete(localChapter, {recursive: true});
+
+        const event = await internals.applySync(
+            'push', 'delete', '/chapter', localChapter, remoteChapter,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(event.error, 'unresolved descendant local operation');
+        assert.strictEqual(await readText(vscode.Uri.joinPath(remoteChapter, 'main.tex')), 'chapter baseline');
+        assert.strictEqual(
+            internals.syncManifest.pendingOperations['/outside.tex'].kind,
+            'move',
+        );
+    });
+
 
     test('preflights a recursive folder delete before deleting any unchanged sibling', async () => {
         const remoteRoot = await tempDir('sr-overleaf-folder-atomic-remote-');
