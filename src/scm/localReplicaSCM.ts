@@ -40,7 +40,11 @@ import { EventBus, Events } from '../utils/eventBus';
 import { formatUnknownError } from '../utils/errorMessage';
 import { getOutputChannel } from '../utils/outputChannel';
 import { PROTECTED_LOCAL_REPLICA_IGNORE_PATTERNS } from './replicaIgnorePatterns';
-import { decodeUtf8Text, mergeUtf8Text } from '../utils/threeWayMerge';
+import {
+    decodeUtf8Text,
+    mergeUtf8Text,
+    mergeUtf8TextWithConflictMarkers,
+} from '../utils/threeWayMerge';
 
 const IGNORE_SETTING_KEY = 'ignore-patterns';
 const ECHO_WINDOW_MS = 500;
@@ -181,6 +185,13 @@ interface SyncManifestConflictEntry {
     localDigest: string;
     remoteKind?: PathRevision['kind'];
     remoteRevision?: string;
+    // A merge review is available only when the exact common baseline and
+    // remote entity proof were captured at conflict time. Legacy, binary and
+    // over-limit conflicts intentionally omit this proof.
+    mergeBaseContentBase64?: string;
+    mergeBaseRevision?: string;
+    mergeRemoteEntity?: SyncManifestRemoteEntityIdentity;
+    mergeRemoteParentEntity?: SyncManifestRemoteFolderIdentity;
     updatedAt: string;
 }
 
@@ -267,8 +278,46 @@ interface SyncManifestFolderConflictResolutionHistoryEntry {
     completedAt: string;
 }
 
+type SyncManifestTextMergeResolutionPhase =
+    | 'prepared'
+    | 'canonical-applied'
+    | 'remote-applied'
+    | 'blocked';
+
+// The user-authored merged bytes are persisted only after explicit confirmation.
+// Preview drafts deliberately stay in memory; this record makes the canonical
+// write and subsequent guarded Overleaf update crash-recoverable.
+interface SyncManifestTextMergeResolution {
+    version: 1;
+    id: string;
+    conflictPath: string;
+    baseRevision: string;
+    localRevision: string;
+    localIdentity: LocalReadIdentity;
+    remoteRevision: string;
+    remoteEntity: SyncManifestRemoteEntityIdentity;
+    remoteParentEntity: SyncManifestRemoteFolderIdentity;
+    resultContentBase64: string;
+    resultRevision: string;
+    phase: SyncManifestTextMergeResolutionPhase;
+    createdAt: string;
+    updatedAt: string;
+}
+
+interface SyncManifestTextMergeResolutionHistoryEntry {
+    version: 1;
+    id: string;
+    conflictPath: string;
+    baseRevision: string;
+    localRevision: string;
+    remoteRevision: string;
+    resultRevision: string;
+    outcome: 'completed' | 'superseded' | 'blocked';
+    completedAt: string;
+}
+
 interface SyncManifest {
-    version: 13;
+    version: 14;
     projectUri: string;
     baselineComplete: boolean;
     files: Record<string, SyncManifestEntry>;
@@ -278,6 +327,8 @@ interface SyncManifest {
     conflictResolutionHistory: SyncManifestConflictResolutionHistoryEntry[];
     folderConflictResolutions: Record<string, SyncManifestFolderConflictResolution>;
     folderConflictResolutionHistory: SyncManifestFolderConflictResolutionHistoryEntry[];
+    textMergeResolutions: Record<string, SyncManifestTextMergeResolution>;
+    textMergeResolutionHistory: SyncManifestTextMergeResolutionHistoryEntry[];
     pendingOperations: Record<string, SyncManifestPendingOperation>;
 }
 
@@ -548,6 +599,9 @@ interface ApplySyncOptions {
     resolveConflict?: boolean;
     deferConflictResolution?: boolean;
     acceptUnchangedLocalConflictState?: boolean;
+    // An explicit text-merge transaction must never accidentally transmit a
+    // later agent/editor write that arrived after its candidate was installed.
+    expectedPushContent?: Uint8Array;
     skipDirectoryDescendants?: boolean;
 }
 
@@ -593,6 +647,21 @@ type SyncOwnerProbe =
 interface ConflictResolutionProof {
     conflictPath: string;
     remoteState: PathRevision;
+}
+
+interface TextMergePreviewSession {
+    id: string;
+    relPath: string;
+    generation: number;
+    baseContent: Uint8Array;
+    baseRevision: string;
+    localContent: Uint8Array;
+    localRevision: string;
+    localIdentity: LocalReadIdentity;
+    remoteContent: Uint8Array;
+    remoteRevision: string;
+    remoteEntity: SyncManifestRemoteEntityIdentity;
+    remoteParentEntity: SyncManifestRemoteFolderIdentity;
 }
 
 type StableConflictLocalState =
@@ -754,6 +823,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         generation: number;
         promise: Promise<void>;
     };
+    private textMergeResolutionReplay?: {
+        generation: number;
+        promise: Promise<void>;
+    };
     // Files we have written locally at least once. A push-delete arriving for a
     // relPath that isn't in here AND isn't in baseCache is treated as an echo,
     // not a user-driven delete, and is refused in the delete-guard layer.
@@ -833,6 +906,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     }>();
     private syncConflicts: Map<string, string> = new Map();
     private conflictLocalDigests: Map<string, string> = new Map();
+    // Preview sessions intentionally live only in memory: displaying Base /
+    // Local / Overleaf must not make a conflict decision or alter either copy.
+    private textMergePreviewSessions = new Map<string, TextMergePreviewSession>();
+    private textMergePreviewPanels = new Map<string, vscode.WebviewPanel>();
+    private textMergePreviewBusy = new Set<string>();
     private localReplicaSettings?: {
         uri: string,
         serverName: string,
@@ -917,6 +995,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private static readonly remoteDeleteConflictWindowMs = 5_000;
     private static readonly maxConflictResolutionHistoryEntries = 20;
     private static readonly maxFolderConflictResolutionHistoryEntries = 20;
+    private static readonly maxTextMergeResolutionHistoryEntries = 20;
     // How long a watcher-observed update may keep looking for a path that has
     // momentarily vanished before the absence is accepted as a real deletion.
     // An atomic rename replacement closes in microseconds; this only has to
@@ -2180,6 +2259,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         releaseOwnership = true,
     ) {
         if (generation!==undefined && generation!==this.syncGeneration) { return; }
+        this.disposeTextMergePreviewSessions();
         this.stopSyncInputs(generation);
         this.syncSessionActive = false;
         this.syncGeneration += 1;
@@ -3824,7 +3904,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private emptySyncManifest(baselineComplete = true): SyncManifest {
         return {
-            version: 13,
+            version: 14,
             projectUri: stringifyOverleafUri(this.vfs.origin),
             baselineComplete,
             files: {},
@@ -3834,6 +3914,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             conflictResolutionHistory: [],
             folderConflictResolutions: {},
             folderConflictResolutionHistory: [],
+            textMergeResolutions: {},
+            textMergeResolutionHistory: [],
             pendingOperations: {},
         };
     }
@@ -3969,11 +4051,42 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             )
             && this.isValidRecordedPathRevision(entry.remoteRevision)
         );
+        const hasMergeProof = (
+            entry.mergeBaseContentBase64!==undefined
+            || entry.mergeBaseRevision!==undefined
+            || entry.mergeRemoteEntity!==undefined
+            || entry.mergeRemoteParentEntity!==undefined
+        );
+        const mergeBase = entry.mergeBaseContentBase64;
+        const mergeBaseContent = typeof mergeBase==='string'
+            ? Buffer.from(mergeBase, 'base64')
+            : undefined;
+        const validMergeProof = !hasMergeProof || (
+            entry.remoteKind==='file'
+            && /^[a-f0-9]{40}$/.test(entry.remoteRevision ?? '')
+            && typeof mergeBase==='string'
+            && mergeBase.length<=Math.ceil(
+                LocalReplicaSCMProvider.maxMergeBaselineBytes*4/3,
+            )+4
+            && mergeBase.length%4===0
+            && /^[A-Za-z0-9+/]*={0,2}$/.test(mergeBase)
+            && mergeBaseContent!==undefined
+            && mergeBaseContent.toString('base64')===mergeBase
+            && decodeUtf8Text(
+                mergeBaseContent,
+                LocalReplicaSCMProvider.maxMergeBaselineBytes,
+            )!==undefined
+            && contentDigest(mergeBaseContent)===entry.mergeBaseRevision
+            && /^[a-f0-9]{40}$/.test(entry.mergeBaseRevision ?? '')
+            && this.isValidSyncManifestRemoteEntityIdentity(entry.mergeRemoteEntity)
+            && this.isValidSyncManifestFolderIdentity(entry.mergeRemoteParentEntity)
+        );
         return typeof entry.reason==='string'
             && entry.reason.length>0
             && entry.reason.length<=16_384
             && this.isValidRecordedPathRevision(entry.localDigest)
             && validRemoteProof
+            && validMergeProof
             && typeof entry.updatedAt==='string'
             && Number.isFinite(Date.parse(entry.updatedAt));
     }
@@ -4173,6 +4286,80 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && this.isValidRecordedPathRevision(entry.remoteRevision)
             && validStoredPath(entry.artifactRelPath, 'artifact')
             && validStoredPath(entry.guardRelPath, 'guard')
+            && (
+                entry.outcome==='completed'
+                || entry.outcome==='superseded'
+                || entry.outcome==='blocked'
+            )
+            && typeof entry.completedAt==='string'
+            && Number.isFinite(Date.parse(entry.completedAt));
+    }
+
+    private isValidSyncManifestTextMergeResolution(
+        value: unknown,
+    ): value is SyncManifestTextMergeResolution {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const entry = value as Partial<SyncManifestTextMergeResolution>;
+        const resultContent = typeof entry.resultContentBase64==='string'
+            ? Buffer.from(entry.resultContentBase64, 'base64')
+            : undefined;
+        const validResult = typeof entry.resultContentBase64==='string'
+            && entry.resultContentBase64.length<=Math.ceil(
+                LocalReplicaSCMProvider.maxMergeBaselineBytes*4/3,
+            )+4
+            && entry.resultContentBase64.length%4===0
+            && /^[A-Za-z0-9+/]*={0,2}$/.test(entry.resultContentBase64)
+            && resultContent!==undefined
+            && resultContent.toString('base64')===entry.resultContentBase64
+            && decodeUtf8Text(
+                resultContent,
+                LocalReplicaSCMProvider.maxMergeBaselineBytes,
+            )!==undefined
+            && contentDigest(resultContent)===entry.resultRevision;
+        return entry.version===1
+            && typeof entry.id==='string'
+            && /^[a-f0-9]{32}$/.test(entry.id)
+            && typeof entry.conflictPath==='string'
+            && this.isCanonicalReplicaRelPath(entry.conflictPath)
+            && /^[a-f0-9]{40}$/.test(entry.baseRevision ?? '')
+            && /^[a-f0-9]{40}$/.test(entry.localRevision ?? '')
+            && this.isValidLocalReadIdentity(entry.localIdentity)
+            && /^[a-f0-9]{40}$/.test(entry.remoteRevision ?? '')
+            && this.isValidSyncManifestRemoteEntityIdentity(entry.remoteEntity)
+            && entry.remoteEntity.type==='doc'
+            && this.isValidSyncManifestFolderIdentity(entry.remoteParentEntity)
+            && validResult
+            && /^[a-f0-9]{40}$/.test(entry.resultRevision ?? '')
+            && (
+                entry.phase==='prepared'
+                || entry.phase==='canonical-applied'
+                || entry.phase==='remote-applied'
+                || entry.phase==='blocked'
+            )
+            && typeof entry.createdAt==='string'
+            && Number.isFinite(Date.parse(entry.createdAt))
+            && typeof entry.updatedAt==='string'
+            && Number.isFinite(Date.parse(entry.updatedAt));
+    }
+
+    private isValidSyncManifestTextMergeResolutionHistoryEntry(
+        value: unknown,
+    ): value is SyncManifestTextMergeResolutionHistoryEntry {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const entry = value as Partial<SyncManifestTextMergeResolutionHistoryEntry>;
+        return entry.version===1
+            && typeof entry.id==='string'
+            && /^[a-f0-9]{32}$/.test(entry.id)
+            && typeof entry.conflictPath==='string'
+            && this.isCanonicalReplicaRelPath(entry.conflictPath)
+            && /^[a-f0-9]{40}$/.test(entry.baseRevision ?? '')
+            && /^[a-f0-9]{40}$/.test(entry.localRevision ?? '')
+            && /^[a-f0-9]{40}$/.test(entry.remoteRevision ?? '')
+            && /^[a-f0-9]{40}$/.test(entry.resultRevision ?? '')
             && (
                 entry.outcome==='completed'
                 || entry.outcome==='superseded'
@@ -4501,6 +4688,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 conflictResolutionHistory?: SyncManifestConflictResolutionHistoryEntry[];
                 folderConflictResolutions?: Record<string, SyncManifestFolderConflictResolution>;
                 folderConflictResolutionHistory?: SyncManifestFolderConflictResolutionHistoryEntry[];
+                textMergeResolutions?: Record<string, SyncManifestTextMergeResolution>;
+                textMergeResolutionHistory?: SyncManifestTextMergeResolutionHistoryEntry[];
                 pendingOperations?: Record<string, SyncManifestPendingOperation>;
             };
             let sameProject = false;
@@ -4510,7 +4699,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } catch {
                 sameProject = false;
             }
-            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11 || manifest.version===12 || manifest.version===13)
+            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11 || manifest.version===12 || manifest.version===13 || manifest.version===14)
                 && sameProject
                 && (manifest.baselineComplete===undefined || typeof manifest.baselineComplete==='boolean')
                 && this.isValidSyncManifestRecord<SyncManifestEntry>(
@@ -4535,7 +4724,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     )
                 )
                 && (
-                    manifest.version!==10 && manifest.version!==11 && manifest.version!==12 && manifest.version!==13
+                    manifest.version!==10 && manifest.version!==11 && manifest.version!==12 && manifest.version!==13 && manifest.version!==14
                     || (
                         this.isValidSyncManifestRecord<SyncManifestConflictResolution>(
                             manifest.conflictResolutions,
@@ -4554,7 +4743,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     )
                 )
                 && (
-                    manifest.version!==11 && manifest.version!==12
+                    manifest.version!==11 && manifest.version!==12 && manifest.version!==13 && manifest.version!==14
                     || (
                         this.isValidSyncManifestRecord<SyncManifestFolderConflictResolution>(
                             manifest.folderConflictResolutions,
@@ -4569,6 +4758,25 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             <=LocalReplicaSCMProvider.maxFolderConflictResolutionHistoryEntries
                         && manifest.folderConflictResolutionHistory.every(entry =>
                             this.isValidSyncManifestFolderConflictResolutionHistoryEntry(entry),
+                        )
+                    )
+                )
+                && (
+                    manifest.version!==14
+                    || (
+                        this.isValidSyncManifestRecord<SyncManifestTextMergeResolution>(
+                            manifest.textMergeResolutions,
+                            (value): value is SyncManifestTextMergeResolution =>
+                                this.isValidSyncManifestTextMergeResolution(value),
+                        )
+                        && Object.entries(manifest.textMergeResolutions!).every(
+                            ([relPath, entry]) => entry.conflictPath===relPath,
+                        )
+                        && Array.isArray(manifest.textMergeResolutionHistory)
+                        && manifest.textMergeResolutionHistory.length
+                            <=LocalReplicaSCMProvider.maxTextMergeResolutionHistoryEntries
+                        && manifest.textMergeResolutionHistory.every(entry =>
+                            this.isValidSyncManifestTextMergeResolutionHistoryEntry(entry),
                         )
                     )
                 )
@@ -4588,7 +4796,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (validShape) {
                 this.requireSyncSession(generation);
                 this.syncManifest = {
-                    version: 13,
+                    version: 14,
                     projectUri,
                     baselineComplete: manifest.baselineComplete!==false,
                     files: manifest.files!,
@@ -4596,19 +4804,25 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         ? manifest.directories
                         : {},
                     conflicts: manifest.conflicts ?? {},
-                    conflictResolutions: manifest.version===10 || manifest.version===11 || manifest.version===12 || manifest.version===13
+                    conflictResolutions: manifest.version===10 || manifest.version===11 || manifest.version===12 || manifest.version===13 || manifest.version===14
                         ? manifest.conflictResolutions!
                         : {},
-                    conflictResolutionHistory: manifest.version===10 || manifest.version===11 || manifest.version===12 || manifest.version===13
+                    conflictResolutionHistory: manifest.version===10 || manifest.version===11 || manifest.version===12 || manifest.version===13 || manifest.version===14
                         ? manifest.conflictResolutionHistory!
                         : [],
-                    folderConflictResolutions: manifest.version===11 || manifest.version===12 || manifest.version===13
+                    folderConflictResolutions: manifest.version===11 || manifest.version===12 || manifest.version===13 || manifest.version===14
                         ? manifest.folderConflictResolutions!
                         : {},
-                    folderConflictResolutionHistory: manifest.version===11 || manifest.version===12 || manifest.version===13
+                    folderConflictResolutionHistory: manifest.version===11 || manifest.version===12 || manifest.version===13 || manifest.version===14
                         ? manifest.folderConflictResolutionHistory!
                         : [],
-                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11 || manifest.version===12 || manifest.version===13
+                    textMergeResolutions: manifest.version===14
+                        ? manifest.textMergeResolutions!
+                        : {},
+                    textMergeResolutionHistory: manifest.version===14
+                        ? manifest.textMergeResolutionHistory!
+                        : [],
+                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11 || manifest.version===12 || manifest.version===13 || manifest.version===14
                         ? manifest.pendingOperations!
                         : {},
                 };
@@ -4636,13 +4850,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     ? 'unavailable'
                     : 'trusted';
                 this.syncManifestRevision += 1;
-                this.syncManifestDirty = manifest.version!==13
+                this.syncManifestDirty = manifest.version!==14
                     || manifest.directories===undefined
                     || manifest.conflicts===undefined
                     || manifest.conflictResolutions===undefined
                     || manifest.conflictResolutionHistory===undefined
                     || manifest.folderConflictResolutions===undefined
                     || manifest.folderConflictResolutionHistory===undefined
+                    || manifest.textMergeResolutions===undefined
+                    || manifest.textMergeResolutionHistory===undefined
                     || manifest.baselineComplete===undefined
                     || manifest.projectUri!==projectUri;
                 return;
@@ -8019,6 +8235,28 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+    private conflictMergeBaseContent(
+        entry?: SyncManifestConflictEntry,
+    ): Uint8Array | undefined {
+        if (
+            entry?.mergeBaseContentBase64===undefined
+            || entry.mergeBaseRevision===undefined
+        ) {
+            return undefined;
+        }
+        try {
+            const content = Buffer.from(entry.mergeBaseContentBase64, 'base64');
+            return (
+                contentDigest(content)===entry.mergeBaseRevision
+                && this.decodeMergeableText(content)!==undefined
+            )
+                ? content
+                : undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
     private async markSyncConflict(
         relPath: string,
         reason: string,
@@ -8057,6 +8295,37 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
             }
         }
+        let mergeBaseContent: Uint8Array | undefined;
+        let mergeRemoteIdentity: RemoteFilePathIdentity | undefined;
+        const existingConflict = this.syncManifest?.conflicts[relPath];
+        if (remoteState?.kind==='file') {
+            mergeBaseContent = this.baseCache[relPath]
+                ?? this.manifestBaseContent(this.syncManifest?.files[relPath])
+                ?? this.conflictMergeBaseContent(existingConflict);
+            if (
+                mergeBaseContent===undefined
+                || this.decodeMergeableText(mergeBaseContent)===undefined
+            ) {
+                mergeBaseContent = undefined;
+            }
+            if (mergeBaseContent!==undefined) {
+                try {
+                    mergeRemoteIdentity = await this.resolveStableRemoteFilePathIdentity(
+                        relPath,
+                        remoteState,
+                        generation,
+                    );
+                } catch (error) {
+                    if (!this.isSyncSessionActive(generation)) {
+                        throw error;
+                    }
+                    getOutputChannel().appendLine(
+                        new Date().toISOString() + ' [sync conflict merge proof unavailable] '
+                        + relPath + ': ' + formatUnknownError(error),
+                    );
+                }
+            }
+        }
         this.requireSyncSession(generation);
         this.syncConflicts.set(relPath, reason);
         this.conflictLocalDigests.set(relPath, conflictDigest);
@@ -8066,6 +8335,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 localDigest: conflictDigest,
                 remoteKind: remoteState?.kind,
                 remoteRevision: remoteState?.revision,
+                ...(mergeBaseContent!==undefined && mergeRemoteIdentity!==undefined
+                    ? {
+                        mergeBaseContentBase64: Buffer.from(mergeBaseContent).toString('base64'),
+                        mergeBaseRevision: contentDigest(mergeBaseContent),
+                        mergeRemoteEntity: mergeRemoteIdentity.entity,
+                        mergeRemoteParentEntity: mergeRemoteIdentity.parent,
+                    }
+                    : {}),
                 updatedAt: new Date().toISOString(),
             };
             this.markSyncManifestDirty();
@@ -8305,6 +8582,74 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             );
             return undefined;
         }
+        if (
+            entry.mergeRemoteEntity!==undefined
+            || entry.mergeRemoteParentEntity!==undefined
+        ) {
+            if (
+                remoteConflictState.kind!=='file'
+                || entry.mergeRemoteEntity===undefined
+                || entry.mergeRemoteParentEntity===undefined
+            ) {
+                await this.markSyncConflict(
+                    conflictPath,
+                    'Overleaf changed type after the conflict was recorded; the newer remote state was preserved',
+                    localState.kind==='missing' ? null : localState.content,
+                    generation,
+                    remoteConflictState,
+                );
+                getOutputChannel().appendLine(
+                    new Date().toISOString()
+                    + ' [conflict resolution blocked:remote-identity-changed] '
+                    + conflictPath,
+                );
+                return undefined;
+            }
+            try {
+                const remoteIdentity = await this.resolveStableRemoteFilePathIdentity(
+                    conflictPath,
+                    remoteConflictState,
+                    generation,
+                );
+                if (!this.remoteFilePathIdentityMatches(
+                    remoteIdentity,
+                    entry.mergeRemoteEntity,
+                    entry.mergeRemoteParentEntity,
+                )) {
+                    await this.markSyncConflict(
+                        conflictPath,
+                        'Overleaf replaced the conflicted file entity after the conflict was recorded; the newer remote file was preserved',
+                        localState.kind==='missing' ? null : localState.content,
+                        generation,
+                        remoteConflictState,
+                    );
+                    getOutputChannel().appendLine(
+                        new Date().toISOString()
+                        + ' [conflict resolution blocked:remote-identity-changed] '
+                        + conflictPath,
+                    );
+                    return undefined;
+                }
+            } catch (error) {
+                if (!this.isSyncSessionActive(generation)) {
+                    throw error;
+                }
+                await this.markSyncConflict(
+                    conflictPath,
+                    'The conflicted Overleaf file identity could not be verified; neither state was replaced',
+                    localState.kind==='missing' ? null : localState.content,
+                    generation,
+                    remoteConflictState,
+                );
+                getOutputChannel().appendLine(
+                    new Date().toISOString()
+                    + ' [conflict resolution blocked:remote-identity-proof] '
+                    + conflictPath + ': ' + formatUnknownError(error),
+                );
+                return undefined;
+            }
+        }
+
         if (remoteConflictState.kind==='other') {
             getOutputChannel().appendLine(
                 `${new Date().toISOString()} [conflict resolution blocked:unsupported-remote-type] ${conflictPath}`,
@@ -8339,6 +8684,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             .sort((left, right) => right.split('/').length-left.split('/').length);
         for (const relPath of conflictPaths) {
             this.requireSyncSession(generation);
+            // A durable merged-result transaction owns its conflict until its
+            // own proof/recovery code finishes. Generic startup replay must
+            // never turn that explicit choice into an automatic push.
+            if (this.syncManifest?.textMergeResolutions[relPath]!==undefined) {
+                continue;
+            }
             if (!await this.hasLocalConflictRevision(relPath, generation)) {
                 continue;
             }
@@ -8381,6 +8732,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (
             confinedRelPath===undefined
             || !this.syncConflicts.has(confinedRelPath)
+            || this.syncManifest?.textMergeResolutions[confinedRelPath]!==undefined
         ) {
             return false;
         }
@@ -9082,6 +9434,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             confinedRelPath===undefined
             || !this.syncConflicts.has(confinedRelPath)
             || !this.syncManifest
+            || this.syncManifest.textMergeResolutions[confinedRelPath]!==undefined
         ) {
             return {resolved: false};
         }
@@ -9162,6 +9515,1116 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             generation,
         ) as LocalReplicaConflictResolutionResult | undefined;
         return result ?? {resolved: false};
+    }
+
+    private textMergeResolutionResultContent(
+        record: SyncManifestTextMergeResolution,
+    ): Uint8Array | undefined {
+        try {
+            const content = Buffer.from(record.resultContentBase64, 'base64');
+            return (
+                contentDigest(content)===record.resultRevision
+                && this.decodeMergeableText(content)!==undefined
+            )
+                ? content
+                : undefined;
+        } catch {
+            return undefined;
+        }
+    }
+
+    private textMergeResolutionLocalStateMatches(
+        record: SyncManifestTextMergeResolution,
+        local: StableConflictLocalState,
+    ): boolean {
+        return local.kind==='file'
+            && local.revision===record.localRevision
+            && this.localReadIdentityEquals(record.localIdentity, local.identity);
+    }
+
+    private textMergeResolutionResultMatches(
+        record: SyncManifestTextMergeResolution,
+        local: StableConflictLocalState,
+    ): boolean {
+        return local.kind==='file' && local.revision===record.resultRevision;
+    }
+
+    private setTextMergeResolutionPhase(
+        record: SyncManifestTextMergeResolution,
+        phase: SyncManifestTextMergeResolutionPhase,
+    ): boolean {
+        const current = this.syncManifest?.textMergeResolutions[record.conflictPath];
+        if (!current || current.id!==record.id) {
+            return false;
+        }
+        current.phase = phase;
+        current.updatedAt = new Date().toISOString();
+        this.markSyncManifestDirty();
+        return true;
+    }
+
+    private archiveTextMergeResolution(
+        record: SyncManifestTextMergeResolution,
+        outcome: SyncManifestTextMergeResolutionHistoryEntry['outcome'],
+    ): boolean {
+        const manifest = this.syncManifest;
+        const current = manifest?.textMergeResolutions[record.conflictPath];
+        if (!manifest || !current || current.id!==record.id) {
+            return false;
+        }
+        manifest.textMergeResolutionHistory.push({
+            version: 1,
+            id: current.id,
+            conflictPath: current.conflictPath,
+            baseRevision: current.baseRevision,
+            localRevision: current.localRevision,
+            remoteRevision: current.remoteRevision,
+            resultRevision: current.resultRevision,
+            outcome,
+            completedAt: new Date().toISOString(),
+        });
+        if (
+            manifest.textMergeResolutionHistory.length
+            > LocalReplicaSCMProvider.maxTextMergeResolutionHistoryEntries
+        ) {
+            manifest.textMergeResolutionHistory.splice(
+                0,
+                manifest.textMergeResolutionHistory.length
+                    - LocalReplicaSCMProvider.maxTextMergeResolutionHistoryEntries,
+            );
+        }
+        delete manifest.textMergeResolutions[record.conflictPath];
+        this.markSyncManifestDirty();
+        return true;
+    }
+
+    private async blockTextMergeResolution(
+        record: SyncManifestTextMergeResolution,
+        reason: string,
+        generation: number,
+        remoteState?: PathRevision,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        if (!this.setTextMergeResolutionPhase(record, 'blocked')) {
+            return;
+        }
+        await this.markSyncConflict(
+            record.conflictPath,
+            reason,
+            undefined,
+            generation,
+            remoteState,
+        );
+        await this.persistSyncManifest(true, generation);
+    }
+
+    private async captureCurrentTextMergeRemoteState(
+        relPath: string,
+        generation: number,
+    ): Promise<{state: PathRevision; identity: RemoteFilePathIdentity} | undefined> {
+        this.requireSyncSession(generation);
+        await this.refreshRemoteStateForReconciliation(
+            relPath,
+            generation,
+            'verify text merge resolution',
+        );
+        const state = await this.captureRemotePathRevision(relPath, generation);
+        this.requireSyncSession(generation);
+        if (state.kind!=='file' || state.content===undefined) {
+            return undefined;
+        }
+        const identity = await this.resolveStableRemoteFilePathIdentity(
+            relPath,
+            state,
+            generation,
+        );
+        this.requireSyncSession(generation);
+        return {state, identity};
+    }
+
+    private textMergeResolutionRemoteMatches(
+        record: SyncManifestTextMergeResolution,
+        remote: {state: PathRevision; identity: RemoteFilePathIdentity},
+        revision: string,
+    ): boolean {
+        return remote.state.kind==='file'
+            && remote.state.revision===revision
+            && this.remoteFilePathIdentityMatches(
+                remote.identity,
+                record.remoteEntity,
+                record.remoteParentEntity,
+            );
+    }
+
+    private async textMergeResolutionMayProceed(
+        record: SyncManifestTextMergeResolution,
+        generation: number,
+    ): Promise<boolean> {
+        if (this.hasDirtyOpenReplicaDocument(record.conflictPath)) {
+            await this.blockTextMergeResolution(
+                record,
+                'The local editor has unsaved text for this merge; save or discard it before applying the merged result',
+                generation,
+            );
+            return false;
+        }
+        const pending = this.pendingOperationIntersectingPaths(
+            record.conflictPath,
+            record.conflictPath,
+        );
+        if (pending!==undefined) {
+            getOutputChannel().appendLine(
+                new Date().toISOString()
+                + ' [text merge resolution deferred:pending-operation] '
+                + record.conflictPath + ': ' + pending,
+            );
+            return false;
+        }
+        const ordinary = this.activeConflictResolutionIntersectingPaths(
+            record.conflictPath,
+            record.conflictPath,
+        );
+        if (ordinary!==undefined) {
+            getOutputChannel().appendLine(
+                new Date().toISOString()
+                + ' [text merge resolution deferred:file-resolution] '
+                + record.conflictPath + ': ' + ordinary,
+            );
+            return false;
+        }
+        const text = this.activeTextMergeResolutionIntersectingPaths(
+            record.conflictPath,
+            record.conflictPath,
+            record.id,
+        );
+        if (text!==undefined) {
+            getOutputChannel().appendLine(
+                new Date().toISOString()
+                + ' [text merge resolution deferred:text-merge] '
+                + record.conflictPath + ': ' + text,
+            );
+            return false;
+        }
+        const folder = this.activeFolderConflictResolutionIntersectingPaths(
+            record.conflictPath,
+            record.conflictPath,
+        );
+        if (folder!==undefined) {
+            getOutputChannel().appendLine(
+                new Date().toISOString()
+                + ' [text merge resolution deferred:folder-resolution] '
+                + record.conflictPath + ': ' + folder,
+            );
+            return false;
+        }
+        return true;
+    }
+
+    private async installTextMergeCanonicalState(
+        record: SyncManifestTextMergeResolution,
+        local: StableConflictLocalState,
+        result: Uint8Array,
+        generation: number,
+        remoteState: PathRevision,
+    ): Promise<boolean> {
+        if (!this.textMergeResolutionLocalStateMatches(record, local)) {
+            await this.blockTextMergeResolution(
+                record,
+                'The local file changed after the merged result was confirmed; neither copy was replaced',
+                generation,
+                remoteState,
+            );
+            return false;
+        }
+        if (!await this.textMergeResolutionMayProceed(record, generation)) {
+            return false;
+        }
+        const previousBypass = this.snapshotBypassCache(record.conflictPath);
+        this.setBypassCache(record.conflictPath, result, 'push');
+        const applied = await this.writeLocalFileIfRevision(
+            record.conflictPath,
+            result,
+            record.localRevision,
+            generation,
+            record.localIdentity,
+        );
+        if (!applied) {
+            this.restoreBypassCache(record.conflictPath, previousBypass);
+            await this.blockTextMergeResolution(
+                record,
+                'The local file changed while the merged result was being installed; neither copy was replaced',
+                generation,
+                remoteState,
+            );
+            return false;
+        }
+        if (!this.setTextMergeResolutionPhase(record, 'canonical-applied')) {
+            return false;
+        }
+        await this.persistSyncManifest(true, generation);
+        return true;
+    }
+
+
+    private async finalizeTextMergeResolution(
+        record: SyncManifestTextMergeResolution,
+        generation: number,
+    ): Promise<boolean> {
+        this.requireSyncSession(generation);
+        const active = this.syncManifest?.textMergeResolutions[record.conflictPath];
+        const result = this.textMergeResolutionResultContent(record);
+        if (!active || active.id!==record.id || result===undefined) {
+            return false;
+        }
+        if (!await this.textMergeResolutionMayProceed(record, generation)) {
+            return false;
+        }
+        const remote = await this.captureCurrentTextMergeRemoteState(
+            record.conflictPath,
+            generation,
+        );
+        if (
+            remote===undefined
+            || !this.textMergeResolutionRemoteMatches(
+                record,
+                remote,
+                record.resultRevision,
+            )
+        ) {
+            await this.blockTextMergeResolution(
+                record,
+                'Overleaf changed before the merged result could be finalized; both copies were preserved',
+                generation,
+                remote?.state,
+            );
+            return false;
+        }
+        const local = await this.captureStableConflictLocalState(
+            record.conflictPath,
+            generation,
+        );
+        if (local===undefined || !this.textMergeResolutionResultMatches(record, local)) {
+            this.removeSyncManifestEntry(record.conflictPath);
+            await this.blockTextMergeResolution(
+                record,
+                'The local file changed before the merged result could be finalized; both copies were preserved',
+                generation,
+                remote.state,
+            );
+            return false;
+        }
+        const stable = await this.recordSyncManifestEntry(
+            record.conflictPath,
+            this.vfs.pathToUri(record.conflictPath),
+            result,
+            generation,
+        );
+        if (!stable) {
+            await this.blockTextMergeResolution(
+                record,
+                'The local file changed while recording the merged result; both copies were preserved',
+                generation,
+                remote.state,
+            );
+            return false;
+        }
+        const finalRemote = await this.captureCurrentTextMergeRemoteState(
+            record.conflictPath,
+            generation,
+        );
+        const finalLocal = await this.captureStableConflictLocalState(
+            record.conflictPath,
+            generation,
+        );
+        if (
+            finalRemote===undefined
+            || !this.textMergeResolutionRemoteMatches(
+                record,
+                finalRemote,
+                record.resultRevision,
+            )
+            || finalLocal===undefined
+            || !this.textMergeResolutionResultMatches(record, finalLocal)
+        ) {
+            this.removeSyncManifestEntry(record.conflictPath);
+            await this.blockTextMergeResolution(
+                record,
+                'A local or Overleaf change arrived while finalizing the merged result; both copies were preserved',
+                generation,
+                finalRemote?.state,
+            );
+            return false;
+        }
+
+        this.baseCache[record.conflictPath] = result;
+        this.seenLocalEntities.add(record.conflictPath);
+        this.clearRemoteDelete(record.conflictPath);
+        this.locallyDivergedPaths.delete(record.conflictPath);
+        await this.clearSyncConflict(record.conflictPath, generation);
+        if (!this.archiveTextMergeResolution(record, 'completed')) {
+            return false;
+        }
+        await this.persistSyncManifest(true, generation);
+        await this.refreshCleanOpenReplicaDocumentsFromDisk(generation);
+        getOutputChannel().appendLine(
+            new Date().toISOString()
+            + ' [text merge resolution complete] '
+            + record.conflictPath,
+        );
+        return true;
+    }
+
+
+    private async resumeTextMergeResolution(
+        record: SyncManifestTextMergeResolution,
+        generation: number,
+    ): Promise<boolean> {
+        this.requireSyncSession(generation);
+        const active = this.syncManifest?.textMergeResolutions[record.conflictPath];
+        const result = this.textMergeResolutionResultContent(record);
+        if (
+            !active
+            || active.id!==record.id
+            || record.phase==='blocked'
+            || result===undefined
+        ) {
+            return false;
+        }
+        if (!this.syncConflicts.has(record.conflictPath)) {
+            this.archiveTextMergeResolution(record, 'superseded');
+            await this.persistSyncManifest(true, generation);
+            return false;
+        }
+        if (!await this.textMergeResolutionMayProceed(record, generation)) {
+            return false;
+        }
+
+        const remote = await this.captureCurrentTextMergeRemoteState(
+            record.conflictPath,
+            generation,
+        );
+        if (remote===undefined) {
+            await this.blockTextMergeResolution(
+                record,
+                'Overleaf could not be verified before resuming the merged result; neither copy was changed',
+                generation,
+            );
+            return false;
+        }
+        const remoteIsOriginal = this.textMergeResolutionRemoteMatches(
+            record,
+            remote,
+            record.remoteRevision,
+        );
+        const remoteIsResult = this.textMergeResolutionRemoteMatches(
+            record,
+            remote,
+            record.resultRevision,
+        );
+        if (!remoteIsOriginal && !remoteIsResult) {
+            await this.blockTextMergeResolution(
+                record,
+                'Overleaf changed after the merged result was recorded; neither copy was changed',
+                generation,
+                remote.state,
+            );
+            return false;
+        }
+
+        let local = await this.captureStableConflictLocalState(
+            record.conflictPath,
+            generation,
+        );
+        if (local===undefined) {
+            await this.blockTextMergeResolution(
+                record,
+                'The local file could not be read stably while resuming the merged result',
+                generation,
+                remote.state,
+            );
+            return false;
+        }
+        const localIsOriginal = this.textMergeResolutionLocalStateMatches(record, local);
+        let localIsResult = this.textMergeResolutionResultMatches(record, local);
+
+        if (remoteIsResult) {
+            if (localIsOriginal && record.phase==='prepared') {
+                if (!await this.installTextMergeCanonicalState(
+                    record,
+                    local,
+                    result,
+                    generation,
+                    remote.state,
+                )) {
+                    return false;
+                }
+                local = await this.captureStableConflictLocalState(
+                    record.conflictPath,
+                    generation,
+                );
+                localIsResult = local!==undefined
+                    && this.textMergeResolutionResultMatches(record, local);
+            }
+            if (!localIsResult) {
+                await this.blockTextMergeResolution(
+                    record,
+                    'The local file no longer matches the confirmed merged result; neither copy was changed',
+                    generation,
+                    remote.state,
+                );
+                return false;
+            }
+            if (!this.setTextMergeResolutionPhase(record, 'remote-applied')) {
+                return false;
+            }
+            await this.persistSyncManifest(true, generation);
+            return this.finalizeTextMergeResolution(record, generation);
+        }
+
+        if (record.phase==='remote-applied') {
+            await this.blockTextMergeResolution(
+                record,
+                'Overleaf reverted after it accepted the merged result; neither copy was changed',
+                generation,
+                remote.state,
+            );
+            return false;
+        }
+        if (localIsOriginal) {
+            if (record.phase==='canonical-applied') {
+                await this.blockTextMergeResolution(
+                    record,
+                    'The local merged result disappeared before it was uploaded; neither copy was changed',
+                    generation,
+                    remote.state,
+                );
+                return false;
+            }
+            if (!await this.installTextMergeCanonicalState(
+                record,
+                local,
+                result,
+                generation,
+                remote.state,
+            )) {
+                return false;
+            }
+        } else if (localIsResult) {
+            // A process can stop after the atomic local write but before its
+            // phase reaches disk. Promote only the exact recorded candidate.
+            if (record.phase==='prepared') {
+                if (!this.setTextMergeResolutionPhase(record, 'canonical-applied')) {
+                    return false;
+                }
+                await this.persistSyncManifest(true, generation);
+            }
+        } else {
+            await this.blockTextMergeResolution(
+                record,
+                'The local file changed after the merged result was recorded; neither copy was changed',
+                generation,
+                remote.state,
+            );
+            return false;
+        }
+
+        const push = await this.applySync(
+            'push',
+            'update',
+            record.conflictPath,
+            this.localUri(record.conflictPath),
+            this.vfs.pathToUri(record.conflictPath),
+            {
+                forcePush: true,
+                reason: 'explicit text merge resolution',
+                resolveConflict: true,
+                deferConflictResolution: true,
+                acceptUnchangedLocalConflictState: true,
+                expectedPushContent: result,
+            },
+            generation,
+        );
+        if (push.outcome!=='success') {
+            return false;
+        }
+        const acceptedRemote = await this.captureCurrentTextMergeRemoteState(
+            record.conflictPath,
+            generation,
+        );
+        if (
+            acceptedRemote===undefined
+            || !this.textMergeResolutionRemoteMatches(
+                record,
+                acceptedRemote,
+                record.resultRevision,
+            )
+        ) {
+            await this.blockTextMergeResolution(
+                record,
+                'Overleaf changed while accepting the merged result; neither copy was overwritten again',
+                generation,
+                acceptedRemote?.state,
+            );
+            return false;
+        }
+        if (!this.setTextMergeResolutionPhase(record, 'remote-applied')) {
+            return false;
+        }
+        await this.persistSyncManifest(true, generation);
+        return this.finalizeTextMergeResolution(record, generation);
+    }
+
+
+    private async reconcilePersistedTextMergeResolutionTransactions(
+        generation = this.syncGeneration,
+    ): Promise<number> {
+        let resolved = 0;
+        for (const record of Object.values(
+            this.syncManifest?.textMergeResolutions ?? {},
+        )) {
+            this.requireSyncSession(generation);
+            if (!this.syncConflicts.has(record.conflictPath)) {
+                this.archiveTextMergeResolution(record, 'superseded');
+                continue;
+            }
+            if (record.phase==='blocked') {
+                continue;
+            }
+            try {
+                const complete = await this.enqueueSync(
+                    record.conflictPath,
+                    () => this.resumeTextMergeResolution(record, generation),
+                    generation,
+                ) as boolean | undefined;
+                if (complete) {
+                    resolved += 1;
+                }
+            } catch (error) {
+                if (!this.isSyncSessionActive(generation)) {
+                    throw error;
+                }
+                getOutputChannel().appendLine(
+                    new Date().toISOString()
+                    + ' [startup text merge transaction deferred] '
+                    + record.conflictPath + ': ' + formatUnknownError(error),
+                );
+            }
+        }
+        if (this.syncManifestDirty) {
+            await this.persistSyncManifest(true, generation);
+        }
+        return resolved;
+    }
+
+
+    private disposeTextMergePreviewSessions(): void {
+        const panels = [...this.textMergePreviewPanels.values()];
+        this.textMergePreviewPanels.clear();
+        this.textMergePreviewSessions.clear();
+        this.textMergePreviewBusy.clear();
+        for (const panel of panels) {
+            try {
+                panel.dispose();
+            } catch {
+                // A workbench reload can dispose the panel first.
+            }
+        }
+    }
+
+    private async createTextMergePreviewSession(
+        relPath: string,
+        generation: number,
+    ): Promise<TextMergePreviewSession | undefined> {
+        this.requireSyncSession(generation);
+        const entry = this.syncManifest?.conflicts[relPath];
+        const baseContent = this.conflictMergeBaseContent(entry);
+        if (
+            !entry
+            || baseContent===undefined
+            || entry.mergeBaseRevision===undefined
+            || entry.mergeRemoteEntity?.type!=='doc'
+            || entry.mergeRemoteParentEntity===undefined
+            || !this.syncConflicts.has(relPath)
+            || this.hasDirtyOpenReplicaDocument(relPath)
+            || this.syncManifest?.textMergeResolutions[relPath]!==undefined
+        ) {
+            return undefined;
+        }
+        const pending = this.pendingOperationIntersectingPaths(relPath, relPath);
+        const fileResolution = this.activeConflictResolutionIntersectingPaths(
+            relPath,
+            relPath,
+        );
+        const folderResolution = this.activeFolderConflictResolutionIntersectingPaths(
+            relPath,
+            relPath,
+        );
+        const textResolution = this.activeTextMergeResolutionIntersectingPaths(
+            relPath,
+            relPath,
+        );
+        if (
+            pending!==undefined
+            || fileResolution!==undefined
+            || folderResolution!==undefined
+            || textResolution!==undefined
+        ) {
+            return undefined;
+        }
+
+        const local = await this.captureStableConflictLocalState(relPath, generation);
+        const remote = await this.captureCurrentTextMergeRemoteState(relPath, generation);
+        if (
+            local===undefined
+            || local.kind!=='file'
+            || remote===undefined
+            || remote.state.content===undefined
+            || this.decodeMergeableText(baseContent)===undefined
+            || this.decodeMergeableText(local.content)===undefined
+            || this.decodeMergeableText(remote.state.content)===undefined
+            || remote.state.revision!==entry.remoteRevision
+            || !this.remoteFilePathIdentityMatches(
+                remote.identity,
+                entry.mergeRemoteEntity,
+                entry.mergeRemoteParentEntity,
+            )
+        ) {
+            return undefined;
+        }
+        return {
+            id: crypto.randomBytes(16).toString('hex'),
+            relPath,
+            generation,
+            baseContent,
+            baseRevision: entry.mergeBaseRevision,
+            localContent: local.content,
+            localRevision: local.revision,
+            localIdentity: local.identity,
+            remoteContent: remote.state.content,
+            remoteRevision: remote.state.revision,
+            remoteEntity: entry.mergeRemoteEntity,
+            remoteParentEntity: entry.mergeRemoteParentEntity,
+        };
+    }
+
+    private async verifyTextMergePreviewSession(
+        session: TextMergePreviewSession,
+    ): Promise<boolean> {
+        const generation = session.generation;
+        if (
+            !this.isSyncSessionActive(generation)
+            || this.textMergePreviewSessions.get(session.id)!==session
+            || this.hasDirtyOpenReplicaDocument(session.relPath)
+            || !this.syncConflicts.has(session.relPath)
+        ) {
+            return false;
+        }
+        const entry = this.syncManifest?.conflicts[session.relPath];
+        if (
+            !entry
+            || entry.mergeBaseRevision!==session.baseRevision
+            || entry.mergeRemoteEntity===undefined
+            || entry.mergeRemoteParentEntity===undefined
+            || entry.mergeRemoteEntity.type!=='doc'
+            || entry.mergeRemoteEntity.id!==session.remoteEntity.id
+            || entry.mergeRemoteParentEntity.id!==session.remoteParentEntity.id
+        ) {
+            return false;
+        }
+        const pending = this.pendingOperationIntersectingPaths(
+            session.relPath,
+            session.relPath,
+        );
+        if (
+            pending!==undefined
+            || this.activeConflictResolutionIntersectingPaths(
+                session.relPath,
+                session.relPath,
+            )!==undefined
+            || this.activeFolderConflictResolutionIntersectingPaths(
+                session.relPath,
+                session.relPath,
+            )!==undefined
+            || this.activeTextMergeResolutionIntersectingPaths(
+                session.relPath,
+                session.relPath,
+            )!==undefined
+        ) {
+            return false;
+        }
+        const local = await this.captureStableConflictLocalState(
+            session.relPath,
+            generation,
+        );
+        if (
+            local===undefined
+            || local.kind!=='file'
+            || local.revision!==session.localRevision
+            || !this.localReadIdentityEquals(session.localIdentity, local.identity)
+        ) {
+            return false;
+        }
+        const remote = await this.captureCurrentTextMergeRemoteState(
+            session.relPath,
+            generation,
+        );
+        return remote!==undefined
+            && remote.state.revision===session.remoteRevision
+            && this.remoteFilePathIdentityMatches(
+                remote.identity,
+                session.remoteEntity,
+                session.remoteParentEntity,
+            );
+    }
+
+
+    private textMergePreviewHtml(
+        session: TextMergePreviewSession,
+        resultContent: Uint8Array,
+    ): string {
+        const base = this.decodeMergeableText(session.baseContent);
+        const local = this.decodeMergeableText(session.localContent);
+        const remote = this.decodeMergeableText(session.remoteContent);
+        const result = this.decodeMergeableText(resultContent);
+        if (
+            base===undefined
+            || local===undefined
+            || remote===undefined
+            || result===undefined
+        ) {
+            throw new Error('Text merge preview requires UTF-8 contents below the merge limit.');
+        }
+        const nonce = crypto.randomBytes(18).toString('base64');
+        const payload = JSON.stringify({
+            sessionId: session.id,
+            path: session.relPath,
+            base,
+            local,
+            remote,
+            result,
+        }).replace(/</g, '\\u003c')
+            .replace(/>/g, '\\u003e')
+            .replace(/&/g, '\\u0026')
+            .split(String.fromCharCode(0x2028)).join('\\u2028')
+            .split(String.fromCharCode(0x2029)).join('\\u2029');
+        return `<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'nonce-${nonce}'; script-src 'nonce-${nonce}';">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<style nonce="${nonce}">
+:root { color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); font-family: var(--vscode-font-family); }
+body { margin: 0; padding: 14px; }
+h1 { margin: 0 0 6px; font-size: 1.2em; }
+p { margin: 5px 0 14px; color: var(--vscode-descriptionForeground); }
+.grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; }
+.column { display: flex; flex-direction: column; min-width: 0; }
+label { font-weight: 600; margin-bottom: 5px; }
+textarea { min-height: 260px; resize: vertical; color: var(--vscode-editor-foreground); background: var(--vscode-editor-background); border: 1px solid var(--vscode-editorWidget-border); padding: 8px; font-family: var(--vscode-editor-font-family); font-size: var(--vscode-editor-font-size); line-height: 1.35; }
+#result { min-height: 230px; }
+.actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+button { color: var(--vscode-button-foreground); background: var(--vscode-button-background); border: 0; border-radius: 2px; padding: 7px 10px; cursor: pointer; }
+button.secondary { color: var(--vscode-button-secondaryForeground); background: var(--vscode-button-secondaryBackground); }
+.notice { margin-top: 10px; font-size: .9em; color: var(--vscode-descriptionForeground); }
+@media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<h1>Review text conflict: <span id="path"></span></h1>
+<p>Base, Local, and Overleaf are read-only. The merged draft is only in this window until you explicitly apply it.</p>
+<div class="grid">
+  <div class="column"><label for="base">Base</label><textarea id="base" readonly></textarea></div>
+  <div class="column"><label for="local">Local</label><textarea id="local" readonly></textarea></div>
+  <div class="column"><label for="remote">Overleaf</label><textarea id="remote" readonly></textarea></div>
+</div>
+<div class="column"><label for="result">Merged result</label><textarea id="result"></textarea></div>
+<div class="actions">
+  <button id="apply">Apply merged result</button>
+  <button id="accept-local" class="secondary">Accept Local</button>
+  <button id="accept-overleaf" class="secondary">Accept Overleaf</button>
+  <button id="cancel" class="secondary">Cancel</button>
+</div>
+<div class="notice">Apply rechecks the exact local file and Overleaf entity before writing anything. Cancel does not change either copy.</div>
+<script nonce="${nonce}">
+const vscode = acquireVsCodeApi();
+const data = ${payload};
+const byId = id => document.getElementById(id);
+byId('path').textContent = data.path;
+byId('base').value = data.base;
+byId('local').value = data.local;
+byId('remote').value = data.remote;
+byId('result').value = data.result;
+const send = (type, includeResult) => vscode.postMessage({
+  type,
+  sessionId: data.sessionId,
+  result: includeResult ? byId('result').value : undefined,
+});
+byId('apply').addEventListener('click', () => send('apply', true));
+byId('accept-local').addEventListener('click', () => send('accept-local', false));
+byId('accept-overleaf').addEventListener('click', () => send('accept-overleaf', false));
+byId('cancel').addEventListener('click', () => send('cancel', false));
+</script>
+</body>
+</html>`;
+    }
+
+    private closeTextMergePreviewSession(sessionId: string): void {
+        this.textMergePreviewSessions.delete(sessionId);
+        this.textMergePreviewBusy.delete(sessionId);
+        const panel = this.textMergePreviewPanels.get(sessionId);
+        this.textMergePreviewPanels.delete(sessionId);
+        try {
+            panel?.dispose();
+        } catch {
+            // The workbench can already have disposed its panel.
+        }
+    }
+
+    private async openTextConflictPreview(relPath: string): Promise<boolean> {
+        const generation = this.syncGeneration;
+        this.requireSyncSession(generation);
+        const confinedRelPath = this.normalizeConfinedRelPath(
+            relPath,
+            'review text conflict',
+        );
+        if (confinedRelPath===undefined) {
+            return false;
+        }
+        const session = await this.enqueueSync(
+            confinedRelPath,
+            () => this.createTextMergePreviewSession(confinedRelPath, generation),
+            generation,
+        ) as TextMergePreviewSession | undefined;
+        if (session===undefined) {
+            vscode.window.showWarningMessage(
+                vscode.l10n.t(
+                    'This conflict cannot be reviewed as text because one side changed, is not UTF-8 text, or is still busy.',
+                ),
+            );
+            return false;
+        }
+        for (const [id, existing] of this.textMergePreviewSessions) {
+            if (existing.relPath===confinedRelPath) {
+                this.closeTextMergePreviewSession(id);
+            }
+        }
+        const automatic = this.mergeTextContents(
+            session.baseContent,
+            session.localContent,
+            session.remoteContent,
+        );
+        const initialResult = automatic
+            ?? mergeUtf8TextWithConflictMarkers(
+                session.baseContent,
+                session.localContent,
+                session.remoteContent,
+                LocalReplicaSCMProvider.maxMergeBaselineBytes,
+            );
+        if (initialResult===undefined) {
+            return false;
+        }
+
+        const panel = vscode.window.createWebviewPanel(
+            'semanticResearcherOverleaf.textMerge',
+            vscode.l10n.t('Review Local Replica Text Conflict'),
+            vscode.ViewColumn.Active,
+            {enableScripts: true, retainContextWhenHidden: false},
+        );
+        this.textMergePreviewSessions.set(session.id, session);
+        this.textMergePreviewPanels.set(session.id, panel);
+        panel.webview.html = this.textMergePreviewHtml(session, initialResult);
+        const messageSubscription = panel.webview.onDidReceiveMessage(
+            (message: unknown) => {
+                void this.handleTextMergePreviewMessage(message).catch(error => {
+                    getOutputChannel().appendLine(
+                        new Date().toISOString()
+                        + ' [text merge preview message rejected] '
+                        + formatUnknownError(error),
+                    );
+                });
+            },
+        );
+        panel.onDidDispose(() => {
+            messageSubscription.dispose();
+            this.textMergePreviewPanels.delete(session.id);
+            this.textMergePreviewSessions.delete(session.id);
+        });
+        return true;
+    }
+
+
+    private async applyTextMergePreviewResult(
+        sessionId: string,
+        resultContent: Uint8Array,
+    ): Promise<boolean> {
+        const session = this.textMergePreviewSessions.get(sessionId);
+        if (
+            !session
+            || resultContent.length>LocalReplicaSCMProvider.maxMergeBaselineBytes
+            || this.decodeMergeableText(resultContent)===undefined
+        ) {
+            return false;
+        }
+        const generation = session.generation;
+        const result = await this.enqueueSync(
+            session.relPath,
+            async () => {
+                this.requireSyncSession(generation);
+                if (this.textMergePreviewSessions.get(sessionId)!==session) {
+                    return false;
+                }
+                if (!await this.verifyTextMergePreviewSession(session)) {
+                    getOutputChannel().appendLine(
+                        new Date().toISOString()
+                        + ' [text merge apply blocked:preview-stale] '
+                        + session.relPath,
+                    );
+                    return false;
+                }
+                const manifest = this.syncManifest;
+                if (
+                    !manifest
+                    || manifest.textMergeResolutions[session.relPath]!==undefined
+                ) {
+                    return false;
+                }
+                const record: SyncManifestTextMergeResolution = {
+                    version: 1,
+                    id: crypto.randomBytes(16).toString('hex'),
+                    conflictPath: session.relPath,
+                    baseRevision: session.baseRevision,
+                    localRevision: session.localRevision,
+                    localIdentity: session.localIdentity,
+                    remoteRevision: session.remoteRevision,
+                    remoteEntity: session.remoteEntity,
+                    remoteParentEntity: session.remoteParentEntity,
+                    resultContentBase64: Buffer.from(resultContent).toString('base64'),
+                    resultRevision: contentDigest(resultContent),
+                    phase: 'prepared',
+                    createdAt: new Date().toISOString(),
+                    updatedAt: new Date().toISOString(),
+                };
+                manifest.textMergeResolutions[session.relPath] = record;
+                this.markSyncManifestDirty();
+                await this.persistSyncManifest(true, generation);
+                // From this point recovery is durable; close the in-memory
+                // preview before any canonical/remote mutation can begin.
+                this.closeTextMergePreviewSession(sessionId);
+                return this.resumeTextMergeResolution(record, generation);
+            },
+            generation,
+        ) as boolean | undefined;
+        return result===true;
+    }
+
+
+    private async handleTextMergePreviewMessage(message: unknown): Promise<void> {
+        if (!message || typeof message!=='object' || Array.isArray(message)) {
+            return;
+        }
+        const candidate = message as {
+            type?: unknown;
+            sessionId?: unknown;
+            result?: unknown;
+        };
+        if (
+            typeof candidate.type!=='string'
+            || typeof candidate.sessionId!=='string'
+            || !new Set(['accept-local', 'accept-overleaf', 'apply', 'cancel'])
+                .has(candidate.type)
+        ) {
+            return;
+        }
+        const session = this.textMergePreviewSessions.get(candidate.sessionId);
+        if (!session || this.textMergePreviewBusy.has(session.id)) {
+            return;
+        }
+        if (candidate.type==='cancel') {
+            this.closeTextMergePreviewSession(session.id);
+            return;
+        }
+        this.textMergePreviewBusy.add(session.id);
+        try {
+            if (!await this.verifyTextMergePreviewSession(session)) {
+                vscode.window.showWarningMessage(
+                    vscode.l10n.t(
+                        'The conflict changed after this review opened. Neither copy was changed; reopen the review from the current conflict.',
+                    ),
+                );
+                this.closeTextMergePreviewSession(session.id);
+                return;
+            }
+            if (candidate.type==='apply') {
+                if (typeof candidate.result!=='string') {
+                    return;
+                }
+                const resultContent = new TextEncoder().encode(candidate.result);
+                if (
+                    resultContent.length>LocalReplicaSCMProvider.maxMergeBaselineBytes
+                    || this.decodeMergeableText(resultContent)===undefined
+                ) {
+                    vscode.window.showWarningMessage(
+                        vscode.l10n.t(
+                            'The merged result must be valid UTF-8 text no larger than 5 MiB.',
+                        ),
+                    );
+                    return;
+                }
+                const apply = vscode.l10n.t('Apply Merged Result');
+                const confirmed = await vscode.window.showWarningMessage(
+                    vscode.l10n.t(
+                        'Apply this merged text locally and to Overleaf after one final identity check?',
+                    ),
+                    {modal: true},
+                    apply,
+                );
+                if (confirmed!==apply || !await this.verifyTextMergePreviewSession(session)) {
+                    return;
+                }
+                if (!await this.applyTextMergePreviewResult(session.id, resultContent)) {
+                    vscode.window.showWarningMessage(
+                        vscode.l10n.t(
+                            'The merged result was not applied because the local or Overleaf proof changed.',
+                        ),
+                    );
+                }
+                return;
+            }
+
+            const acceptLocal = candidate.type==='accept-local';
+            const action = vscode.l10n.t(
+                acceptLocal ? 'Accept Local' : 'Accept Overleaf',
+            );
+            const confirmed = await vscode.window.showWarningMessage(
+                vscode.l10n.t(
+                    acceptLocal
+                        ? 'Replace the conflicted Overleaf text with the reviewed local copy?'
+                        : 'Replace the reviewed local text with the verified Overleaf copy?',
+                ),
+                {modal: true},
+                action,
+            );
+            if (confirmed!==action || !await this.verifyTextMergePreviewSession(session)) {
+                return;
+            }
+            this.closeTextMergePreviewSession(session.id);
+            const accepted = acceptLocal
+                ? await this.resolveConflictWithLocalState(session.relPath)
+                : (await this.resolveConflictWithOverleafState(
+                    session.relPath,
+                    false,
+                )).resolved;
+            if (!accepted) {
+                vscode.window.showWarningMessage(
+                    vscode.l10n.t(
+                        'The conflict was not resolved because the local or Overleaf proof changed.',
+                    ),
+                );
+            }
+        } finally {
+            this.textMergePreviewBusy.delete(session.id);
+        }
     }
 
     private hasDirtyOpenReplicaDocumentAtOrBelow(relPath: string): boolean {
@@ -9452,6 +10915,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         );
         if (fileResolution!==undefined) {
             return 'a file conflict-resolution transaction intersects the folder: ' + fileResolution;
+        }
+        const textResolution = this.activeTextMergeResolutionIntersectingPaths(
+            record.conflictPath,
+            record.conflictPath,
+        );
+        if (textResolution!==undefined) {
+            return 'a text-merge transaction intersects the folder: ' + textResolution;
         }
         const folderResolution = this.activeFolderConflictResolutionIntersectingPaths(
             record.conflictPath,
@@ -10523,6 +11993,40 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return replay;
     }
 
+
+    private requestPersistedTextMergeResolutionReplay(
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        const existing = this.textMergeResolutionReplay;
+        if (existing?.generation===generation) {
+            return existing.promise;
+        }
+        const record: {generation: number; promise: Promise<void>} = {
+            generation,
+            promise: Promise.resolve(),
+        };
+        const replay = (async () => {
+            await this.drainPendingSyncWork();
+            if (!this.isSyncSessionActive(generation)) { return; }
+            await this.reconcilePersistedTextMergeResolutionTransactions(generation);
+        })().catch(error => {
+            if (this.isSyncSessionActive(generation)) {
+                getOutputChannel().appendLine(
+                    new Date().toISOString()
+                    + ' [text merge resolution replay failed] '
+                    + formatUnknownError(error),
+                );
+            }
+        }).finally(() => {
+            if (this.textMergeResolutionReplay===record) {
+                this.textMergeResolutionReplay = undefined;
+            }
+        });
+        record.promise = replay;
+        this.textMergeResolutionReplay = record;
+        return replay;
+    }
+
     public async resolveFolderConflictWithOverleafState(
         relPath: string,
         preserveLocal = false,
@@ -10818,6 +12322,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (staleFolderResolution) {
             this.archiveFolderConflictResolution(staleFolderResolution, 'superseded');
         }
+        const staleTextMergeResolution = this.syncManifest?.textMergeResolutions[relPath];
+        if (staleTextMergeResolution) {
+            this.archiveTextMergeResolution(staleTextMergeResolution, 'superseded');
+        }
         const ancestorConflicts = [...this.syncConflicts.keys()]
             .filter(path => this.isPathAtOrBelow(relPath, path))
             .sort((left, right) => right.split('/').length-left.split('/').length);
@@ -10875,6 +12383,30 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 || this.isPathAtOrBelow(secondRelPath, conflictPath)
             ) {
                 return conflictPath + ' (' + record.choice + ')';
+            }
+        }
+        return undefined;
+    }
+
+
+    private activeTextMergeResolutionIntersectingPaths(
+        firstRelPath: string,
+        secondRelPath: string,
+        ignoreResolutionId?: string,
+    ): string | undefined {
+        for (const [conflictPath, record] of Object.entries(
+            this.syncManifest?.textMergeResolutions ?? {},
+        )) {
+            if (
+                record.id!==ignoreResolutionId
+                && (
+                    this.isPathAtOrBelow(conflictPath, firstRelPath)
+                    || this.isPathAtOrBelow(firstRelPath, conflictPath)
+                    || this.isPathAtOrBelow(conflictPath, secondRelPath)
+                    || this.isPathAtOrBelow(secondRelPath, conflictPath)
+                )
+            ) {
+                return conflictPath + ' (text-merge)';
             }
         }
         return undefined;
@@ -13490,6 +15022,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 activeResolution,
             );
         }
+        const activeTextResolution = this.activeTextMergeResolutionIntersectingPaths(
+            sourceRelPath,
+            destinationRelPath,
+        );
+        if (activeTextResolution!==undefined) {
+            throw new RemoteDocumentMergeConflictError(
+                'An active Local Replica text-merge transaction blocks this folder move: ' +
+                activeTextResolution,
+            );
+        }
         const activeConflict = this.syncConflictIntersectingPaths(
             sourceRelPath,
             destinationRelPath,
@@ -14431,6 +15973,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             sourceRelPath,
             destinationRelPath,
         );
+        const activeTextResolution = this.activeTextMergeResolutionIntersectingPaths(
+            sourceRelPath,
+            destinationRelPath,
+        );
         const activeConflict = this.syncConflictIntersectingPaths(
             sourceRelPath,
             destinationRelPath,
@@ -14438,11 +15984,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         if (
             activeFileResolution!==undefined
             || activeFolderResolution!==undefined
+            || activeTextResolution!==undefined
             || activeConflict!==undefined
         ) {
             throw new RemoteDocumentMergeConflictError(
                 'A conflict or conflict-resolution transaction appeared while the folder move was being acknowledged: ' +
-                (activeFileResolution ?? activeFolderResolution ?? activeConflict),
+                (activeFileResolution ?? activeFolderResolution ?? activeTextResolution ?? activeConflict),
             );
         }
         const movePath = (path: string) => destinationRelPath + path.slice(sourceRelPath.length);
@@ -17117,6 +18664,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             this.requireSyncSession(generation);
             await this.reconcilePersistedConflictResolutionTransactions(generation);
             this.requireSyncSession(generation);
+            await this.reconcilePersistedTextMergeResolutionTransactions(generation);
+            this.requireSyncSession(generation);
             await this.reconcilePersistedConflictChoicesOnStartup(generation);
             this.requireSyncSession(generation);
             for (const relPath of [...blockedDirectoryRoots]) {
@@ -19000,6 +20549,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             readStat = snapshot.stat;
                         }
                         this.requireSyncSession(generation);
+                        if (
+                            action==='push'
+                            && options.expectedPushContent!==undefined
+                            && !bytesEqual(newContent, options.expectedPushContent)
+                        ) {
+                            await this.markSyncConflict(
+                                relPath,
+                                'The local file changed after the merged result was confirmed; the newer local bytes were not uploaded',
+                                newContent,
+                                generation,
+                            );
+                            outcome = 'blocked';
+                            errorMessage = 'merged local result advanced before push';
+                            return;
+                        }
                         if (action==='pull' && this.hasDirtyOpenReplicaDocument(relPath)) {
                             const localState = await this.captureLocalPathRevision(
                                 relPath,
@@ -20430,15 +21994,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             source.relPath,
             destinationRelPath,
         );
+        const activeTextResolution = this.activeTextMergeResolutionIntersectingPaths(
+            source.relPath,
+            destinationRelPath,
+        );
         const activeConflict = this.syncConflictIntersectingPaths(
             source.relPath,
             destinationRelPath,
         );
-        if (activeResolution!==undefined || activeConflict!==undefined) {
+        if (activeResolution!==undefined || activeTextResolution!==undefined || activeConflict!==undefined) {
             await this.markSyncConflict(
                 destinationRelPath,
                 'A local folder move cannot begin while an unresolved Local Replica conflict or conflict-resolution transaction intersects it: ' +
-                    (activeResolution ?? activeConflict),
+                    (activeResolution ?? activeTextResolution ?? activeConflict),
                 undefined,
                 generation,
             );
@@ -21007,6 +22575,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             // ordinary initial overwrite inspects that same divergent local
             // folder; otherwise the bootstrap can mistake it for an unrelated
             // local create/update and prevent its guarded recovery.
+            const pendingTextMergeResolutionCount = Object.values(
+                this.syncManifest?.textMergeResolutions ?? {},
+            ).filter(record => record.phase!=='blocked').length;
+            if (pendingTextMergeResolutionCount>0) {
+                getOutputChannel().appendLine(
+                    new Date().toISOString()
+                    + ' [text merge resolution preflight] '
+                    + pendingTextMergeResolutionCount
+                    + ' persisted decision(s)',
+                );
+                await this.reconcilePersistedTextMergeResolutionTransactions(
+                    activeGeneration,
+                );
+                this.requireSyncSession(activeGeneration);
+            }
             const pendingFolderResolutionCount = Object.values(
                 this.syncManifest?.folderConflictResolutions ?? {},
             ).filter(record => record.phase!=='blocked').length;
@@ -22007,6 +23590,18 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     );
                     await this.requestPendingFilePushOperationReplay(generation);
                 }
+                const pendingTextMergeResolutionCount = Object.values(
+                    this.syncManifest?.textMergeResolutions ?? {},
+                ).filter(record => record.phase!=='blocked').length;
+                if (pendingTextMergeResolutionCount>0 && this.isSyncSessionActive(generation)) {
+                    getOutputChannel().appendLine(
+                        new Date().toISOString()
+                        + ' [text merge resolution replay on reconnect] '
+                        + pendingTextMergeResolutionCount
+                        + ' decisions',
+                    );
+                    await this.requestPersistedTextMergeResolutionReplay(generation);
+                }
                 const pendingFolderResolutionCount = Object.values(
                     this.syncManifest?.folderConflictResolutions ?? {},
                 ).filter(record => record.phase!=='blocked').length;
@@ -22273,7 +23868,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             localKind==='file'
             || localKind==='missing'
         );
-        type ConflictChoice = 'keep-local' | 'keep-overleaf' | 'keep-both';
+        const supportsTextMergeChoice = localKind==='file'
+            && conflictEntry?.mergeBaseContentBase64!==undefined
+            && conflictEntry.mergeBaseRevision!==undefined
+            && conflictEntry.mergeRemoteEntity?.type==='doc'
+            && conflictEntry.mergeRemoteParentEntity!==undefined
+            && this.syncManifest?.textMergeResolutions[relPath]===undefined;
+        type ConflictChoice = 'review-merge' | 'keep-local' | 'keep-overleaf' | 'keep-both';
         type ConflictChoiceItem = vscode.QuickPickItem & {choice: ConflictChoice};
         const choices: ConflictChoiceItem[] = [
             {
@@ -22282,6 +23883,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 choice: 'keep-local',
             },
         ];
+        if (supportsTextMergeChoice) {
+            choices.push({
+                label: vscode.l10n.t('Review & Merge Text...'),
+                description: vscode.l10n.t('Compare Base, Local, and Overleaf before explicitly applying a merged result'),
+                choice: 'review-merge',
+            });
+        }
         if (supportsRemoteCanonicalChoice) {
             choices.push({
                 label: vscode.l10n.t('Keep Overleaf'),
@@ -22303,6 +23911,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             title: vscode.l10n.t('Choose how to resolve "{relPath}"', {relPath}),
         });
         if (!choice) { return; }
+
+        if (choice.choice==='review-merge') {
+            await this.openTextConflictPreview(relPath);
+            return;
+        }
 
         if (choice.choice==='keep-local') {
             const applyLocal = vscode.l10n.t('Apply Local State');

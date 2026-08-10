@@ -315,7 +315,25 @@ class FakeVirtualFileSystem {
         content: Uint8Array,
         _remoteBaseline?: Uint8Array,
         expectedRemoteMissing = false,
+        expectedEntity?: {id: string; type: 'doc' | 'file'; parentId?: string},
     ) {
+        const assertExpectedEntity = async () => {
+            if (!expectedEntity) { return; }
+            const resolved = await this._resolveUri(uri);
+            if (
+                resolved.fileType!==expectedEntity.type
+                || resolved.fileEntity._id!==expectedEntity.id
+                || (
+                    expectedEntity.parentId!==undefined
+                    && resolved.parentFolder._id!==expectedEntity.parentId
+                )
+            ) {
+                throw new RemoteDocumentMergeConflictError(
+                    'unexpected remote entity while writing: ' + uri.path,
+                );
+            }
+        };
+        await assertExpectedEntity();
         if (expectedRemoteMissing && await pathExists(uri)) {
             const remoteContent = await vscode.workspace.fs.readFile(uri);
             if (Buffer.compare(Buffer.from(remoteContent), Buffer.from(content))===0) {
@@ -325,6 +343,7 @@ class FakeVirtualFileSystem {
                 `Overleaf path appeared while the local file was being created: ${uri.path}`,
             );
         }
+        await assertExpectedEntity();
         await vscode.workspace.fs.writeFile(uri, content);
         return content;
     }
@@ -617,6 +636,7 @@ suite('Select Project Folder Local Replica', function () {
     });
 
     let originalShowTextDocument: typeof vscode.window.showTextDocument;
+    let originalCreateWebviewPanel: typeof vscode.window.createWebviewPanel;
     let originalCreateFileSystemWatcher: typeof vscode.workspace.createFileSystemWatcher;
     let originalExecuteCommand: typeof vscode.commands.executeCommand;
     let originalUpdateWorkspaceFolders: typeof vscode.workspace.updateWorkspaceFolders;
@@ -798,6 +818,53 @@ suite('Select Project Folder Local Replica', function () {
         };
     }
 
+
+    async function createTextConflictFixture(
+        prefix: string,
+        relativePath = 'main.tex',
+    ) {
+        const remoteRoot = await tempDir('sr-overleaf-' + prefix + '-remote-');
+        const localRoot = await tempDir('sr-overleaf-' + prefix + '-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        const relPath = '/' + relativePath.split('/').filter(Boolean).join('/');
+        const segments = relPath.split('/').filter(Boolean);
+        const remoteFile = vscode.Uri.joinPath(remoteRoot, ...segments);
+        const localFile = vscode.Uri.joinPath(localRoot, ...segments);
+        const baseContent = '\\title{Base}\\nBody: base\\n';
+        const localContent = '\\title{Local}\\nBody: base\\n';
+        const remoteContent = '\\title{Remote}\\nBody: base\\n';
+        await writeText(remoteFile, baseContent);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeText(localFile, localContent);
+        await writeText(remoteFile, remoteContent);
+        const conflict = await (scm as any).applySync(
+            'pull',
+            'update',
+            relPath,
+            remoteFile,
+            localFile,
+        ) as Events['scmSyncCompleteEvent'];
+        assert.strictEqual(conflict.outcome, 'blocked');
+        assert.ok((scm as any).syncConflicts.has(relPath));
+        const conflictEntry = (scm as any).syncManifest.conflicts[relPath];
+        assert.strictEqual(conflictEntry.mergeBaseRevision, sha1(baseContent));
+        assert.strictEqual(conflictEntry.mergeRemoteEntity.type, 'doc');
+        return {
+            scm,
+            fakeVfs,
+            relPath,
+            remoteRoot,
+            localRoot,
+            remoteFile,
+            localFile,
+            baseContent,
+            localContent,
+            remoteContent,
+        };
+    }
+
     setup(() => {
         localReplicaWorkspaceState.clear();
         restoreLocalReplicaWorkspaceContext = localReplicaWorkspace.configureLocalReplicaWorkspace({
@@ -809,6 +876,7 @@ suite('Select Project Folder Local Replica', function () {
         originalShowErrorMessage = vscode.window.showErrorMessage;
         originalShowQuickPick = vscode.window.showQuickPick;
         originalShowTextDocument = vscode.window.showTextDocument;
+        originalCreateWebviewPanel = vscode.window.createWebviewPanel;
         originalCreateFileSystemWatcher = vscode.workspace.createFileSystemWatcher;
         originalExecuteCommand = vscode.commands.executeCommand;
         originalUpdateWorkspaceFolders = vscode.workspace.updateWorkspaceFolders;
@@ -830,6 +898,7 @@ suite('Select Project Folder Local Replica', function () {
         (vscode.window as any).showErrorMessage = originalShowErrorMessage;
         (vscode.window as any).showQuickPick = originalShowQuickPick;
         (vscode.window as any).showTextDocument = originalShowTextDocument;
+        (vscode.window as any).createWebviewPanel = originalCreateWebviewPanel;
         (vscode.workspace as any).createFileSystemWatcher = originalCreateFileSystemWatcher;
         (vscode.commands as any).executeCommand = originalExecuteCommand;
         (vscode.workspace as any).updateWorkspaceFolders = originalUpdateWorkspaceFolders;
@@ -4659,7 +4728,7 @@ suite('Select Project Folder Local Replica', function () {
         );
         const interruptedManifest = JSON.parse(await readText(manifestUri));
         const pending = interruptedManifest.pendingOperations['/main.tex'];
-        assert.strictEqual(interruptedManifest.version, 13);
+        assert.strictEqual(interruptedManifest.version, 14);
         assert.strictEqual(pending.kind, 'update');
         assert.strictEqual(pending.localKind, 'file');
         assert.strictEqual(pending.localRevision, sha1('offline local update'));
@@ -4781,7 +4850,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), false);
     });
 
-    test('migrates a version 2 manifest to the version 13 resolution schema', async () => {
+    test('migrates a version 2 manifest to the version 14 resolution schema', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-v3-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-v3-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -4794,6 +4863,8 @@ suite('Select Project Folder Local Replica', function () {
         const legacyManifest = JSON.parse(await readText(manifestUri));
         legacyManifest.version = 2;
         delete legacyManifest.pendingOperations;
+        delete legacyManifest.textMergeResolutions;
+        delete legacyManifest.textMergeResolutionHistory;
         await writeText(manifestUri, JSON.stringify(legacyManifest));
 
         await firstScm.deactivate();
@@ -4803,8 +4874,10 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 13);
+        assert.strictEqual(migratedManifest.version, 14);
         assert.deepStrictEqual(migratedManifest.pendingOperations, {});
+        assert.deepStrictEqual(migratedManifest.textMergeResolutions, {});
+        assert.deepStrictEqual(migratedManifest.textMergeResolutionHistory, []);
     });
 
     test('migrates a v10 file-resolution manifest without losing its file state', async () => {
@@ -4821,6 +4894,8 @@ suite('Select Project Folder Local Replica', function () {
         legacyManifest.version = 10;
         delete legacyManifest.folderConflictResolutions;
         delete legacyManifest.folderConflictResolutionHistory;
+        delete legacyManifest.textMergeResolutions;
+        delete legacyManifest.textMergeResolutionHistory;
         await writeText(manifestUri, JSON.stringify(legacyManifest));
 
         await firstScm.deactivate();
@@ -4830,13 +4905,15 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 13);
+        assert.strictEqual(migratedManifest.version, 14);
         assert.deepStrictEqual(migratedManifest.folderConflictResolutions, {});
         assert.deepStrictEqual(migratedManifest.folderConflictResolutionHistory, []);
+        assert.deepStrictEqual(migratedManifest.textMergeResolutions, {});
+        assert.deepStrictEqual(migratedManifest.textMergeResolutionHistory, []);
         assert.ok(migratedManifest.files['/main.tex']);
     });
 
-    test('records remote entity and stable local inode identities in manifest v13', async () => {
+    test('records remote entity and stable local inode identities in manifest v14', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-identity-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-identity-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -4855,7 +4932,7 @@ suite('Select Project Folder Local Replica', function () {
             REPLICA_SETTINGS_DIR,
             'sync-manifest.json',
         )));
-        assert.strictEqual(manifest.version, 13);
+        assert.strictEqual(manifest.version, 14);
         assert.deepStrictEqual(manifest.files['/main.tex'].remoteEntity, {id: 'doc-main', type: 'doc'});
         assert.deepStrictEqual(manifest.files['/figure.png'].remoteEntity, {id: 'file-figure', type: 'file'});
         for (const entry of [
@@ -8218,6 +8295,448 @@ suite('Select Project Folder Local Replica', function () {
             await pathExists(uriForRelPath(fixture.localRoot, history.at(-1).artifactRelPath)),
             true,
         );
+    });
+
+
+    test('opens a text merge preview without mutating either copy and cancel discards it', async () => {
+        const fixture = await createTextConflictFixture('text-merge-preview');
+        const manifestBefore = JSON.stringify((fixture.scm as any).syncManifest);
+        let receiveMessage: ((message: unknown) => void) | undefined;
+        let disposeListener: (() => void) | undefined;
+        let disposed = false;
+        const panel: any = {
+            webview: {
+                html: '',
+                onDidReceiveMessage: (listener: (message: unknown) => void) => {
+                    receiveMessage = listener;
+                    return {dispose: () => undefined};
+                },
+            },
+            onDidDispose: (listener: () => void) => {
+                disposeListener = listener;
+                return {dispose: () => undefined};
+            },
+            dispose: () => {
+                if (disposed) { return; }
+                disposed = true;
+                disposeListener?.();
+            },
+        };
+        (vscode.window as any).createWebviewPanel = () => panel;
+
+        assert.strictEqual(
+            await (fixture.scm as any).openTextConflictPreview(fixture.relPath),
+            true,
+        );
+        assert.ok(panel.webview.html.includes('Base'));
+        assert.ok(panel.webview.html.includes('Merged result'));
+        const session = [...(fixture.scm as any).textMergePreviewSessions.values()][0];
+        assert.ok(session);
+        assert.strictEqual(Buffer.from(session.baseContent).toString(), fixture.baseContent);
+        assert.strictEqual(Buffer.from(session.localContent).toString(), fixture.localContent);
+        assert.strictEqual(Buffer.from(session.remoteContent).toString(), fixture.remoteContent);
+        assert.ok(panel.webview.html.includes('\\u003c\\u003c\\u003c\\u003c\\u003c\\u003c\\u003c Local'));
+        assert.ok(panel.webview.html.includes('\\u003e\\u003e\\u003e\\u003e\\u003e\\u003e\\u003e Overleaf'));
+        assert.strictEqual(JSON.stringify((fixture.scm as any).syncManifest), manifestBefore);
+        assert.deepStrictEqual(await readText(fixture.localFile), fixture.localContent);
+        assert.deepStrictEqual(await readText(fixture.remoteFile), fixture.remoteContent);
+
+        receiveMessage!({type: 'cancel', sessionId: session.id});
+        await new Promise(resolve => setImmediate(resolve));
+
+        assert.strictEqual(disposed, true);
+        assert.strictEqual((fixture.scm as any).textMergePreviewSessions.size, 0);
+        assert.strictEqual((fixture.scm as any).syncManifest.textMergeResolutions[fixture.relPath], undefined);
+        assert.strictEqual(JSON.stringify((fixture.scm as any).syncManifest), manifestBefore);
+        assert.deepStrictEqual(await readText(fixture.localFile), fixture.localContent);
+        assert.deepStrictEqual(await readText(fixture.remoteFile), fixture.remoteContent);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has(fixture.relPath), true);
+    });
+
+    test('does not open a text merge preview while its editor is dirty', async () => {
+        const fixture = await createTextConflictFixture('text-merge-dirty-before-preview');
+        const document = await vscode.workspace.openTextDocument(fixture.localFile);
+        const editor = await vscode.window.showTextDocument(document);
+        const edited = await editor.edit(builder => {
+            builder.insert(new vscode.Position(0, 0), '% unsaved merge review edit\\n');
+        });
+        assert.strictEqual(edited, true);
+        assert.strictEqual(document.isDirty, true);
+
+        try {
+            assert.strictEqual(
+                await (fixture.scm as any).createTextMergePreviewSession(
+                    fixture.relPath,
+                    (fixture.scm as any).syncGeneration,
+                ),
+                undefined,
+            );
+            assert.strictEqual(
+                (fixture.scm as any).syncManifest.textMergeResolutions[fixture.relPath],
+                undefined,
+            );
+            assert.strictEqual(await readText(fixture.localFile), fixture.localContent);
+            assert.strictEqual(await readText(fixture.remoteFile), fixture.remoteContent);
+            assert.strictEqual((fixture.scm as any).syncConflicts.has(fixture.relPath), true);
+        } finally {
+            if (document.isDirty) {
+                await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+            }
+        }
+    });
+
+    test('rejects a text merge when its editor becomes dirty after preview', async () => {
+        const fixture = await createTextConflictFixture('text-merge-dirty-after-preview');
+        const session = await (fixture.scm as any).createTextMergePreviewSession(
+            fixture.relPath,
+            (fixture.scm as any).syncGeneration,
+        );
+        assert.ok(session);
+        (fixture.scm as any).textMergePreviewSessions.set(session.id, session);
+        const document = await vscode.workspace.openTextDocument(fixture.localFile);
+        const editor = await vscode.window.showTextDocument(document);
+        const edited = await editor.edit(builder => {
+            builder.insert(new vscode.Position(0, 0), '% unsaved merge apply edit\\n');
+        });
+        assert.strictEqual(edited, true);
+        assert.strictEqual(document.isDirty, true);
+
+        try {
+            assert.strictEqual(
+                await (fixture.scm as any).applyTextMergePreviewResult(
+                    session.id,
+                    Buffer.from('\\title{Merged}\\nBody: merged\\n'),
+                ),
+                false,
+            );
+            assert.strictEqual(
+                (fixture.scm as any).syncManifest.textMergeResolutions[fixture.relPath],
+                undefined,
+            );
+            assert.strictEqual(await readText(fixture.localFile), fixture.localContent);
+            assert.strictEqual(await readText(fixture.remoteFile), fixture.remoteContent);
+            assert.strictEqual((fixture.scm as any).syncConflicts.has(fixture.relPath), true);
+        } finally {
+            if (document.isDirty) {
+                await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+            }
+        }
+    });
+
+    test('rejects a text merge after a local inode replacement following preview', async () => {
+        const fixture = await createTextConflictFixture('text-merge-local-inode');
+        const session = await (fixture.scm as any).createTextMergePreviewSession(
+            fixture.relPath,
+            (fixture.scm as any).syncGeneration,
+        );
+        assert.ok(session);
+        (fixture.scm as any).textMergePreviewSessions.set(session.id, session);
+        const replacement = vscode.Uri.joinPath(fixture.localRoot, 'agent-replacement.tex');
+        const replacementContent = '\\title{Agent replacement}\\nBody: later write\\n';
+        await writeText(replacement, replacementContent);
+        await vscode.workspace.fs.rename(replacement, fixture.localFile, {overwrite: true});
+        const local = await (fixture.scm as any).captureStableConflictLocalState(
+            fixture.relPath,
+            (fixture.scm as any).syncGeneration,
+        );
+        assert.ok(local?.kind==='file');
+        assert.notStrictEqual(local?.identity.ino, session.localIdentity.ino);
+
+        assert.strictEqual(
+            await (fixture.scm as any).applyTextMergePreviewResult(
+                session.id,
+                Buffer.from('\\title{Merged}\\nBody: merged\\n'),
+            ),
+            false,
+        );
+        assert.strictEqual(await readText(fixture.localFile), replacementContent);
+        assert.strictEqual(await readText(fixture.remoteFile), fixture.remoteContent);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.textMergeResolutions[fixture.relPath],
+            undefined,
+        );
+        assert.strictEqual((fixture.scm as any).syncConflicts.has(fixture.relPath), true);
+    });
+
+    test('applies an explicitly merged text result through the guarded durable path', async () => {
+        const fixture = await createTextConflictFixture('text-merge-apply');
+        const session = await (fixture.scm as any).createTextMergePreviewSession(
+            fixture.relPath,
+            (fixture.scm as any).syncGeneration,
+        );
+        assert.ok(session);
+        (fixture.scm as any).textMergePreviewSessions.set(session.id, session);
+        const merged = Buffer.from('\\title{Local}\\nBody: resolved together\\n');
+        const originalWrite = fixture.fakeVfs.writeFileFromRemoteBaseline.bind(fixture.fakeVfs);
+        let remoteWrites = 0;
+        let expectedEntity: any;
+        (fixture.fakeVfs as any).writeFileFromRemoteBaseline = async (
+            ...args: unknown[]
+        ) => {
+            remoteWrites += 1;
+            expectedEntity = args[4];
+            return originalWrite(...args as [
+                vscode.Uri,
+                Uint8Array,
+                Uint8Array | undefined,
+                boolean,
+                {id: string; type: 'doc' | 'file'; parentId?: string} | undefined,
+            ]);
+        };
+
+        assert.strictEqual(
+            await (fixture.scm as any).applyTextMergePreviewResult(session.id, merged),
+            true,
+        );
+        assert.deepStrictEqual(await readBytes(fixture.localFile), merged);
+        assert.deepStrictEqual(await readBytes(fixture.remoteFile), merged);
+        assert.strictEqual(remoteWrites, 1);
+        assert.strictEqual(expectedEntity.type, 'doc');
+        assert.strictEqual(
+            expectedEntity.id,
+            (await fixture.fakeVfs._resolveUri(fixture.remoteFile)).fileEntity._id,
+        );
+        assert.strictEqual((fixture.scm as any).syncConflicts.has(fixture.relPath), false);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.textMergeResolutions[fixture.relPath],
+            undefined,
+        );
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.textMergeResolutionHistory.at(-1).outcome,
+            'completed',
+        );
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.files[fixture.relPath].localDigest,
+            sha1(merged),
+        );
+    });
+
+
+    test('routes a confirmed merge preview message through the durable transaction', async () => {
+        const fixture = await createTextConflictFixture('text-merge-preview-message');
+        const session = await (fixture.scm as any).createTextMergePreviewSession(
+            fixture.relPath,
+            (fixture.scm as any).syncGeneration,
+        );
+        assert.ok(session);
+        (fixture.scm as any).textMergePreviewSessions.set(session.id, session);
+        const merged = '\\title{Merged from preview}\\nBody: confirmed\\n';
+        let confirmationCount = 0;
+        const originalWarning = vscode.window.showWarningMessage;
+        (vscode.window as any).showWarningMessage = async (...args: unknown[]) => {
+            if (args.at(-1)==='Apply Merged Result') {
+                confirmationCount += 1;
+                return args.at(-1);
+            }
+            return undefined;
+        };
+        try {
+            await (fixture.scm as any).handleTextMergePreviewMessage({
+                type: 'apply',
+                sessionId: session.id,
+                result: merged,
+            });
+        } finally {
+            (vscode.window as any).showWarningMessage = originalWarning;
+        }
+
+        assert.strictEqual(confirmationCount, 1);
+        assert.strictEqual(await readText(fixture.localFile), merged);
+        assert.strictEqual(await readText(fixture.remoteFile), merged);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has(fixture.relPath), false);
+        assert.strictEqual((fixture.scm as any).textMergePreviewSessions.has(session.id), false);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.textMergeResolutionHistory.at(-1).outcome,
+            'completed',
+        );
+    });
+
+    test('rejects a text merge when a same-byte Overleaf entity replacement arrives after preview', async () => {
+        const fixture = await createTextConflictFixture('text-merge-remote-identity');
+        const session = await (fixture.scm as any).createTextMergePreviewSession(
+            fixture.relPath,
+            (fixture.scm as any).syncGeneration,
+        );
+        assert.ok(session);
+        (fixture.scm as any).textMergePreviewSessions.set(session.id, session);
+        fixture.fakeVfs.setEntityId(fixture.relPath, 'same-bytes-collaborator-document');
+        const originalWrite = fixture.fakeVfs.writeFileFromRemoteBaseline.bind(fixture.fakeVfs);
+        let remoteWrites = 0;
+        (fixture.fakeVfs as any).writeFileFromRemoteBaseline = async (
+            ...args: unknown[]
+        ) => {
+            remoteWrites += 1;
+            return originalWrite(...args as [
+                vscode.Uri,
+                Uint8Array,
+                Uint8Array | undefined,
+                boolean,
+                {id: string; type: 'doc' | 'file'; parentId?: string} | undefined,
+            ]);
+        };
+
+        assert.strictEqual(
+            await (fixture.scm as any).applyTextMergePreviewResult(
+                session.id,
+                Buffer.from('\\title{Merged}\\nBody: merged\\n'),
+            ),
+            false,
+        );
+        assert.strictEqual(remoteWrites, 0);
+        assert.strictEqual(await readText(fixture.localFile), fixture.localContent);
+        assert.strictEqual(await readText(fixture.remoteFile), fixture.remoteContent);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has(fixture.relPath), true);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.textMergeResolutions[fixture.relPath],
+            undefined,
+        );
+    });
+
+    test('defers a text merge when a covering directory move arrives after preview', async () => {
+        const fixture = await createTextConflictFixture(
+            'text-merge-directory-move',
+            'dir/main.tex',
+        );
+        const session = await (fixture.scm as any).createTextMergePreviewSession(
+            fixture.relPath,
+            (fixture.scm as any).syncGeneration,
+        );
+        assert.ok(session);
+        (fixture.scm as any).textMergePreviewSessions.set(session.id, session);
+        (fixture.scm as any).syncManifest.pendingOperations['/dir'] = {
+            version: 1,
+            id: 'pending-text-merge-directory-move',
+            kind: 'directory-move',
+            destinationRelPath: '/newdir',
+        };
+
+        assert.strictEqual(
+            await (fixture.scm as any).applyTextMergePreviewResult(
+                session.id,
+                Buffer.from('\\title{Merged}\\nBody: merged\\n'),
+            ),
+            false,
+        );
+        assert.strictEqual(await readText(fixture.localFile), fixture.localContent);
+        assert.strictEqual(await readText(fixture.remoteFile), fixture.remoteContent);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has(fixture.relPath), true);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.textMergeResolutions[fixture.relPath],
+            undefined,
+        );
+    });
+
+
+    test('recovers a text merge after the local canonical write precedes its phase persistence', async () => {
+        const fixture = await createTextConflictFixture('text-merge-restart');
+        const session = await (fixture.scm as any).createTextMergePreviewSession(
+            fixture.relPath,
+            (fixture.scm as any).syncGeneration,
+        );
+        assert.ok(session);
+        (fixture.scm as any).textMergePreviewSessions.set(session.id, session);
+        const merged = Buffer.from('\\title{Merged}\\nBody: durable result\\n');
+        const originalSetPhase = (fixture.scm as any)
+            .setTextMergeResolutionPhase.bind(fixture.scm);
+        (fixture.scm as any).setTextMergeResolutionPhase = (
+            ...args: unknown[]
+        ) => args[1]==='canonical-applied'
+            ? false
+            : originalSetPhase(...args);
+        let applied = true;
+        try {
+            applied = await (fixture.scm as any).applyTextMergePreviewResult(
+                session.id,
+                merged,
+            );
+        } finally {
+            (fixture.scm as any).setTextMergeResolutionPhase = originalSetPhase;
+        }
+
+        assert.strictEqual(applied, false);
+        assert.deepStrictEqual(await readBytes(fixture.localFile), merged);
+        assert.deepStrictEqual(await readText(fixture.remoteFile), fixture.remoteContent);
+        const interrupted = (fixture.scm as any).syncManifest
+            .textMergeResolutions[fixture.relPath];
+        assert.strictEqual(interrupted.phase, 'prepared');
+
+        await fixture.scm.deactivate();
+        const restarted = createSCM(
+            fixture.remoteRoot,
+            fixture.localRoot,
+            new FakeVirtualFileSystem(fixture.remoteRoot),
+        );
+        assert.strictEqual(
+            await restarted.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.deepStrictEqual(await readBytes(fixture.localFile), merged);
+        assert.deepStrictEqual(await readBytes(fixture.remoteFile), merged);
+        assert.strictEqual((restarted as any).syncConflicts.has(fixture.relPath), false);
+        assert.strictEqual(
+            (restarted as any).syncManifest.textMergeResolutions[fixture.relPath],
+            undefined,
+        );
+        assert.strictEqual(
+            (restarted as any).syncManifest.textMergeResolutionHistory.at(-1).outcome,
+            'completed',
+        );
+    });
+
+
+    test('does not upload a later agent write that arrives after text merge installation', async () => {
+        const fixture = await createTextConflictFixture('text-merge-agent-race');
+        const session = await (fixture.scm as any).createTextMergePreviewSession(
+            fixture.relPath,
+            (fixture.scm as any).syncGeneration,
+        );
+        assert.ok(session);
+        (fixture.scm as any).textMergePreviewSessions.set(session.id, session);
+        const merged = Buffer.from('\\title{Merged}\\nBody: selected\\n');
+        const agentContent = '\\title{Agent}\\nBody: later write\\n';
+        const originalInstall = (fixture.scm as any)
+            .installTextMergeCanonicalState.bind(fixture.scm);
+        const originalWrite = fixture.fakeVfs.writeFileFromRemoteBaseline.bind(fixture.fakeVfs);
+        let injected = false;
+        let remoteWrites = 0;
+        (fixture.scm as any).installTextMergeCanonicalState = async (
+            ...args: unknown[]
+        ) => {
+            const installed = await originalInstall(...args);
+            if (installed && !injected) {
+                injected = true;
+                await writeText(fixture.localFile, agentContent);
+            }
+            return installed;
+        };
+        (fixture.fakeVfs as any).writeFileFromRemoteBaseline = async (
+            ...args: unknown[]
+        ) => {
+            remoteWrites += 1;
+            return originalWrite(...args as [
+                vscode.Uri,
+                Uint8Array,
+                Uint8Array | undefined,
+                boolean,
+                {id: string; type: 'doc' | 'file'; parentId?: string} | undefined,
+            ]);
+        };
+        let applied: boolean;
+        try {
+            applied = await (fixture.scm as any).applyTextMergePreviewResult(
+                session.id,
+                merged,
+            );
+        } finally {
+            (fixture.scm as any).installTextMergeCanonicalState = originalInstall;
+        }
+
+        assert.strictEqual(injected, true);
+        assert.strictEqual(applied!, false);
+        assert.strictEqual(remoteWrites, 0);
+        assert.strictEqual(await readText(fixture.localFile), agentContent);
+        assert.strictEqual(await readText(fixture.remoteFile), fixture.remoteContent);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has(fixture.relPath), true);
     });
 
     test('preserves a binary revision created after conflict proof but before upload', async () => {
