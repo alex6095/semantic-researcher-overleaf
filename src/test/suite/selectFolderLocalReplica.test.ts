@@ -3347,7 +3347,7 @@ suite('Select Project Folder Local Replica', function () {
         );
         const interruptedManifest = JSON.parse(await readText(manifestUri));
         const pending = interruptedManifest.pendingOperations['/main.tex'];
-        assert.strictEqual(interruptedManifest.version, 7);
+        assert.strictEqual(interruptedManifest.version, 8);
         assert.strictEqual(pending.kind, 'update');
         assert.strictEqual(pending.localKind, 'file');
         assert.strictEqual(pending.localRevision, sha1('offline local update'));
@@ -3469,7 +3469,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), false);
     });
 
-    test('migrates a version 2 manifest to the version 7 identity schema', async () => {
+    test('migrates a version 2 manifest to the version 8 identity schema', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-v3-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-v3-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -3491,11 +3491,11 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 7);
+        assert.strictEqual(migratedManifest.version, 8);
         assert.deepStrictEqual(migratedManifest.pendingOperations, {});
     });
 
-    test('records remote entity and stable local inode identities in manifest v7', async () => {
+    test('records remote entity and stable local inode identities in manifest v8', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-identity-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-identity-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -3514,7 +3514,7 @@ suite('Select Project Folder Local Replica', function () {
             REPLICA_SETTINGS_DIR,
             'sync-manifest.json',
         )));
-        assert.strictEqual(manifest.version, 7);
+        assert.strictEqual(manifest.version, 8);
         assert.deepStrictEqual(manifest.files['/main.tex'].remoteEntity, {id: 'doc-main', type: 'doc'});
         assert.deepStrictEqual(manifest.files['/figure.png'].remoteEntity, {id: 'file-figure', type: 'file'});
         for (const entry of [
@@ -3984,11 +3984,11 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(event.outcome, 'success');
         assert.strictEqual(await pathExists(remoteFolder), true);
         assert.strictEqual((scm as any).syncManifest.pendingOperations['/figures'], undefined);
-        assert.deepStrictEqual((scm as any).syncManifest.directories['/figures'], {
-            remoteEntity: {id: '/figures', type: 'folder'},
-            parentEntity: {id: '/', type: 'folder'},
-            updatedAt: (scm as any).syncManifest.directories['/figures'].updatedAt,
-        });
+        const directoryEntry = (scm as any).syncManifest.directories['/figures'];
+        assert.deepStrictEqual(directoryEntry.remoteEntity, {id: '/figures', type: 'folder'});
+        assert.deepStrictEqual(directoryEntry.parentEntity, {id: '/', type: 'folder'});
+        assert.match(directoryEntry.localIdentity.dev, /^\d+$/);
+        assert.match(directoryEntry.localIdentity.ino, /^[1-9]\d*$/);
     });
 
     test('replays a journaled local folder create on reconnect without another watcher event', async () => {

@@ -171,6 +171,7 @@ interface SyncManifestEntry {
 interface SyncManifestDirectoryEntry {
     remoteEntity?: SyncManifestRemoteFolderIdentity;
     parentEntity?: SyncManifestRemoteFolderIdentity;
+    localIdentity?: SyncManifestLocalFileIdentity;
     updatedAt: string;
 }
 
@@ -183,7 +184,7 @@ interface SyncManifestConflictEntry {
 }
 
 interface SyncManifest {
-    version: 7;
+    version: 8;
     projectUri: string;
     baselineComplete: boolean;
     files: Record<string, SyncManifestEntry>;
@@ -3522,7 +3523,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private emptySyncManifest(baselineComplete = true): SyncManifest {
         return {
-            version: 7,
+            version: 8,
             projectUri: stringifyOverleafUri(this.vfs.origin),
             baselineComplete,
             files: {},
@@ -3617,8 +3618,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             return false;
         }
         const entry = value as Partial<SyncManifestDirectoryEntry>;
+        const localIdentity = entry.localIdentity;
+        const validLocalIdentity = localIdentity===undefined || (
+            typeof localIdentity.dev==='string'
+            && /^[0-9]+$/.test(localIdentity.dev)
+            && typeof localIdentity.ino==='string'
+            && /^[1-9][0-9]*$/.test(localIdentity.ino)
+        );
         return (entry.remoteEntity===undefined || this.isValidSyncManifestFolderIdentity(entry.remoteEntity))
             && (entry.parentEntity===undefined || this.isValidSyncManifestFolderIdentity(entry.parentEntity))
+            && validLocalIdentity
             && typeof entry.updatedAt==='string'
             && Number.isFinite(Date.parse(entry.updatedAt));
     }
@@ -3888,7 +3897,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } catch {
                 sameProject = false;
             }
-            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7)
+            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8)
                 && sameProject
                 && (manifest.baselineComplete===undefined || typeof manifest.baselineComplete==='boolean')
                 && this.isValidSyncManifestRecord<SyncManifestEntry>(
@@ -3928,7 +3937,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (validShape) {
                 this.requireSyncSession(generation);
                 this.syncManifest = {
-                    version: 7,
+                    version: 8,
                     projectUri,
                     baselineComplete: manifest.baselineComplete!==false,
                     files: manifest.files!,
@@ -3936,7 +3945,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         ? manifest.directories
                         : {},
                     conflicts: manifest.conflicts ?? {},
-                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7
+                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8
                         ? manifest.pendingOperations!
                         : {},
                 };
@@ -3964,7 +3973,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     ? 'unavailable'
                     : 'trusted';
                 this.syncManifestRevision += 1;
-                this.syncManifestDirty = manifest.version!==7
+                this.syncManifestDirty = manifest.version!==8
                     || manifest.directories===undefined
                     || manifest.conflicts===undefined
                     || manifest.baselineComplete===undefined
@@ -9197,6 +9206,41 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
         return {dev: finalStat.dev, ino: finalStat.ino};
     }
+    private async captureManifestLocalDirectoryIdentity(
+        relPath: string,
+        localUri: vscode.Uri,
+    ): Promise<SyncManifestLocalFileIdentity | undefined> {
+        if (localUri.scheme!=='file' || this.baseUri.scheme!=='file') {
+            return undefined;
+        }
+        let snapshot: LocalPathIdentitySnapshot;
+        try {
+            snapshot = await this.captureLocalPathIdentitySnapshot(
+                localUri,
+                `manifest directory identity snapshot of ${relPath}`,
+            );
+        } catch (error) {
+            if (LocalReplicaSCMProvider.isFileNotFoundError(error)) {
+                return undefined;
+            }
+            throw error;
+        }
+        if (!snapshot.finalStat.isDirectory) {
+            throw new LocalReadUnstableError(
+                relPath,
+                'path-identity-changed',
+                `Local Replica manifest directory changed type while identity was recorded: ${localUri.fsPath}`,
+            );
+        }
+        if (snapshot.finalStat.ino==='0') {
+            return undefined;
+        }
+        return {
+            dev: snapshot.finalStat.dev,
+            ino: snapshot.finalStat.ino,
+        };
+    }
+
     private async canSkipInitialBinaryPull(
         relPath: string,
         vfsUri: vscode.Uri,
@@ -10152,12 +10196,20 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return 'deferred';
     }
 
-    private recordSyncManifestDirectory(
+    private async recordSyncManifestDirectory(
         relPath: string,
         remoteIdentity?: RemoteFolderPathIdentity,
-    ) {
-        if (!this.syncManifest) { return; }
-        this.syncManifest.directories[relPath] = remoteIdentity===undefined
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        const manifest = this.syncManifest;
+        if (!manifest) { return; }
+        const localIdentity = await this.captureManifestLocalDirectoryIdentity(
+            relPath,
+            this.localUri(relPath),
+        );
+        this.requireSyncSession(generation);
+        const entry: SyncManifestDirectoryEntry = remoteIdentity===undefined
             ? {
                 updatedAt: new Date().toISOString(),
             }
@@ -10166,6 +10218,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 parentEntity: {...remoteIdentity.parent},
                 updatedAt: new Date().toISOString(),
             };
+        if (localIdentity!==undefined) {
+            entry.localIdentity = localIdentity;
+        }
+        manifest.directories[relPath] = entry;
         this.markSyncManifestDirty();
     }
 
@@ -10188,7 +10244,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 'Overleaf folder identity changed before the pending local create was verified.',
             );
         }
-        this.recordSyncManifestDirectory(relPath, remoteIdentity);
+        await this.recordSyncManifestDirectory(relPath, remoteIdentity, generation);
         this.seenLocalEntities.add(relPath);
         this.clearRemoteDelete(relPath);
         this.locallyDivergedPaths.delete(relPath);
@@ -11548,7 +11604,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     );
                 }
                 this.seenLocalEntities.add(relPath);
-                this.recordSyncManifestDirectory(relPath, remoteIdentity);
+                await this.recordSyncManifestDirectory(relPath, remoteIdentity, generation);
             }
 
             // sync the files
@@ -11985,7 +12041,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             );
                         }
                         this.seenLocalEntities.add(relPath);
-                        this.recordSyncManifestDirectory(relPath, remoteIdentity);
+                        await this.recordSyncManifestDirectory(relPath, remoteIdentity, generation);
                     } else if (this.syncManifest?.directories[relPath]===undefined) {
                         startupPushDirectoryPaths.add(relPath);
                     }
@@ -13630,9 +13686,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         this.seenLocalEntities.add(relPath);
                         this.clearRemoteDelete(relPath);
                         this.locallyDivergedPaths.delete(relPath);
-                        this.recordSyncManifestDirectory(
+                        await this.recordSyncManifestDirectory(
                             relPath,
                             observedRemoteDirectoryIdentity,
+                            generation,
                         );
                         await this.persistSyncManifest(false, generation);
                     }
