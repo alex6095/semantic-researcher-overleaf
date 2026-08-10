@@ -5,6 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import * as vscode from 'vscode';
 import {
+    ExpectedRemoteEntity,
     RemoteDocumentMergeConflictError,
     VirtualFileSystem,
 } from '../../core/remoteFileSystemProvider';
@@ -46,6 +47,11 @@ class FakeVirtualFileSystem {
     private readonly connectionEmitter = new vscode.EventEmitter<string>();
     public readonly onDidChangeConnection = this.connectionEmitter.event;
     private readonly persists = new Map<string, PersistRecord>();
+    // Identity is deliberately independent of the path. The production VFS
+    // mutates by entity ID, so this fake must preserve an ID/type across a
+    // staging rename and reject a stale expected entity.
+    private readonly entityIds = new Map<string, string>();
+    private readonly entityTypes = new Map<string, 'doc' | 'file' | 'folder'>();
     // Every byte that reaches Overleaf goes through writeFileFromRemoteBaseline
     // (guardedReplaceRemoteBinary and pushWithRetry both end here). Entries are
     // appended only once the bytes have actually landed, and they carry the
@@ -73,36 +79,171 @@ class FakeVirtualFileSystem {
         return vscode.Uri.joinPath(this.remoteRoot, ...segments);
     }
 
-    async _resolveUri(uri: vscode.Uri) {
+    private relativeKey(uri: vscode.Uri): string {
         const relativePath = path.relative(this.remoteRoot.fsPath, uri.fsPath).split(path.sep).join('/');
-        const relPath = '/' + relativePath.split('/').filter(Boolean).join('/');
+        return '/' + relativePath.split('/').filter(Boolean).join('/');
+    }
+
+    // Tests that emulate a collaborator replacement can explicitly change the
+    // remote entity while retaining the path and bytes.
+    setEntityId(relPath: string, entityId: string) {
+        this.entityIds.set('/' + relPath.split('/').filter(Boolean).join('/'), entityId);
+    }
+
+    async _resolveUri(uri: vscode.Uri) {
+        const relPath = this.relativeKey(uri);
         const fileName = path.basename(uri.fsPath);
         let isDirectory = false;
+        let exists = false;
         try {
             isDirectory = (await vscode.workspace.fs.stat(uri)).type===vscode.FileType.Directory;
+            exists = true;
         } catch {
             isDirectory = false;
         }
-        const fileType = isDirectory
+        const detectedFileType: 'doc' | 'file' | 'folder' = isDirectory
             ? 'folder'
             : /\.tex$/i.test(fileName) ? 'doc' : 'file';
         const parentRelPath = relPath==='/' ? '/' : path.posix.dirname(relPath);
+        let fileType = detectedFileType;
+        if (exists) {
+            fileType = this.entityTypes.get(relPath) ?? detectedFileType;
+            this.entityIds.set(relPath, this.entityIds.get(relPath) ?? relPath);
+            this.entityIds.set(
+                parentRelPath,
+                this.entityIds.get(parentRelPath) ?? parentRelPath,
+            );
+            this.entityTypes.set(relPath, fileType);
+            this.entityTypes.set(parentRelPath, 'folder');
+        }
         return {
             parentFolder: {
-                _id: parentRelPath,
+                _id: this.entityIds.get(parentRelPath) ?? parentRelPath,
                 name: path.posix.basename(parentRelPath),
                 _type: 'folder',
             },
             fileName,
             fileType,
             fileEntity: {
-                _id: relPath,
+                _id: this.entityIds.get(relPath) ?? relPath,
                 name: fileName,
                 _type: fileType,
                 linkedFileData: null,
                 created: new Date(0).toISOString(),
             },
         };
+    }
+
+    _resolveById(entityId: string) {
+        for (const [relPath, id] of this.entityIds) {
+            if (id!==entityId) { continue; }
+            const fileName = path.posix.basename(relPath);
+            const fileType = this.entityTypes.get(relPath)
+                ?? (relPath==='/' || !path.extname(fileName)
+                    ? 'folder'
+                    : (/\.tex$/i.test(fileName) ? 'doc' : 'file'));
+            const parentRelPath = relPath==='/' ? '/' : path.posix.dirname(relPath);
+            return {
+                parentFolder: {
+                    _id: this.entityIds.get(parentRelPath) ?? parentRelPath,
+                    name: path.posix.basename(parentRelPath),
+                    _type: 'folder',
+                },
+                fileEntity: {
+                    _id: id,
+                    name: fileName,
+                    _type: fileType,
+                    linkedFileData: null,
+                    created: new Date(0).toISOString(),
+                },
+                fileType,
+                path: relPath,
+            };
+        }
+        return undefined;
+    }
+
+    async rename(
+        oldUri: vscode.Uri,
+        newUri: vscode.Uri,
+        force: boolean,
+        expectedEntity?: ExpectedRemoteEntity,
+    ) {
+        const oldKey = this.relativeKey(oldUri);
+        let actualType: 'doc' | 'file' | 'folder';
+        try {
+            await vscode.workspace.fs.stat(oldUri);
+            actualType = (await this._resolveUri(oldUri)).fileType;
+        } catch {
+            throw vscode.FileSystemError.FileNotFound(oldUri);
+        }
+        const oldParentKey = oldKey==='/' ? '/' : path.posix.dirname(oldKey);
+        if (
+            expectedEntity!==undefined
+            && (
+                (this.entityIds.get(oldKey) ?? oldKey)!==expectedEntity.id
+                || actualType!==expectedEntity.type
+                || (
+                    expectedEntity.parentId!==undefined
+                    && (this.entityIds.get(oldParentKey) ?? oldParentKey)!==expectedEntity.parentId
+                )
+            )
+        ) {
+            throw vscode.FileSystemError.Unavailable('unexpected remote entity');
+        }
+        if (!force && await pathExists(newUri)) {
+            throw vscode.FileSystemError.FileExists(newUri);
+        }
+        await vscode.workspace.fs.rename(oldUri, newUri, {overwrite: force});
+        const newKey = this.relativeKey(newUri);
+        const movedIds = [...this.entityIds.entries()]
+            .filter(([key]) => key===oldKey || key.startsWith(oldKey+'/'));
+        const movedTypes = [...this.entityTypes.entries()]
+            .filter(([key]) => key===oldKey || key.startsWith(oldKey+'/'));
+        for (const [key, id] of movedIds) {
+            this.entityIds.delete(key);
+            this.entityIds.set(newKey + key.slice(oldKey.length), id);
+        }
+        for (const [key, type] of movedTypes) {
+            this.entityTypes.delete(key);
+            this.entityTypes.set(newKey + key.slice(oldKey.length), type);
+        }
+        if (movedIds.length===0) {
+            this.entityIds.set(newKey, oldKey);
+            this.entityTypes.set(newKey, actualType);
+        }
+    }
+
+    async remove(
+        uri: vscode.Uri,
+        recursive: boolean,
+        expectedEntity?: ExpectedRemoteEntity,
+    ) {
+        if (!await pathExists(uri)) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
+        const resolved = await this._resolveUri(uri);
+        if (
+            expectedEntity!==undefined
+            && (
+                resolved.fileType!==expectedEntity.type
+                || resolved.fileEntity._id!==expectedEntity.id
+                || (
+                    expectedEntity.parentId!==undefined
+                    && resolved.parentFolder._id!==expectedEntity.parentId
+                )
+            )
+        ) {
+            throw vscode.FileSystemError.Unavailable('unexpected remote entity');
+        }
+        await vscode.workspace.fs.delete(uri, {recursive});
+        const key = this.relativeKey(uri);
+        for (const pathKey of [...this.entityIds.keys()]) {
+            if (pathKey===key || pathKey.startsWith(key+'/')) {
+                this.entityIds.delete(pathKey);
+                this.entityTypes.delete(pathKey);
+            }
+        }
     }
 
     async ensureConnectedForWrite() {}
@@ -152,7 +293,28 @@ class FakeVirtualFileSystem {
         content: Uint8Array,
         _remoteBaseline?: Uint8Array,
         expectedRemoteMissing = false,
+        expectedEntity?: ExpectedRemoteEntity,
     ) {
+        if (expectedEntity!==undefined) {
+            if (!await pathExists(uri)) {
+                throw new RemoteDocumentMergeConflictError(
+                    `Overleaf file source no longer exists: ${uri.path}`,
+                );
+            }
+            const current = await this._resolveUri(uri);
+            if (
+                current.fileType!==expectedEntity.type
+                || current.fileEntity._id!==expectedEntity.id
+                || (
+                    expectedEntity.parentId!==undefined
+                    && current.parentFolder._id!==expectedEntity.parentId
+                )
+            ) {
+                throw new RemoteDocumentMergeConflictError(
+                    `Overleaf file source or parent no longer matches the recorded entity: ${uri.path}`,
+                );
+            }
+        }
         if (expectedRemoteMissing && await pathExists(uri)) {
             const remoteContent = await vscode.workspace.fs.readFile(uri);
             if (Buffer.compare(Buffer.from(remoteContent), Buffer.from(content))===0) {

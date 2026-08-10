@@ -10,6 +10,7 @@ import { BaseSCM, CommitItem, SettingItem } from ".";
 import {
     RemoteDocumentMergeConflictError,
     RemoteDocumentWriteAmbiguousError,
+    ExpectedRemoteEntity,
     VirtualFileSystem,
     parseUri,
     vfsProjectKey,
@@ -267,7 +268,7 @@ interface SyncManifestFolderConflictResolutionHistoryEntry {
 }
 
 interface SyncManifest {
-    version: 12;
+    version: 13;
     projectUri: string;
     baselineComplete: boolean;
     files: Record<string, SyncManifestEntry>;
@@ -304,15 +305,30 @@ type RemoteFilePathIdentity = {
 };
 
 interface SyncManifestPendingFileOperation {
-    version: 1;
+    // v1 records predate entity-bound durable file mutation. They remain
+    // readable only so recovery can turn the unproven intent into a conflict.
+    version: 1 | 2;
     id: string;
     kind: 'update' | 'delete';
     localKind: 'file' | 'missing';
     localRevision: string;
     remoteKind?: PathRevision['kind'];
     remoteRevision?: string;
+    // v2 records bind an observed remote regular file to its exact entity and
+    // parent before any mutation. `appliedEntity` is only set by a binary
+    // replacement after the server-issued replacement identity is durable.
+    targetEntity?: SyncManifestRemoteEntityIdentity;
+    parentEntity?: SyncManifestRemoteFolderIdentity;
+    appliedEntity?: SyncManifestRemoteEntityIdentity;
     createdAt: string;
     updatedAt: string;
+}
+
+interface RemoteFileMutationGuard {
+    targetEntity: SyncManifestRemoteEntityIdentity;
+    parentEntity: SyncManifestRemoteFolderIdentity;
+    pendingOperationId: string;
+    replacementEntity?: SyncManifestRemoteEntityIdentity;
 }
 
 
@@ -448,7 +464,9 @@ interface RemoteFolderDeleteGuard {
 }
 
 interface RemoteDeleteOperationRecord {
-    version: 1;
+    // v1 is retained for recovery only. New regular-file delete and replace
+    // records are v2 and carry the entity/parent proof below.
+    version: 1 | 2;
     id: string;
     kind?: 'delete' | 'replace';
     relPath: string;
@@ -459,6 +477,7 @@ interface RemoteDeleteOperationRecord {
     // Present only for a guarded recursive folder deletion. It lets crash
     // recovery distinguish the original folder from a same-name replacement.
     folderGuard?: RemoteFolderDeleteGuard;
+    fileGuard?: RemoteFileMutationGuard;
     createdAt: string;
 }
 
@@ -2719,6 +2738,44 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && left.pendingOperationId===right.pendingOperationId;
     }
 
+    private isValidRemoteFileMutationGuard(
+        value: unknown,
+    ): value is RemoteFileMutationGuard {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const guard = value as Partial<RemoteFileMutationGuard>;
+        return this.isValidSyncManifestRemoteEntityIdentity(guard.targetEntity)
+            && this.isValidSyncManifestFolderIdentity(guard.parentEntity)
+            && typeof guard.pendingOperationId==='string'
+            && /^[a-f0-9]{32}$/.test(guard.pendingOperationId)
+            && (
+                guard.replacementEntity===undefined
+                || this.isValidSyncManifestRemoteEntityIdentity(guard.replacementEntity)
+            );
+    }
+
+    private remoteFileMutationGuardsMatch(
+        left: RemoteFileMutationGuard | undefined,
+        right: RemoteFileMutationGuard | undefined,
+    ): boolean {
+        if (left===undefined || right===undefined) {
+            return left===right;
+        }
+        const sameReplacement = (
+            left.replacementEntity===undefined || right.replacementEntity===undefined
+        )
+            ? left.replacementEntity===right.replacementEntity
+            : this.remoteMoveEntityMatches(
+                left.replacementEntity,
+                right.replacementEntity,
+            );
+        return this.remoteMoveEntityMatches(left.targetEntity, right.targetEntity)
+            && this.remoteFolderIdentityMatches(left.parentEntity, right.parentEntity)
+            && left.pendingOperationId===right.pendingOperationId
+            && sameReplacement;
+    }
+
     private isValidRemoteDeleteOperationRecord(
         value: unknown,
     ): value is RemoteDeleteOperationRecord {
@@ -2735,7 +2792,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 kind==='delete'
                 && this.isValidRemoteFolderDeleteGuard(record.folderGuard)
             );
-        return record.version===1
+        const validFileGuard = record.fileGuard===undefined
+            || (
+                record.folderGuard===undefined
+                && this.isValidRemoteFileMutationGuard(record.fileGuard)
+            );
+        return (record.version===1 || record.version===2)
             && (kind==='delete' || kind==='replace')
             && typeof record.id==='string'
             && record.id.length<=128
@@ -2758,6 +2820,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         )
             )
             && validFolderGuard
+            && validFileGuard
+            && (
+                record.version===1
+                    ? record.fileGuard===undefined
+                    : record.folderGuard===undefined && record.fileGuard!==undefined
+            )
             && typeof record.createdAt==='string'
             && Number.isFinite(Date.parse(record.createdAt));
     }
@@ -2777,6 +2845,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 && existing.replacementRevision===record.replacementRevision
                 && existing.supersededByRevision===record.supersededByRevision
                 && this.remoteFolderDeleteGuardsMatch(existing.folderGuard, record.folderGuard)
+                && this.remoteFileMutationGuardsMatch(existing.fileGuard, record.fileGuard)
             ) {
                 return;
             }
@@ -3755,7 +3824,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private emptySyncManifest(baselineComplete = true): SyncManifest {
         return {
-            version: 12,
+            version: 13,
             projectUri: stringifyOverleafUri(this.vfs.origin),
             baselineComplete,
             files: {},
@@ -4132,7 +4201,20 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             )
             && this.isValidRecordedPathRevision(entry.remoteRevision)
         );
-        return entry.version===1
+        const hasTargetIdentity = entry.targetEntity!==undefined
+            || entry.parentEntity!==undefined;
+        const validTargetIdentity = !hasTargetIdentity || (
+            this.isValidSyncManifestRemoteEntityIdentity(entry.targetEntity)
+            && this.isValidSyncManifestFolderIdentity(entry.parentEntity)
+        );
+        const validAppliedIdentity = entry.appliedEntity===undefined || (
+            entry.kind==='update'
+            && this.isValidSyncManifestRemoteEntityIdentity(entry.appliedEntity)
+            && validTargetIdentity
+            && hasTargetIdentity
+        );
+        const requiresObservedIdentity = entry.version===2 && entry.remoteKind==='file';
+        return (entry.version===1 || entry.version===2)
             && typeof entry.id==='string'
             && /^[a-f0-9]{32}$/.test(entry.id)
             && (entry.kind==='update' || entry.kind==='delete')
@@ -4146,6 +4228,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     : entry.localKind==='missing' && entry.localRevision===DELETE_DIGEST
             )
             && validRemoteProof
+            && validTargetIdentity
+            && validAppliedIdentity
+            && (
+                entry.version===1
+                    ? !hasTargetIdentity && entry.appliedEntity===undefined
+                    : !requiresObservedIdentity || hasTargetIdentity
+            )
             && typeof entry.createdAt==='string'
             && Number.isFinite(Date.parse(entry.createdAt))
             && typeof entry.updatedAt==='string'
@@ -4421,7 +4510,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } catch {
                 sameProject = false;
             }
-            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11 || manifest.version===12)
+            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11 || manifest.version===12 || manifest.version===13)
                 && sameProject
                 && (manifest.baselineComplete===undefined || typeof manifest.baselineComplete==='boolean')
                 && this.isValidSyncManifestRecord<SyncManifestEntry>(
@@ -4446,7 +4535,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     )
                 )
                 && (
-                    manifest.version!==10 && manifest.version!==11 && manifest.version!==12
+                    manifest.version!==10 && manifest.version!==11 && manifest.version!==12 && manifest.version!==13
                     || (
                         this.isValidSyncManifestRecord<SyncManifestConflictResolution>(
                             manifest.conflictResolutions,
@@ -4499,7 +4588,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (validShape) {
                 this.requireSyncSession(generation);
                 this.syncManifest = {
-                    version: 12,
+                    version: 13,
                     projectUri,
                     baselineComplete: manifest.baselineComplete!==false,
                     files: manifest.files!,
@@ -4507,19 +4596,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         ? manifest.directories
                         : {},
                     conflicts: manifest.conflicts ?? {},
-                    conflictResolutions: manifest.version===10 || manifest.version===11 || manifest.version===12
+                    conflictResolutions: manifest.version===10 || manifest.version===11 || manifest.version===12 || manifest.version===13
                         ? manifest.conflictResolutions!
                         : {},
-                    conflictResolutionHistory: manifest.version===10 || manifest.version===11 || manifest.version===12
+                    conflictResolutionHistory: manifest.version===10 || manifest.version===11 || manifest.version===12 || manifest.version===13
                         ? manifest.conflictResolutionHistory!
                         : [],
-                    folderConflictResolutions: manifest.version===11 || manifest.version===12
+                    folderConflictResolutions: manifest.version===11 || manifest.version===12 || manifest.version===13
                         ? manifest.folderConflictResolutions!
                         : {},
-                    folderConflictResolutionHistory: manifest.version===11 || manifest.version===12
+                    folderConflictResolutionHistory: manifest.version===11 || manifest.version===12 || manifest.version===13
                         ? manifest.folderConflictResolutionHistory!
                         : [],
-                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11 || manifest.version===12
+                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6 || manifest.version===7 || manifest.version===8 || manifest.version===9 || manifest.version===10 || manifest.version===11 || manifest.version===12 || manifest.version===13
                         ? manifest.pendingOperations!
                         : {},
                 };
@@ -4547,7 +4636,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     ? 'unavailable'
                     : 'trusted';
                 this.syncManifestRevision += 1;
-                this.syncManifestDirty = manifest.version!==12
+                this.syncManifestDirty = manifest.version!==13
                     || manifest.directories===undefined
                     || manifest.conflicts===undefined
                     || manifest.conflictResolutions===undefined
@@ -4789,27 +4878,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     private remoteDeleteOperationId(
         relPath: string,
         expectedRevision: string,
-        expectedFolderId?: string,
+        expectedEntityId?: string,
     ): string {
-        // Keep the v0.16.1 file-delete seed byte-for-byte stable. Existing
-        // crash journals name their remote stage from it, so adding folder
-        // identity must be a distinct seed rather than an empty third field.
-        const seed = expectedFolderId===undefined
+        // Preserve v0.16.1 stage names when no identity is available, but put
+        // every new guarded entity into its own durable recovery namespace.
+        const seed = expectedEntityId===undefined
             ? `${relPath}\0${expectedRevision}`
-            : `${relPath}\0${expectedRevision}\0${expectedFolderId}`;
+            : `${relPath}\0${expectedRevision}\0${expectedEntityId}`;
         return contentDigest(Buffer.from(seed)).slice(0, 24);
     }
 
     private remoteDeleteStagingPath(
         relPath: string,
         expectedRevision: string,
-        expectedFolderId?: string,
+        expectedEntityId?: string,
     ): string {
         const parentPath = nodePath.posix.dirname(relPath);
         const operationId = this.remoteDeleteOperationId(
             relPath,
             expectedRevision,
-            expectedFolderId,
+            expectedEntityId,
         );
         const stageName = `.sr-overleaf-delete-${operationId}`;
         return parentPath==='/' ? `/${stageName}` : `${parentPath}/${stageName}`;
@@ -4819,22 +4907,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         relPath: string,
         expectedRevision: string,
         replacementRevision: string,
+        expectedEntityId?: string,
     ): string {
-        return contentDigest(
-            Buffer.from(`${relPath}\0${expectedRevision}\0${replacementRevision}`),
-        ).slice(0, 24);
+        const seed = expectedEntityId===undefined
+            ? `${relPath}\0${expectedRevision}\0${replacementRevision}`
+            : `${relPath}\0${expectedRevision}\0${replacementRevision}\0${expectedEntityId}`;
+        return contentDigest(Buffer.from(seed)).slice(0, 24);
     }
 
     private remoteReplacementStagingPath(
         relPath: string,
         expectedRevision: string,
         replacementRevision: string,
+        expectedEntityId?: string,
     ): string {
         const parentPath = nodePath.posix.dirname(relPath);
         const operationId = this.remoteReplacementOperationId(
             relPath,
             expectedRevision,
             replacementRevision,
+            expectedEntityId,
         );
         const stageName = `.sr-overleaf-replace-${operationId}`;
         return parentPath==='/' ? `/${stageName}` : `${parentPath}/${stageName}`;
@@ -4857,13 +4949,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         targetUri: vscode.Uri,
         stagingUri: vscode.Uri,
         generation: number,
+        expectedEntity?: ExpectedRemoteEntity,
     ): Promise<void> {
         return this.runSessionIO(
             generation,
-            () => vscode.workspace.fs.rename(
+            () => this.vfs.rename(
                 targetUri,
                 stagingUri,
-                {overwrite: false},
+                false,
+                expectedEntity,
             ),
         );
     }
@@ -4891,6 +4985,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         targetUri: vscode.Uri,
         relPath: string,
         generation: number,
+        expectedEntity?: ExpectedRemoteEntity,
     ): Promise<boolean> {
         if (await this.remotePathExists(targetUri, generation)) {
             getOutputChannel().appendLine(
@@ -4902,10 +4997,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         try {
             await this.runSessionIO(
                 generation,
-                () => vscode.workspace.fs.rename(
+                () => this.vfs.rename(
                     stagingUri,
                     targetUri,
-                    {overwrite: false},
+                    false,
+                    expectedEntity,
                 ),
             );
             this.requireSyncSession(generation);
@@ -5270,21 +5366,63 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         expectedRevision: string,
         generation = this.syncGeneration,
         confirmLocalStillAbsent?: () => Promise<boolean>,
+        fileGuard?: RemoteFileMutationGuard,
     ): Promise<boolean> {
         this.requireSyncSession(generation);
         const targetUri = this.vfs.pathToUri(relPath);
-        const operationId = this.remoteDeleteOperationId(relPath, expectedRevision);
-        const stagingRelPath = this.remoteDeleteStagingPath(relPath, expectedRevision);
+        const operationId = this.remoteDeleteOperationId(
+            relPath, expectedRevision, fileGuard?.targetEntity.id,
+        );
+        const stagingRelPath = this.remoteDeleteStagingPath(
+            relPath, expectedRevision, fileGuard?.targetEntity.id,
+        );
         const stagingUri = this.vfs.pathToUri(stagingRelPath);
         let staged = await this.captureRemoteUriRevision(stagingUri, relPath, generation);
         let target = await this.captureRemoteUriRevision(targetUri, relPath, generation);
         let remoteWasStaged = staged.kind!=='missing';
+        const expectedFileEntity = fileGuard===undefined
+            ? undefined
+            : this.expectedRemoteEntityForFileMutation(fileGuard);
+        const assertGuardedFileState = async (
+            uri: vscode.Uri,
+            state: PathRevision,
+            label: string,
+        ): Promise<void> => {
+            if (fileGuard===undefined || state.kind==='missing') { return; }
+            if (state.kind!=='file' || state.revision!==expectedRevision) {
+                throw new ConcurrentReplicaChangeError(
+                    'Overleaf ' + label + ' no longer has the expected file revision: ' + relPath,
+                );
+            }
+            const identity = await this.resolveRemoteFilePathIdentity(uri);
+            this.requireSyncSession(generation);
+            if (!this.remoteFilePathIdentityMatches(
+                identity,
+                fileGuard.targetEntity,
+                fileGuard.parentEntity,
+            )) {
+                throw new ConcurrentReplicaChangeError(
+                    'Overleaf ' + label + ' no longer has the expected file identity: ' + relPath,
+                );
+            }
+        };
+        const verifyGuardedFileDeleted = () => {
+            if (
+                fileGuard!==undefined
+                && this.vfs._resolveById(fileGuard.targetEntity.id)!==undefined
+            ) {
+                throw new ConcurrentReplicaChangeError(
+                    'The original Overleaf file still exists after its delete: ' + relPath,
+                );
+            }
+        };
         await this.createRemoteDeleteOperationRecord({
-            version: 1,
+            version: fileGuard===undefined ? 1 : 2,
             id: operationId,
             relPath,
             stagingRelPath,
             expectedRevision,
+            fileGuard: fileGuard===undefined ? undefined : {...fileGuard},
             createdAt: new Date().toISOString(),
         });
 
@@ -5292,7 +5430,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             try {
                 await this.runSessionIO(
                     generation,
-                    () => vscode.workspace.fs.delete(stagingUri, {recursive: true}),
+                    () => this.vfs.remove(stagingUri, true, expectedFileEntity),
                 );
             } catch (error) {
                 await this.refreshRemoteStateForReconciliation(
@@ -5321,6 +5459,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 targetUri,
                 relPath,
                 generation,
+                expectedFileEntity,
             );
             if (!restored) {
                 getOutputChannel().appendLine(
@@ -5334,6 +5473,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         };
 
         try {
+            await assertGuardedFileState(stagingUri, staged, 'delete stage');
+            await assertGuardedFileState(targetUri, target, 'delete target');
             if (staged.kind!=='missing') {
                 if (staged.revision!==expectedRevision) {
                     if (target.kind==='missing') {
@@ -5346,6 +5487,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     );
                 }
                 if (target.kind!=='missing') {
+                    if (fileGuard!==undefined) {
+                        throw new ConcurrentReplicaChangeError(
+                            'Overleaf recreated the target while the original guarded file is retained in its delete stage: ' + relPath,
+                        );
+                    }
                     await deleteExpectedStaging();
                     await this.removeRemoteDeleteOperationRecord(operationId);
                     throw new ConcurrentReplicaChangeError(
@@ -5354,6 +5500,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 }
             } else {
                 if (target.kind==='missing') {
+                    verifyGuardedFileDeleted();
                     await this.removeRemoteDeleteOperationRecord(operationId);
                     return true;
                 }
@@ -5365,7 +5512,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 }
 
                 try {
-                    await this.renameRemotePathForDelete(targetUri, stagingUri, generation);
+                    await this.renameRemotePathForDelete(
+                        targetUri, stagingUri, generation, expectedFileEntity,
+                    );
                     remoteWasStaged = true;
                 } catch (error) {
                     await this.refreshRemoteStateForReconciliation(
@@ -5375,7 +5524,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     );
                     staged = await this.captureRemoteUriRevision(stagingUri, relPath, generation);
                     target = await this.captureRemoteUriRevision(targetUri, relPath, generation);
+                    await assertGuardedFileState(
+                        targetUri,
+                        target,
+                        'ambiguous delete target',
+                    );
                     if (staged.kind==='missing' && target.kind==='missing') {
+                        verifyGuardedFileDeleted();
                         await this.removeRemoteDeleteOperationRecord(operationId);
                         return true;
                     }
@@ -5397,8 +5552,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
             staged = await this.captureRemoteUriRevision(stagingUri, relPath, generation);
             target = await this.captureRemoteUriRevision(targetUri, relPath, generation);
+            await assertGuardedFileState(stagingUri, staged, 'staged delete');
+            await assertGuardedFileState(targetUri, target, 'staged delete target');
             if (staged.kind==='missing') {
                 if (target.kind==='missing') {
+                    verifyGuardedFileDeleted();
                     await this.removeRemoteDeleteOperationRecord(operationId);
                     return true;
                 }
@@ -5418,6 +5576,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
             }
             if (target.kind!=='missing') {
+                if (fileGuard!==undefined) {
+                    throw new ConcurrentReplicaChangeError(
+                        'Overleaf recreated the target while the original guarded file is retained in its delete stage: ' + relPath,
+                    );
+                }
                 await deleteExpectedStaging();
                 await this.removeRemoteDeleteOperationRecord(operationId);
                 throw new ConcurrentReplicaChangeError(
@@ -5442,6 +5605,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
             }
             if (target.kind!=='missing') {
+                if (fileGuard!==undefined) {
+                    throw new ConcurrentReplicaChangeError(
+                        'Overleaf recreated the target while the original guarded file is retained in its final delete stage: ' + relPath,
+                    );
+                }
                 await deleteExpectedStaging();
                 await this.removeRemoteDeleteOperationRecord(operationId);
                 throw new ConcurrentReplicaChangeError(
@@ -5490,6 +5658,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     `Overleaf recreated ${relPath} while its staged entity was being deleted`,
                 );
             }
+            verifyGuardedFileDeleted();
             await this.removeRemoteDeleteOperationRecord(operationId);
             return true;
         } catch (error) {
@@ -5507,8 +5676,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
                 staged = await this.captureRemoteUriRevision(stagingUri, relPath, generation);
                 target = await this.captureRemoteUriRevision(targetUri, relPath, generation);
+                await assertGuardedFileState(stagingUri, staged, 'failed delete stage');
+                await assertGuardedFileState(targetUri, target, 'failed delete target');
                 if (staged.kind==='missing') {
                     if (target.kind==='missing') {
+                        verifyGuardedFileDeleted();
                         await this.removeRemoteDeleteOperationRecord(operationId);
                         return true;
                     }
@@ -5536,6 +5708,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         targetUri,
                         relPath,
                         generation,
+                        expectedFileEntity,
                     );
                     if (!restored) {
                         throw new ConcurrentReplicaChangeError(
@@ -5544,6 +5717,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     }
                     await this.removeRemoteDeleteOperationRecord(operationId);
                 } else {
+                    if (fileGuard!==undefined) {
+                        throw new ConcurrentReplicaChangeError(
+                            'Overleaf recreated the target while the original guarded file is retained in its failed delete stage: ' + relPath,
+                        );
+                    }
                     await deleteExpectedStaging();
                     await this.removeRemoteDeleteOperationRecord(operationId);
                     throw new ConcurrentReplicaChangeError(
@@ -5564,11 +5742,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         stagingUri: vscode.Uri,
         relPath: string,
         generation: number,
+        expectedEntity?: ExpectedRemoteEntity,
     ): Promise<boolean> {
         try {
             await this.runSessionIO(
                 generation,
-                () => vscode.workspace.fs.delete(stagingUri, {recursive: true}),
+                () => this.vfs.remove(stagingUri, true, expectedEntity),
             );
             return true;
         } catch (error) {
@@ -5578,7 +5757,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     generation,
                     'verify remote replacement stage cleanup',
                 );
-                if (!await this.remotePathExists(stagingUri, generation)) {
+                if (
+                    !await this.remotePathExists(stagingUri, generation)
+                    && (
+                        expectedEntity===undefined
+                        || this.vfs._resolveById(expectedEntity.id)===undefined
+                    )
+                ) {
                     return true;
                 }
             } catch {
@@ -5597,6 +5782,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         targetUri: vscode.Uri,
         replacementContent: Uint8Array,
         remoteBaseline: Uint8Array,
+        fileGuard: RemoteFileMutationGuard,
         generation = this.syncGeneration,
     ): Promise<Uint8Array> {
         this.requireSyncSession(generation);
@@ -5606,39 +5792,86 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             relPath,
             expectedRevision,
             replacementRevision,
+            fileGuard.targetEntity.id,
         );
         const stagingRelPath = this.remoteReplacementStagingPath(
             relPath,
             expectedRevision,
             replacementRevision,
+            fileGuard.targetEntity.id,
         );
         const stagingUri = this.vfs.pathToUri(stagingRelPath);
         await this.createRemoteDeleteOperationRecord({
-            version: 1,
+            version: 2,
             id: operationId,
             kind: 'replace',
             relPath,
             stagingRelPath,
             expectedRevision,
             replacementRevision,
+            fileGuard: {...fileGuard},
             createdAt: new Date().toISOString(),
         });
 
         const completedRecord: RemoteDeleteOperationRecord = {
-            version: 1,
+            version: 2,
             id: operationId,
             kind: 'replace',
             relPath,
             stagingRelPath,
             expectedRevision,
             replacementRevision,
+            fileGuard: {...fileGuard},
             createdAt: new Date().toISOString(),
+        };
+        const expectedOriginalEntity = this.expectedRemoteEntityForFileMutation(fileGuard);
+        const assertOriginalIdentity = async (
+            uri: vscode.Uri,
+            state: PathRevision,
+            label: string,
+        ) => {
+            if (state.kind!=='file' || state.revision!==expectedRevision) {
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf ' + label + ' changed before the binary replacement: ' + relPath,
+                );
+            }
+            const identity = await this.resolveRemoteFilePathIdentity(uri);
+            this.requireSyncSession(generation);
+            if (!this.remoteFilePathIdentityMatches(
+                identity, fileGuard.targetEntity, fileGuard.parentEntity,
+            )) {
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf ' + label + ' identity changed before the binary replacement: ' + relPath,
+                );
+            }
+        };
+        const assertReplacementIdentity = async (state: PathRevision) => {
+            if (!fileGuard.replacementEntity) {
+                throw new RemoteDocumentMergeConflictError(
+                    'The replacement file identity was not durably recorded: ' + relPath,
+                );
+            }
+            if (state.kind!=='file' || state.revision!==replacementRevision) {
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf replacement contents changed before finalization: ' + relPath,
+                );
+            }
+            const identity = await this.resolveRemoteFilePathIdentity(targetUri);
+            this.requireSyncSession(generation);
+            if (!this.remoteFilePathIdentityMatches(
+                identity, fileGuard.replacementEntity, fileGuard.parentEntity,
+            )) {
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf replacement identity changed before finalization: ' + relPath,
+                );
+            }
         };
         const removeCompletedJournal = async () => {
             const removed = await this.removeRemoteReplacementStage(
                 stagingUri,
                 relPath,
                 generation,
+                expectedOriginalEntity,
             );
             if (removed) {
                 const verifiedTarget = await this.captureRemoteUriRevision(
@@ -5646,6 +5879,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     relPath,
                     generation,
                 );
+                await assertReplacementIdentity(verifiedTarget);
                 if (verifiedTarget.revision!==replacementRevision) {
                     throw new RemoteDocumentMergeConflictError(
                         `Overleaf changed ${relPath} while its completed binary replacement was finalized`,
@@ -5672,7 +5906,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             );
 
             if (staged.kind==='missing') {
-                if (target.revision===replacementRevision) {
+                if (target.revision===replacementRevision && fileGuard.replacementEntity!==undefined) {
+                    await assertReplacementIdentity(target);
                     await this.retireSupersededRemoteReplacements(
                         completedRecord,
                         generation,
@@ -5690,7 +5925,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         `Overleaf changed ${relPath} before its binary replacement was staged`,
                     );
                 }
-                await this.renameRemotePathForDelete(targetUri, stagingUri, generation);
+                await assertOriginalIdentity(targetUri, target, 'replacement target');
+                await this.renameRemotePathForDelete(
+                    targetUri, stagingUri, generation, expectedOriginalEntity,
+                );
                 staged = await this.captureRemoteUriRevision(
                     stagingUri,
                     relPath,
@@ -5703,6 +5941,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
             }
 
+            await assertOriginalIdentity(stagingUri, staged, 'replacement stage');
             if (staged.revision!==expectedRevision) {
                 if (target.kind==='missing') {
                     const restored = await this.restoreRemoteStagingPath(
@@ -5710,6 +5949,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         targetUri,
                         relPath,
                         generation,
+                        expectedOriginalEntity,
                     );
                     if (restored) {
                         await this.removeRemoteDeleteOperationRecord(operationId);
@@ -5720,7 +5960,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
             }
             if (target.kind!=='missing') {
-                if (target.revision===replacementRevision) {
+                if (target.revision===replacementRevision && fileGuard.replacementEntity!==undefined) {
+                    await assertReplacementIdentity(target);
                     await removeCompletedJournal();
                     return replacementContent;
                 }
@@ -5729,26 +5970,51 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
             }
 
-            const pushedContent = await this.pushWithRetry(
+            const creation = await this.createFileWithRetry(
                 relPath,
                 targetUri,
                 replacementContent,
+                fileGuard.parentEntity,
                 generation,
-                undefined,
-                true,
+            );
+            if (
+                !creation.created
+                || creation.parentId!==fileGuard.parentEntity.id
+                || (creation.entityType!=='doc' && creation.entityType!=='file')
+                || typeof creation.entityId!=='string'
+                || creation.entityId.length===0
+            ) {
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf did not prove the server-issued replacement file identity: ' + relPath,
+                );
+            }
+            const replacementEntity: SyncManifestRemoteEntityIdentity = {
+                id: creation.entityId,
+                type: creation.entityType,
+            };
+            fileGuard.replacementEntity = replacementEntity;
+            completedRecord.fileGuard = {...fileGuard};
+            await this.updateRemoteDeleteOperationRecord(completedRecord);
+            const pending = this.syncManifest?.pendingOperations[relPath];
+            if (!pending || (pending.kind!=='update' && pending.kind!=='delete')) {
+                throw new RemoteDocumentMergeConflictError(
+                    'The pending local file mutation disappeared before its replacement identity was recorded.',
+                );
+            }
+            await this.markPendingFilePushAppliedEntity(
+                relPath,
+                pending,
+                replacementEntity,
+                generation,
             );
             target = await this.captureRemoteUriRevision(
                 targetUri,
                 relPath,
                 generation,
             );
-            if (target.revision!==contentDigest(pushedContent)) {
-                throw new RemoteDocumentWriteAmbiguousError(
-                    `Overleaf could not verify the completed binary replacement for ${relPath}`,
-                );
-            }
+            await assertReplacementIdentity(target);
             await removeCompletedJournal();
-            return pushedContent;
+            return replacementContent;
         } catch (error) {
             try {
                 await this.refreshRemoteStateForReconciliation(
@@ -5766,8 +6032,19 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     relPath,
                     generation,
                 );
+                if (
+                    target.kind==='file'
+                    && target.revision===expectedRevision
+                ) {
+                    await assertOriginalIdentity(
+                        targetUri,
+                        target,
+                        'replacement recovery target',
+                    );
+                }
 
-                if (target.revision===replacementRevision) {
+                if (target.revision===replacementRevision && fileGuard.replacementEntity!==undefined) {
+                    await assertReplacementIdentity(target);
                     if (staged.kind!=='missing') {
                         await removeCompletedJournal();
                     } else {
@@ -5788,6 +6065,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         targetUri,
                         relPath,
                         generation,
+                        expectedOriginalEntity,
                     );
                     if (restored) {
                         await this.removeRemoteDeleteOperationRecord(operationId);
@@ -5804,6 +6082,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         targetUri,
                         relPath,
                         generation,
+                        expectedOriginalEntity,
                     );
                     if (restored) {
                         await this.removeRemoteDeleteOperationRecord(operationId);
@@ -5903,6 +6182,177 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             record.relPath,
             generation,
         );
+        if (record.version===2) {
+            const guard = record.fileGuard;
+            if (!guard) {
+                throw new ConcurrentReplicaChangeError(
+                    'The guarded binary replacement journal is missing its file identity.',
+                );
+            }
+            const expectedOriginal = this.expectedRemoteEntityForFileMutation(guard);
+            const stageIdentity = staged.kind==='missing'
+                ? undefined
+                : await this.resolveRemoteFilePathIdentity(stagingUri);
+            const targetIdentity = target.kind==='missing'
+                ? undefined
+                : await this.resolveRemoteFilePathIdentity(targetUri);
+            this.requireSyncSession(generation);
+            const stageMatchesOriginal = staged.kind==='file'
+                && staged.revision===record.expectedRevision
+                && this.remoteFilePathIdentityMatches(
+                    stageIdentity,
+                    guard.targetEntity,
+                    guard.parentEntity,
+                );
+            const targetMatchesReplacement = target.kind==='file'
+                && target.revision===record.replacementRevision
+                && guard.replacementEntity!==undefined
+                && this.remoteFilePathIdentityMatches(
+                    targetIdentity,
+                    guard.replacementEntity,
+                    guard.parentEntity,
+                );
+            // A later guarded replacement already proved the original stage is
+            // obsolete before writing supersededByRevision. Recovery can remove
+            // only that same exact original entity; it does not infer anything
+            // from the current target bytes or mutate the visible target.
+            if (record.supersededByRevision!==undefined) {
+                if (staged.kind==='missing') {
+                    await this.removeRemoteDeleteOperationRecord(record.id);
+                    return;
+                }
+                if (!stageMatchesOriginal) {
+                    throw new ConcurrentReplicaChangeError(
+                        'The superseded guarded replacement stage no longer has the original file identity.',
+                    );
+                }
+                if (!await this.removeRemoteReplacementStage(
+                    stagingUri,
+                    record.relPath,
+                    generation,
+                    expectedOriginal,
+                )) {
+                    throw new ConcurrentReplicaChangeError(
+                        'Could not clean the superseded guarded binary replacement stage.',
+                    );
+                }
+                await this.removeRemoteDeleteOperationRecord(record.id);
+                return;
+            }
+            if (targetMatchesReplacement) {
+                const pending = this.syncManifest?.pendingOperations[record.relPath];
+                if (
+                    pending
+                    && (pending.kind==='update' || pending.kind==='delete')
+                    && pending.id===guard.pendingOperationId
+                    && guard.replacementEntity
+                ) {
+                    await this.markPendingFilePushAppliedEntity(
+                        record.relPath,
+                        pending,
+                        guard.replacementEntity,
+                        generation,
+                    );
+                }
+                if (staged.kind==='missing') {
+                    await this.removeRemoteDeleteOperationRecord(record.id);
+                    return;
+                }
+                if (!stageMatchesOriginal) {
+                    throw new ConcurrentReplicaChangeError(
+                        'The retained binary replacement stage no longer has the original file identity.',
+                    );
+                }
+                if (!await this.removeRemoteReplacementStage(
+                    stagingUri,
+                    record.relPath,
+                    generation,
+                    expectedOriginal,
+                )) {
+                    throw new ConcurrentReplicaChangeError(
+                        'Could not clean the guarded binary replacement stage.',
+                    );
+                }
+                const verifiedTarget = await this.captureRemoteUriRevision(
+                    targetUri,
+                    record.relPath,
+                    generation,
+                );
+                const verifiedIdentity = await this.resolveRemoteFilePathIdentity(targetUri);
+                this.requireSyncSession(generation);
+                if (
+                    !guard.replacementEntity
+                    || !this.remoteFilePathIdentityMatches(
+                        verifiedIdentity,
+                        guard.replacementEntity,
+                        guard.parentEntity,
+                    )
+                    || verifiedTarget.kind!=='file'
+                    || verifiedTarget.revision!==record.replacementRevision
+                ) {
+                    throw new ConcurrentReplicaChangeError(
+                        'Overleaf replacement changed while guarded recovery was finalized.',
+                    );
+                }
+                await this.removeRemoteDeleteOperationRecord(record.id);
+                return;
+            }
+            if (target.kind==='missing' && stageMatchesOriginal) {
+                if (!await this.restoreRemoteStagingPath(
+                    stagingUri,
+                    targetUri,
+                    record.relPath,
+                    generation,
+                    expectedOriginal,
+                )) {
+                    throw new ConcurrentReplicaChangeError(
+                        'Could not restore the guarded binary replacement stage.',
+                    );
+                }
+                await this.removeRemoteDeleteOperationRecord(record.id);
+                return;
+            }
+            throw new ConcurrentReplicaChangeError(
+                'The guarded binary replacement no longer has a provable entity state.',
+            );
+        }
+        // A v1 external replacement journal has no immutable proof of either
+        // the original staged entity or the created replacement entity. It may
+        // contain the same bytes after a collaborator has replaced one of those
+        // entities, so it must never finish or clean the operation automatically.
+        // If the only visible entity is the retained stage, put that exact
+        // currently-observed entity back at its canonical path without
+        // overwriting anything. This is a guarded preservation rollback, not an
+        // acknowledgement of the old local replacement; the caller records the
+        // unresolved intent as a durable conflict.
+        if (record.version===1) {
+            if (target.kind==='missing' && staged.kind==='file') {
+                const stageIdentity = await this.resolveRemoteFilePathIdentity(stagingUri);
+                this.requireSyncSession(generation);
+                if (!stageIdentity) {
+                    throw new ConcurrentReplicaChangeError(
+                        'The interrupted legacy binary replacement stage has no resolvable file identity.',
+                    );
+                }
+                const restored = await this.restoreRemoteStagingPath(
+                    stagingUri,
+                    targetUri,
+                    record.relPath,
+                    generation,
+                    {
+                        id: stageIdentity.entity.id,
+                        type: stageIdentity.entity.type,
+                        parentId: stageIdentity.parent.id,
+                    },
+                );
+                if (restored) {
+                    await this.removeRemoteDeleteOperationRecord(record.id);
+                }
+            }
+            throw new ConcurrentReplicaChangeError(
+                'An interrupted legacy binary replacement has no durable entity identity and was not resumed automatically.',
+            );
+        }
         if (record.supersededByRevision!==undefined) {
             if (staged.kind==='missing') {
                 await this.removeRemoteDeleteOperationRecord(record.id);
@@ -6151,19 +6601,99 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 }
                 continue;
             }
-            const staging = await this.captureRemotePathRevision(
-                record.stagingRelPath,
-                generation,
-            );
-            if (staging.kind==='missing') {
-                await this.removeRemoteDeleteOperationRecord(record.id);
+            if (record.version!==2 || record.fileGuard===undefined) {
+                const localState = await this.captureLocalPathRevision(
+                    record.relPath,
+                    generation,
+                );
+                await this.markSyncConflict(
+                    record.relPath,
+                    'An interrupted legacy remote file delete has no durable entity identity and was not resumed automatically.',
+                    localState.kind==='missing'
+                        ? null
+                        : (localState.kind==='file' ? localState.content : undefined),
+                    generation,
+                );
                 continue;
             }
             try {
+                const guard = record.fileGuard;
+                const pending = this.syncManifest?.pendingOperations[record.relPath];
+                if (
+                    !pending
+                    || pending.kind!=='delete'
+                    || pending.id!==guard.pendingOperationId
+                    || !pending.targetEntity
+                    || !pending.parentEntity
+                    || !this.remoteMoveEntityMatches(
+                        pending.targetEntity,
+                        guard.targetEntity,
+                    )
+                    || !this.remoteFolderIdentityMatches(
+                        pending.parentEntity,
+                        guard.parentEntity,
+                    )
+                ) {
+                    throw new ConcurrentReplicaChangeError(
+                        'The durable file-delete journals no longer describe the same entity.',
+                    );
+                }
+                const targetUri = this.vfs.pathToUri(record.relPath);
+                const stagingUri = this.vfs.pathToUri(record.stagingRelPath);
+                const [target, staging] = await Promise.all([
+                    this.captureRemoteUriRevision(targetUri, record.relPath, generation),
+                    this.captureRemoteUriRevision(stagingUri, record.relPath, generation),
+                ]);
+                const [targetIdentity, stagingIdentity] = await Promise.all([
+                    target.kind==='missing'
+                        ? Promise.resolve(undefined)
+                        : this.resolveRemoteFilePathIdentity(targetUri),
+                    staging.kind==='missing'
+                        ? Promise.resolve(undefined)
+                        : this.resolveRemoteFilePathIdentity(stagingUri),
+                ]);
+                this.requireSyncSession(generation);
+                const targetMatches = target.kind==='file'
+                    && target.revision===record.expectedRevision
+                    && this.remoteFilePathIdentityMatches(
+                        targetIdentity,
+                        guard.targetEntity,
+                        guard.parentEntity,
+                    );
+                const stagingMatches = staging.kind==='file'
+                    && staging.revision===record.expectedRevision
+                    && this.remoteFilePathIdentityMatches(
+                        stagingIdentity,
+                        guard.targetEntity,
+                        guard.parentEntity,
+                    );
+                const originalAbsent = this.vfs._resolveById(
+                    guard.targetEntity.id,
+                )===undefined;
+                if (
+                    !targetMatches
+                    && !stagingMatches
+                    && !(target.kind==='missing' && staging.kind==='missing' && originalAbsent)
+                ) {
+                    throw new ConcurrentReplicaChangeError(
+                        'The interrupted file delete no longer has a provable original Overleaf entity.',
+                    );
+                }
                 await this.atomicDeleteRemotePathIfRevision(
                     record.relPath,
                     record.expectedRevision,
                     generation,
+                    async () => {
+                        const localState = await this.captureLocalPathRevision(
+                            record.relPath,
+                            generation,
+                        );
+                        const current = this.syncManifest?.pendingOperations[record.relPath];
+                        return localState.kind==='missing'
+                            && current?.kind==='delete'
+                            && current.id===guard.pendingOperationId;
+                    },
+                    guard,
                 );
             } catch (error) {
                 const localState = await this.captureLocalPathRevision(
@@ -6172,14 +6702,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 );
                 await this.markSyncConflict(
                     record.relPath,
-                    `An interrupted remote delete could not be resumed safely: ${formatUnknownError(error)}`,
+                    'An interrupted guarded remote file delete could not be resumed safely: ' +
+                        formatUnknownError(error),
                     localState.kind==='missing'
                         ? null
                         : (localState.kind==='file' ? localState.content : undefined),
                     generation,
                 );
                 getOutputChannel().appendLine(
-                    `${new Date().toISOString()} [remote delete recovery blocked] ${record.relPath}: ` +
+                    `${new Date().toISOString()} [guarded remote delete recovery blocked] ${record.relPath}: ` +
                     formatUnknownError(error),
                 );
             }
@@ -12213,6 +12744,43 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && actual.entity.type===expectedEntity.type
             && this.remoteFolderIdentityMatches(actual.parent, expectedParent);
     }
+    private async resolveStableRemoteFilePathIdentity(
+        relPath: string,
+        expectedState: PathRevision,
+        generation = this.syncGeneration,
+    ): Promise<RemoteFilePathIdentity> {
+        if (expectedState.kind!=='file') {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf path is not a regular file while its identity is required: ' + relPath,
+            );
+        }
+        const identity = await this.resolveRemoteFilePathIdentity(this.vfs.pathToUri(relPath));
+        this.requireSyncSession(generation);
+        const confirmed = await this.captureRemotePathRevision(relPath, generation);
+        this.requireSyncSession(generation);
+        if (
+            !identity
+            || confirmed.kind!=='file'
+            || confirmed.revision!==expectedState.revision
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf file identity or contents advanced while it was being guarded: ' + relPath,
+            );
+        }
+        return identity;
+    }
+
+    private expectedRemoteEntityForFileMutation(
+        guard: RemoteFileMutationGuard,
+        entity = guard.targetEntity,
+    ): ExpectedRemoteEntity {
+        return {
+            id: entity.id,
+            type: entity.type,
+            parentId: guard.parentEntity.id,
+        };
+    }
+
     private remoteFolderIdentityMatches(
         actual: SyncManifestRemoteFolderIdentity | undefined,
         expected: SyncManifestRemoteFolderIdentity,
@@ -12447,66 +13015,215 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         kind: 'update' | 'delete',
         localRevision: string,
         remoteState: PathRevision | undefined,
+        remoteIdentityOrGeneration?: RemoteFilePathIdentity | number,
         generation = this.syncGeneration,
-    ): Promise<void> {
+    ): Promise<SyncManifestPendingFileOperation> {
+        // Older internal callers supplied generation as the fifth argument.
+        // Preserve that call shape, but derive a stable entity proof rather
+        // than creating an identity-less v13 operation.
+        if (typeof remoteIdentityOrGeneration==='number') {
+            generation = remoteIdentityOrGeneration;
+        }
+        let remoteIdentity = typeof remoteIdentityOrGeneration==='number'
+            ? undefined
+            : remoteIdentityOrGeneration;
         this.requireSyncSession(generation);
-        if (!this.syncManifest) { return; }
+        if (!this.syncManifest) {
+            throw new Error('Local Replica pending file mutation requires an active manifest.');
+        }
         const localKind = kind==='update' ? 'file' : 'missing';
         if (
             (kind==='update' && !/^[a-f0-9]{40}$/.test(localRevision))
             || (kind==='delete' && localRevision!==DELETE_DIGEST)
         ) {
-            throw new Error(`Invalid stable local revision for pending ${kind}: ${relPath}`);
+            throw new Error('Invalid stable local revision for pending ' + kind + ': ' + relPath);
         }
         const existing = this.syncManifest.pendingOperations[relPath];
-        const sameLocalIntent = existing?.kind===kind
-            && existing.localKind===localKind
-            && existing.localRevision===localRevision;
-        // Keep an already-observed precondition when this retry has not yet
-        // reached remote inspection. A changed local intent intentionally drops
-        // the old precondition: it described a different source snapshot.
+        const existingFileOperation = existing
+            && (existing.kind==='update' || existing.kind==='delete')
+            ? existing
+            : undefined;
+        const sameLocalIntent = existingFileOperation?.kind===kind
+            && existingFileOperation.localKind===localKind
+            && existingFileOperation.localRevision===localRevision;
+        // The generic watcher journal is written before the later
+        // authoritative remote snapshot. When an agent has advanced a
+        // previously accepted write, retain its last durable entity proof
+        // through that short interval so the next guarded snapshot can
+        // rebind it instead of treating the known remote entity as unknown.
+        // A restart in this provisional state is conservative: the old
+        // revision is rechecked and becomes a conflict if it no longer
+        // proves the path.
+        const retainedCurrentEntity = existingFileOperation?.appliedEntity
+            ?? existingFileOperation?.targetEntity;
+        const retainExistingProof = remoteState===undefined
+            && existingFileOperation?.version===2
+            && retainedCurrentEntity!==undefined
+            && existingFileOperation.parentEntity!==undefined;
         const remoteKind = remoteState?.kind
-            ?? (sameLocalIntent ? existing?.remoteKind : undefined);
+            ?? ((sameLocalIntent || retainExistingProof)
+                ? existingFileOperation?.remoteKind
+                : undefined);
         const remoteRevision = remoteState?.revision
-            ?? (sameLocalIntent ? existing?.remoteRevision : undefined);
+            ?? ((sameLocalIntent || retainExistingProof)
+                ? existingFileOperation?.remoteRevision
+                : undefined);
+        if (remoteState?.kind==='file' && remoteIdentity===undefined) {
+            // A journal is a durable mutation promise. If a legacy/internal
+            // caller did not pass identity proof, take it from the same
+            // authoritative revision now; never persist an unbound v13
+            // operation merely to keep a retry alive.
+            remoteIdentity = await this.resolveStableRemoteFilePathIdentity(
+                relPath,
+                remoteState,
+                generation,
+            );
+            this.requireSyncSession(generation);
+        }
+        if (
+            sameLocalIntent
+            && existingFileOperation?.version===1
+            && existingFileOperation.remoteKind!==undefined
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'A legacy pending file mutation has no entity identity and cannot be upgraded silently: ' + relPath,
+            );
+        }
+        const targetEntity = remoteIdentity?.entity
+            ?? (sameLocalIntent
+                ? existingFileOperation?.targetEntity
+                : (retainExistingProof ? retainedCurrentEntity : undefined));
+        const parentEntity = remoteIdentity?.parent
+            ?? ((sameLocalIntent || retainExistingProof)
+                ? existingFileOperation?.parentEntity
+                : undefined);
+        if (
+            sameLocalIntent
+            && existingFileOperation?.targetEntity!==undefined
+            && targetEntity!==undefined
+            && (
+                !this.remoteMoveEntityMatches(existingFileOperation.targetEntity, targetEntity)
+                || parentEntity===undefined
+                || !this.remoteFolderIdentityMatches(
+                    existingFileOperation.parentEntity,
+                    parentEntity,
+                )
+            )
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf file identity changed while the same local mutation was pending: ' + relPath,
+            );
+        }
+        const sameTarget = targetEntity===undefined || existingFileOperation?.targetEntity===undefined
+            ? targetEntity===existingFileOperation?.targetEntity
+            : this.remoteMoveEntityMatches(existingFileOperation.targetEntity, targetEntity);
+        const sameParent = parentEntity===undefined || existingFileOperation?.parentEntity===undefined
+            ? parentEntity===existingFileOperation?.parentEntity
+            : this.remoteFolderIdentityMatches(existingFileOperation.parentEntity, parentEntity);
         const unchanged = sameLocalIntent
-            && existing?.remoteKind===remoteKind
-            && existing?.remoteRevision===remoteRevision;
+            && existingFileOperation?.remoteKind===remoteKind
+            && existingFileOperation?.remoteRevision===remoteRevision
+            && sameTarget
+            && sameParent;
         if (unchanged) {
             this.locallyDivergedPaths.add(relPath);
             this.refreshDerivedSyncStatusWhenNotActive();
-            return;
+            return existingFileOperation!;
         }
         const now = new Date().toISOString();
-        this.syncManifest.pendingOperations[relPath] = {
-            version: 1,
-            id: sameLocalIntent && existing
-                ? existing.id
+        const record: SyncManifestPendingFileOperation = {
+            version: 2,
+            id: sameLocalIntent && existingFileOperation
+                ? existingFileOperation.id
                 : crypto.randomBytes(16).toString('hex'),
             kind,
             localKind,
             localRevision,
             remoteKind,
             remoteRevision,
-            createdAt: sameLocalIntent && existing
-                ? existing.createdAt
+            targetEntity: targetEntity===undefined ? undefined : {...targetEntity},
+            parentEntity: parentEntity===undefined ? undefined : {...parentEntity},
+            appliedEntity: sameLocalIntent && existingFileOperation?.appliedEntity!==undefined
+                ? {...existingFileOperation.appliedEntity}
+                : undefined,
+            createdAt: sameLocalIntent && existingFileOperation
+                ? existingFileOperation.createdAt
                 : now,
             updatedAt: now,
         };
+        this.syncManifest.pendingOperations[relPath] = record;
         this.locallyDivergedPaths.add(relPath);
         this.markSyncManifestDirty();
-        // This write is deliberately before a possible socket/HTTP mutation.
-        // If it cannot be persisted, fail closed rather than making the remote
-        // change impossible to recover after a process crash.
         await this.persistSyncManifest(false, generation);
         this.refreshDerivedSyncStatusWhenNotActive();
         getOutputChannel().appendLine(
-            `${new Date().toISOString()} [pending operation journaled] ${relPath} ` +
-            `kind=${kind} local=${localRevision.slice(0, 12)} ` +
-            `remote=${remoteKind ?? 'unobserved'}`,
+            new Date().toISOString() + ' [pending operation journaled] ' + relPath +
+            ' kind=' + kind + ' local=' + localRevision.slice(0, 12) +
+            ' remote=' + (remoteKind ?? 'unobserved') +
+            ' entity=' + (targetEntity?.id ?? 'unobserved'),
         );
+        return record;
     }
 
+
+    private pendingFileMutationGuard(
+        record: SyncManifestPendingFileOperation,
+    ): RemoteFileMutationGuard {
+        if (
+            record.version!==2
+            || !record.targetEntity
+            || !record.parentEntity
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'A pending local file mutation has no durable Overleaf entity identity.',
+            );
+        }
+        return {
+            targetEntity: {...record.targetEntity},
+            parentEntity: {...record.parentEntity},
+            pendingOperationId: record.id,
+            replacementEntity: record.appliedEntity===undefined
+                ? undefined
+                : {...record.appliedEntity},
+        };
+    }
+
+    private async markPendingFilePushAppliedEntity(
+        relPath: string,
+        record: SyncManifestPendingFileOperation,
+        appliedEntity: SyncManifestRemoteEntityIdentity,
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        const current = this.syncManifest?.pendingOperations[relPath];
+        if (
+            !current
+            || (current.kind!=='update' && current.kind!=='delete')
+            || current.id!==record.id
+            || current.kind!==record.kind
+            || current.localRevision!==record.localRevision
+            || !current.targetEntity
+            || !current.parentEntity
+            || !record.targetEntity
+            || !record.parentEntity
+            || !this.remoteMoveEntityMatches(current.targetEntity, record.targetEntity)
+            || !this.remoteFolderIdentityMatches(current.parentEntity, record.parentEntity)
+        ) {
+            throw new Error('Local Replica pending file mutation changed before its replacement identity was recorded.');
+        }
+        if (
+            current.appliedEntity!==undefined
+            && !this.remoteMoveEntityMatches(current.appliedEntity, appliedEntity)
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf returned a different replacement file identity for the same pending mutation.',
+            );
+        }
+        current.appliedEntity = {...appliedEntity};
+        current.updatedAt = new Date().toISOString();
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+    }
 
     // A local file create is a tree mutation with its own proof. Replacing the
     // provisional generic update journal is safe because no remote create has
@@ -14177,6 +14894,43 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         maybeWarnSyncFailure(relPath, error);
     }
 
+    private async pendingFilePushIdentityMatchesAuthoritativeState(
+        relPath: string,
+        record: SyncManifestPendingFileOperation,
+        remoteState: PathRevision,
+        generation = this.syncGeneration,
+    ): Promise<boolean> {
+        if (record.version!==2) {
+            return false;
+        }
+        if (remoteState.kind==='missing') {
+            // A delete that was already authoritatively missing has no entity to
+            // mutate. Otherwise the original ID must be absent too: a move or
+            // same-name replacement is not an acknowledgement of this delete.
+            return record.kind==='delete'
+                && (
+                    record.targetEntity===undefined
+                    || this.vfs._resolveById(record.targetEntity.id)===undefined
+                );
+        }
+        if (
+            remoteState.kind!=='file'
+            || !record.targetEntity
+            || !record.parentEntity
+        ) {
+            return false;
+        }
+        const identity = await this.resolveRemoteFilePathIdentity(
+            this.vfs.pathToUri(relPath),
+        );
+        this.requireSyncSession(generation);
+        return this.remoteFilePathIdentityMatches(
+            identity,
+            record.appliedEntity ?? record.targetEntity,
+            record.parentEntity,
+        );
+    }
+
     private async acknowledgePendingFilePushOperationFromAuthoritativeState(
         relPath: string,
         expected: Pick<SyncManifestPendingFileOperation, 'kind' | 'localRevision'>,
@@ -14197,14 +14951,22 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 this.captureRemotePathRevision(relPath, generation),
             ]);
             this.requireSyncSession(generation);
+            const identityMatches = await this.pendingFilePushIdentityMatchesAuthoritativeState(
+                relPath,
+                entry,
+                remoteState,
+                generation,
+            );
             const acknowledgedUpdate = expected.kind==='update'
                 && localState.kind==='file'
                 && remoteState.kind==='file'
                 && localState.revision===expected.localRevision
-                && remoteState.revision===expected.localRevision;
+                && remoteState.revision===expected.localRevision
+                && identityMatches;
             const acknowledgedDelete = expected.kind==='delete'
                 && localState.kind==='missing'
-                && remoteState.kind==='missing';
+                && remoteState.kind==='missing'
+                && identityMatches;
             if (!acknowledgedUpdate && !acknowledgedDelete) {
                 return false;
             }
@@ -15260,6 +16022,24 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 }
                 const remoteState = await this.captureRemotePathRevision(relPath, generation);
                 this.requireSyncSession(generation);
+                const identityMatches = await this.pendingFilePushIdentityMatchesAuthoritativeState(
+                    relPath,
+                    recorded,
+                    remoteState,
+                    generation,
+                );
+                if (!identityMatches) {
+                    await this.markSyncConflict(
+                        relPath,
+                        recorded.version===1
+                            ? 'A legacy pending local file mutation has no entity identity and cannot be replayed safely'
+                            : 'Overleaf file identity changed while a local file mutation was pending',
+                        localState.kind==='file' ? localState.content : null,
+                        generation,
+                        remoteState,
+                    );
+                    continue;
+                }
                 const statesMatch = (
                     localState.kind==='missing'
                     && remoteState.kind==='missing'
@@ -16738,6 +17518,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         generation = this.syncGeneration,
         remoteBaseline?: Uint8Array,
         expectedRemoteMissing = false,
+        expectedEntity?: ExpectedRemoteEntity,
     ): Promise<Uint8Array> {
         return this.withRetry('push', relPath, async () => {
             await this.vfs.ensureConnectedForWrite();
@@ -16749,6 +17530,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     content,
                     remoteBaseline,
                     expectedRemoteMissing,
+                    expectedEntity,
                 ),
             );
         }, {
@@ -17046,7 +17828,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         localUri: vscode.Uri,
         content: Uint8Array,
         generation: number,
-    ): Promise<void> {
+    ): Promise<boolean> {
         const stable = await this.recordSyncManifestEntry(
             relPath,
             vfsUri,
@@ -17055,7 +17837,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         );
         if (stable) {
             this.clearLocalStabilizeState(relPath);
-            return;
+            return true;
         }
         getOutputChannel().appendLine(
             `${new Date().toISOString()} [push intermediate] ${relPath}: ` +
@@ -17069,6 +17851,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             'local-advanced-during-push',
             generation,
         );
+        return false;
     }
 
     private retainRemotePullIntentAfterClassificationFailure(
@@ -17212,6 +17995,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         let authoritativePullCompleted = false;
         let resolveConflict = false;
         let acknowledgedPendingFilePush: Pick<SyncManifestPendingFileOperation, 'kind' | 'localRevision'> | undefined;
+        // A remote write may have succeeded while a local agent advanced
+        // the path. In that case the old pending ID proof must survive
+        // until the next stable snapshot is delivered.
+        let pushedManifestStable = true;
         let conflictResolutionProof: ConflictResolutionProof | undefined;
 
         try {
@@ -17295,6 +18082,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 let expectedRemoteDeleteRevision: string | undefined;
                 let localDeleteState: PathRevision | undefined;
                 let remoteDeleteState: PathRevision | undefined;
+                let pendingFileDelete: SyncManifestPendingFileOperation | undefined;
 
                 // Folder deletes carry a durable entity identity from the
                 // manifest, rather than falling through to the file-oriented
@@ -17640,7 +18428,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         );
                         if (localDeleteSnapshot.kind==='missing') {
                             await this.journalPendingFilePushOperation(
-                                relPath, 'delete', DELETE_DIGEST, undefined, generation,
+                                relPath, 'delete', DELETE_DIGEST, undefined, undefined, generation,
                             );
                         }
                     }
@@ -17653,9 +18441,64 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         return;
                     }
                     if (!directoryDelete) {
-                        await this.journalPendingFilePushOperation(
-                            relPath, 'delete', DELETE_DIGEST, remoteDeleteState, generation,
-                        );
+                        if (remoteDeleteState.kind==='file') {
+                            const remoteIdentity = await this.resolveStableRemoteFilePathIdentity(
+                                relPath,
+                                remoteDeleteState,
+                                generation,
+                            );
+                            this.requireSyncSession(generation);
+                            const acceptedEntity = this.syncManifest?.files[relPath]?.remoteEntity;
+                            if (
+                                !resolveConflict
+                                && (
+                                    !acceptedEntity
+                                    || !this.remoteMoveEntityMatches(
+                                        acceptedEntity,
+                                        remoteIdentity.entity,
+                                    )
+                                )
+                            ) {
+                                await this.markSyncConflict(
+                                    relPath,
+                                    'Overleaf file identity changed since the accepted local replica baseline',
+                                    null,
+                                    generation,
+                                    remoteDeleteState,
+                                );
+                                outcome = 'blocked';
+                                errorMessage = 'remote file identity changed';
+                                return;
+                            }
+                            pendingFileDelete = await this.journalPendingFilePushOperation(
+                                relPath,
+                                'delete',
+                                DELETE_DIGEST,
+                                remoteDeleteState,
+                                remoteIdentity,
+                                generation,
+                            );
+                        } else if (remoteDeleteState.kind==='missing') {
+                            pendingFileDelete = await this.journalPendingFilePushOperation(
+                                relPath,
+                                'delete',
+                                DELETE_DIGEST,
+                                remoteDeleteState,
+                                undefined,
+                                generation,
+                            );
+                        } else {
+                            await this.markSyncConflict(
+                                relPath,
+                                'Overleaf path changed type before the local file delete could be applied',
+                                null,
+                                generation,
+                                remoteDeleteState,
+                            );
+                            outcome = 'blocked';
+                            errorMessage = 'remote path type changed';
+                            return;
+                        }
                     }
                     if (remoteDeleteState.kind==='missing') {
                         targetAlreadyMissing = true;
@@ -17801,6 +18644,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     `Missing expected Overleaf revision for ${relPath}`,
                                 );
                             }
+                            const fileGuard = pendingFileDelete===undefined
+                                ? undefined
+                                : this.pendingFileMutationGuard(pendingFileDelete);
                             await this.atomicDeleteRemotePathIfRevision(
                                 relPath,
                                 expectedRemoteDeleteRevision,
@@ -17808,6 +18654,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 async () => (
                                     await this.captureLocalPathRevision(relPath, generation)
                                 ).kind==='missing',
+                                fileGuard,
                             );
                         }, {
                             delays: LocalReplicaSCMProvider.pushRetryDelays,
@@ -18188,7 +19035,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         }
                         if (action==='push') {
                             await this.journalPendingFilePushOperation(
-                                relPath, 'update', contentDigest(newContent), undefined, generation,
+                                relPath, 'update', contentDigest(newContent), undefined, undefined, generation,
                             );
                         }
                         let writeMergedContentBackToLocal = false;
@@ -18312,6 +19159,87 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                 this.requireSyncSession(generation);
                                 remoteBaselineForPush = remoteContent;
                                 if (bytesEqual(newContent, remoteContent)) {
+                                    // Equal bytes are not an acknowledgement when a collaborator
+                                    // replaced the remote entity at the same path. Prove the current
+                                    // entity before accepting this watcher echo; otherwise retain the
+                                    // pending local intent and surface the race as a conflict.
+                                    const exactRemoteState = await this.captureRemotePathRevision(
+                                        relPath,
+                                        generation,
+                                    );
+                                    this.requireSyncSession(generation);
+                                    if (
+                                        exactRemoteState.kind!=='file'
+                                        || exactRemoteState.revision!==contentDigest(remoteContent)
+                                    ) {
+                                        await this.markSyncConflict(
+                                            relPath,
+                                            'Overleaf advanced while an equal-content local push was being verified',
+                                            newContent,
+                                            generation,
+                                            exactRemoteState,
+                                        );
+                                        outcome = 'blocked';
+                                        errorMessage = 'remote advanced during equal-content verification';
+                                        return;
+                                    }
+                                    const exactRemoteIdentity = await this.resolveStableRemoteFilePathIdentity(
+                                        relPath,
+                                        exactRemoteState,
+                                        generation,
+                                    );
+                                    const pendingAccepted = this.syncManifest?.pendingOperations[relPath];
+                                    const pendingAcceptedFile = pendingAccepted
+                                        && (pendingAccepted.kind==='update' || pendingAccepted.kind==='delete')
+                                        ? pendingAccepted
+                                        : undefined;
+                                    const acceptedEntity = this.syncManifest?.files[relPath]?.remoteEntity
+                                        ?? pendingAcceptedFile?.appliedEntity
+                                        ?? pendingAcceptedFile?.targetEntity;
+                                    const acceptedParent = this.syncManifest?.files[relPath]?.remoteEntity
+                                        ? undefined
+                                        : pendingAcceptedFile?.parentEntity;
+                                    if (
+                                        !resolveConflict
+                                        && (
+                                            !acceptedEntity
+                                            || !this.remoteMoveEntityMatches(
+                                                acceptedEntity,
+                                                exactRemoteIdentity.entity,
+                                            )
+                                            || (
+                                                acceptedParent!==undefined
+                                                && !this.remoteFolderIdentityMatches(
+                                                    exactRemoteIdentity.parent,
+                                                    acceptedParent,
+                                                )
+                                            )
+                                        )
+                                    ) {
+                                        await this.markSyncConflict(
+                                            relPath,
+                                            'Overleaf replaced the file entity while an equal-content local push was pending',
+                                            newContent,
+                                            generation,
+                                            exactRemoteState,
+                                        );
+                                        outcome = 'blocked';
+                                        errorMessage = 'remote entity changed during equal-content verification';
+                                        return;
+                                    }
+                                    // Record the exact entity before taking the fast exit. If an
+                                    // agent advances the local file while recordPushManifestEntry
+                                    // captures its local snapshot, the manifest entry is deliberately
+                                    // withheld; this journal is then the durable entity proof the
+                                    // follow-up push needs. A stable readback removes it below.
+                                    await this.journalPendingFilePushOperation(
+                                        relPath,
+                                        'update',
+                                        contentDigest(newContent),
+                                        exactRemoteState,
+                                        exactRemoteIdentity,
+                                        generation,
+                                    );
                                     // A watcher push can beat the save-triggered compile barrier.
                                     // Treat an exact remote readback as proof of delivery instead of
                                     // issuing a redundant OT update with a potentially stale version.
@@ -18320,19 +19248,21 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     this.seenLocalEntities.add(relPath);
                                     this.clearRemoteDelete(relPath);
                                     this.locallyDivergedPaths.delete(relPath);
-                                    await this.recordPushManifestEntry(
+                                    const verifiedManifestStable = await this.recordPushManifestEntry(
                                         relPath,
                                         toUri,
                                         fromUri,
                                         newContent,
                                         generation,
                                     );
-                                    await this.removePendingFilePushOperation(
-                                        relPath,
-                                        'current local state already matches authoritative Overleaf',
-                                        generation,
-                                        {kind: 'update', localRevision: contentDigest(newContent)},
-                                    );
+                                    if (verifiedManifestStable) {
+                                        await this.removePendingFilePushOperation(
+                                            relPath,
+                                            'current local state already matches authoritative Overleaf',
+                                            generation,
+                                            {kind: 'update', localRevision: contentDigest(newContent)},
+                                        );
+                                    }
                                     await this.persistSyncManifest(false, generation);
                                     this.requireSyncSession(generation);
                                     getOutputChannel().appendLine(
@@ -18365,18 +19295,20 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     this.baseCache[relPath] = remoteContent;
                                     this.seenLocalEntities.add(relPath);
                                     this.locallyDivergedPaths.delete(relPath);
-                                    await this.recordPushManifestEntry(
+                                    const convertedManifestStable = await this.recordPushManifestEntry(
                                         relPath,
                                         toUri,
                                         fromUri,
                                         remoteContent,
                                         generation,
                                     );
-                                    await this.removePendingFilePushOperation(
-                                        relPath,
-                                        'local intent was superseded by an authoritative Overleaf update',
-                                        generation,
-                                    );
+                                    if (convertedManifestStable) {
+                                        await this.removePendingFilePushOperation(
+                                            relPath,
+                                            'local intent was superseded by an authoritative Overleaf update',
+                                            generation,
+                                        );
+                                    }
                                     await this.persistSyncManifest(false, generation);
                                     getOutputChannel().appendLine(
                                         `${new Date().toISOString()} [push converted-to-pull] ${relPath}: remote changed, local remained at baseline`,
@@ -18542,12 +19474,37 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     // capture above before pushing the merge.
                                     this.requireSyncSession(generation);
                                     try {
+                                        const mergedRemoteState = await this.captureRemotePathRevision(
+                                            relPath,
+                                            generation,
+                                        );
+                                        if (
+                                            mergedRemoteState.kind!=='file'
+                                            || mergedRemoteState.revision!==contentDigest(newContent)
+                                        ) {
+                                            throw new RemoteDocumentMergeConflictError(
+                                                'Overleaf changed before the merged local update could be applied: ' +
+                                                relPath,
+                                            );
+                                        }
+                                        const mergedRemoteIdentity =
+                                            await this.resolveStableRemoteFilePathIdentity(
+                                                relPath,
+                                                mergedRemoteState,
+                                                generation,
+                                            );
                                         mergedContent = await this.pushWithRetry(
                                             relPath,
                                             fromUri,
                                             mergedContent,
                                             generation,
                                             newContent,
+                                            false,
+                                            {
+                                                id: mergedRemoteIdentity.entity.id,
+                                                type: mergedRemoteIdentity.entity.type,
+                                                parentId: mergedRemoteIdentity.parent.id,
+                                            },
                                         );
                                     } catch (error) {
                                         if (
@@ -18630,6 +19587,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             this.requireSyncSession(generation);
                             const pendingPushRevision = contentDigest(newContent);
                             let pendingCreate: SyncManifestPendingFileCreateOperation | undefined;
+                            let pendingFilePush: SyncManifestPendingFileOperation | undefined;
                             if (expectedRemoteMissingForPush) {
                                 const parentEntity = await this.ensureGuardedRemoteParentForLocalFileCreate(
                                     relPath,
@@ -18647,11 +19605,57 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                     relPath,
                                     generation,
                                 );
-                                await this.journalPendingFilePushOperation(
+                                if (pendingRemoteState.kind!=='file') {
+                                    throw new RemoteDocumentMergeConflictError(
+                                        'Overleaf path changed before the local file update could be guarded: ' +
+                                        relPath,
+                                    );
+                                }
+                                const remoteIdentity = await this.resolveStableRemoteFilePathIdentity(
+                                    relPath,
+                                    pendingRemoteState,
+                                    generation,
+                                );
+                                this.requireSyncSession(generation);
+                                const pendingAccepted = this.syncManifest?.pendingOperations[relPath];
+                                const pendingAcceptedFile = pendingAccepted
+                                    && (pendingAccepted.kind==='update' || pendingAccepted.kind==='delete')
+                                    ? pendingAccepted
+                                    : undefined;
+                                const acceptedEntity = this.syncManifest?.files[relPath]?.remoteEntity
+                                    ?? pendingAcceptedFile?.appliedEntity
+                                    ?? pendingAcceptedFile?.targetEntity;
+                                const acceptedParent = this.syncManifest?.files[relPath]?.remoteEntity
+                                    ? undefined
+                                    : pendingAcceptedFile?.parentEntity;
+                                if (
+                                    !resolveConflict
+                                    && (
+                                        !acceptedEntity
+                                        || !this.remoteMoveEntityMatches(
+                                            acceptedEntity,
+                                            remoteIdentity.entity,
+                                        )
+                                        || (
+                                            acceptedParent!==undefined
+                                            && !this.remoteFolderIdentityMatches(
+                                                remoteIdentity.parent,
+                                                acceptedParent,
+                                            )
+                                        )
+                                    )
+                                ) {
+                                    throw new RemoteDocumentMergeConflictError(
+                                        'Overleaf file identity changed since the accepted local replica baseline: ' +
+                                        relPath,
+                                    );
+                                }
+                                pendingFilePush = await this.journalPendingFilePushOperation(
                                     relPath,
                                     'update',
                                     pendingPushRevision,
                                     pendingRemoteState,
+                                    remoteIdentity,
                                     generation,
                                 );
                             }
@@ -18715,6 +19719,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                             toUri,
                                             newContent,
                                             remoteBaselineForPush,
+                                            this.pendingFileMutationGuard(pendingFilePush!),
                                             generation,
                                         )
                                         : await this.pushWithRetry(
@@ -18724,6 +19729,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                                             generation,
                                             remoteBaselineForPush,
                                             false,
+                                            this.expectedRemoteEntityForFileMutation(
+                                                this.pendingFileMutationGuard(pendingFilePush!),
+                                            ),
                                         );
                                     if (!bytesEqual(pushedContent, newContent)) {
                                         newContent = pushedContent;
@@ -18807,7 +19815,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         this.clearRemoteDelete(relPath);
                         this.locallyDivergedPaths.delete(relPath);
                         if (action==='push') {
-                            await this.recordPushManifestEntry(
+                            pushedManifestStable = await this.recordPushManifestEntry(
                                 relPath,
                                 toUri,
                                 fromUri,
@@ -18906,6 +19914,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             action==='push'
             && outcome==='success'
             && acknowledgedPendingFilePush!==undefined
+            && pushedManifestStable
             && this.isSyncSessionActive(generation)
         ) {
             try {

@@ -38,6 +38,12 @@ interface PersistRecord {
     settings: JSON;
 }
 
+interface FakeRemoteEntityState {
+    entityIds: Map<string, string>;
+    entityTypes: Map<string, 'doc' | 'file' | 'folder'>;
+    nextEntityId: number;
+}
+
 class FakeVirtualFileSystem {
     public readonly origin: vscode.Uri;
     public readonly projectName = 'Select Folder Test';
@@ -47,8 +53,12 @@ class FakeVirtualFileSystem {
     public connectionState: VFSConnectionState = 'connected';
     private readonly connectionEmitter = new vscode.EventEmitter<VFSConnectionState>();
     public readonly onDidChangeConnection = this.connectionEmitter.event;
+    private static readonly remoteEntityStates = new Map<string, FakeRemoteEntityState>();
     private readonly persists = new Map<string, PersistRecord>();
-    private readonly entityIds = new Map<string, string>();
+    private readonly entityState: FakeRemoteEntityState;
+    private get entityIds() { return this.entityState.entityIds; }
+    private get entityTypes() { return this.entityState.entityTypes; }
+
     setConnectionState(state: VFSConnectionState) {
         this.connectionState = state;
         this.connectionEmitter.fire(state);
@@ -58,7 +68,38 @@ class FakeVirtualFileSystem {
         private readonly remoteRoot: vscode.Uri,
         origin: vscode.Uri = remoteRoot,
     ) {
+        const stateKey = remoteRoot.toString();
+        let entityState = FakeVirtualFileSystem.remoteEntityStates.get(stateKey);
+        if (!entityState) {
+            entityState = {
+                entityIds: new Map(),
+                entityTypes: new Map(),
+                nextEntityId: 1,
+            };
+            FakeVirtualFileSystem.remoteEntityStates.set(stateKey, entityState);
+        }
+        this.entityState = entityState;
         this.origin = origin;
+    }
+
+    private getOrCreateEntityId(relPath: string): string {
+        // The project root is the VFS's stable parent sentinel. It is not a
+        // remotely replaceable entity, so preserve the established '/' contract
+        // while path entities retain independent IDs across test reactivation.
+        if (relPath==='/') {
+            // Default to the VFS project-root sentinel, but retain an explicit
+            // test replacement so guarded parent-ID races remain observable.
+            const existingRoot = this.entityIds.get(relPath);
+            if (existingRoot!==undefined) { return existingRoot; }
+            this.entityIds.set(relPath, '/');
+            this.entityTypes.set(relPath, 'folder');
+            return '/';
+        }
+        const existing = this.entityIds.get(relPath);
+        if (existing!==undefined) { return existing; }
+        const entityId = 'fake-entity-' + this.entityState.nextEntityId++;
+        this.entityIds.set(relPath, entityId);
+        return entityId;
     }
 
     pathToUri(...parts: string[]) {
@@ -86,16 +127,17 @@ class FakeVirtualFileSystem {
         } catch {
             isDirectory = false;
         }
-        const fileType = isDirectory
+        const detectedFileType: 'doc' | 'file' | 'folder' = isDirectory
             ? 'folder'
             : /\.tex$/i.test(fileName) ? 'doc' : 'file';
         const parentRelPath = relPath==='/' ? '/' : path.posix.dirname(relPath);
+        let fileType = detectedFileType;
         if (exists) {
-            this.entityIds.set(relPath, this.entityIds.get(relPath) ?? relPath);
-            this.entityIds.set(
-                parentRelPath,
-                this.entityIds.get(parentRelPath) ?? parentRelPath,
-            );
+            fileType = this.entityTypes.get(relPath) ?? detectedFileType;
+            this.getOrCreateEntityId(relPath);
+            this.getOrCreateEntityId(parentRelPath);
+            this.entityTypes.set(relPath, fileType);
+            this.entityTypes.set(parentRelPath, 'folder');
         }
         return {
             parentFolder: {
@@ -119,7 +161,10 @@ class FakeVirtualFileSystem {
         for (const [relPath, id] of this.entityIds) {
             if (id!==entityId) { continue; }
             const fileName = path.posix.basename(relPath);
-            const isFolder = relPath==='/' || !path.extname(fileName);
+            const fileType = this.entityTypes.get(relPath)
+                ?? (relPath==='/' || !path.extname(fileName)
+                    ? 'folder'
+                    : (/\.tex$/i.test(fileName) ? 'doc' : 'file'));
             return {
                 parentFolder: {
                     _id: this.entityIds.get(path.posix.dirname(relPath))
@@ -130,11 +175,11 @@ class FakeVirtualFileSystem {
                 fileEntity: {
                     _id: id,
                     name: fileName,
-                    _type: isFolder ? 'folder' : (/\.tex$/i.test(fileName) ? 'doc' : 'file'),
+                    _type: fileType,
                     linkedFileData: null,
                     created: new Date(0).toISOString(),
                 },
-                fileType: isFolder ? 'folder' : (/\.tex$/i.test(fileName) ? 'doc' : 'file'),
+                fileType,
                 path: relPath,
             };
         }
@@ -150,9 +195,8 @@ class FakeVirtualFileSystem {
         const oldKey = this.relativeKey(oldUri);
         let actualType: 'doc' | 'file' | 'folder';
         try {
-            actualType = (await vscode.workspace.fs.stat(oldUri)).type===vscode.FileType.Directory
-                ? 'folder'
-                : (/\.tex$/i.test(path.basename(oldUri.fsPath)) ? 'doc' : 'file');
+            await vscode.workspace.fs.stat(oldUri);
+            actualType = (await this._resolveUri(oldUri)).fileType;
         } catch {
             throw vscode.FileSystemError.FileNotFound(oldUri);
         }
@@ -176,12 +220,19 @@ class FakeVirtualFileSystem {
         const newKey = this.relativeKey(newUri);
         const movedIds = [...this.entityIds.entries()]
             .filter(([key]) => key===oldKey || key.startsWith(oldKey+'/'));
+        const movedTypes = [...this.entityTypes.entries()]
+            .filter(([key]) => key===oldKey || key.startsWith(oldKey+'/'));
         for (const [key, id] of movedIds) {
             this.entityIds.delete(key);
             this.entityIds.set(newKey + key.slice(oldKey.length), id);
         }
+        for (const [key, type] of movedTypes) {
+            this.entityTypes.delete(key);
+            this.entityTypes.set(newKey + key.slice(oldKey.length), type);
+        }
         if (movedIds.length===0) {
-            this.entityIds.set(newKey, oldKey);
+            this.getOrCreateEntityId(newKey);
+            this.entityTypes.set(newKey, actualType);
         }
     }
 
@@ -212,6 +263,7 @@ class FakeVirtualFileSystem {
         for (const pathKey of [...this.entityIds.keys()]) {
             if (pathKey===key || pathKey.startsWith(key+'/')) {
                 this.entityIds.delete(pathKey);
+                this.entityTypes.delete(pathKey);
             }
         }
     }
@@ -1320,13 +1372,13 @@ suite('Select Project Folder Local Replica', function () {
         const changedBytes = Buffer.from([9, 8, 7, 6]);
         await writeBytes(localImage, changedBytes);
 
-        const originalPushWithRetry = (scm as any).pushWithRetry.bind(scm);
+        const originalCreateFileWithRetry = (scm as any).createFileWithRetry.bind(scm);
         let failUpload = true;
-        (scm as any).pushWithRetry = async (...args: unknown[]) => {
+        (scm as any).createFileWithRetry = async (...args: unknown[]) => {
             if (failUpload) {
                 throw new Error('simulated media upload failure');
             }
-            return originalPushWithRetry(...args);
+            return originalCreateFileWithRetry(...args);
         };
 
         try {
@@ -1351,7 +1403,7 @@ suite('Select Project Folder Local Replica', function () {
             assert.strictEqual(retried.outcome, 'success');
             assert.deepStrictEqual(await readBytes(remoteImage), changedBytes);
         } finally {
-            (scm as any).pushWithRetry = originalPushWithRetry;
+            (scm as any).createFileWithRetry = originalCreateFileWithRetry;
         }
     });
 
@@ -2385,8 +2437,19 @@ suite('Select Project Folder Local Replica', function () {
 
             const manifest = (scm as any).syncManifest as {
                 files: Record<string, unknown>;
+                pendingOperations: Record<string, {
+                    kind: string;
+                    localRevision: string;
+                    targetEntity?: unknown;
+                    parentEntity?: unknown;
+                }>;
             };
             assert.strictEqual(manifest.files['/main.tex'], undefined);
+            const retained = manifest.pendingOperations['/main.tex'];
+            assert.strictEqual(retained.kind, 'update');
+            assert.strictEqual(retained.localRevision, sha1('first saved edit'));
+            assert.ok(retained.targetEntity);
+            assert.ok(retained.parentEntity);
             assert.strictEqual(await readText(remoteMain), 'first saved edit');
 
             (scm as any).pushWithRetry = originalPushWithRetry;
@@ -4157,6 +4220,200 @@ suite('Select Project Folder Local Replica', function () {
         assert.deepStrictEqual((scm as any).syncManifest.pendingOperations, {});
     });
 
+    test('sends the exact file and parent identities for a normal guarded local delete', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-file-delete-guard-positive-remote-');
+        const localRoot = await tempDir('sr-overleaf-file-delete-guard-positive-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteFile = vscode.Uri.joinPath(remoteRoot, 'obsolete.pdf');
+        const localFile = vscode.Uri.joinPath(localRoot, 'obsolete.pdf');
+        await writeBytes(remoteFile, Buffer.from('%PDF-1.7 guarded delete\\n', 'utf-8'));
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('', 'file-delete-positive-parent');
+        fakeVfs.setEntityId('obsolete.pdf', 'file-delete-positive-target');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.delete(localFile);
+
+        const renameExpectedEntities: unknown[] = [];
+        const removeExpectedEntities: unknown[] = [];
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        const originalRemove = fakeVfs.remove.bind(fakeVfs);
+        (fakeVfs as any).rename = async (...args: any[]) => {
+            renameExpectedEntities.push(args[3]);
+            return (originalRename as any)(...args);
+        };
+        (fakeVfs as any).remove = async (...args: any[]) => {
+            removeExpectedEntities.push(args[2]);
+            return (originalRemove as any)(...args);
+        };
+
+        const event = await (scm as any).applySync(
+            'push', 'delete', '/obsolete.pdf', localFile, remoteFile,
+        ) as Events['scmSyncCompleteEvent'];
+
+        const expectedEntity = {
+            id: 'file-delete-positive-target',
+            type: 'file',
+            parentId: 'file-delete-positive-parent',
+        };
+        assert.strictEqual(event.outcome, 'success');
+        assert.deepStrictEqual(renameExpectedEntities, [expectedEntity]);
+        assert.deepStrictEqual(removeExpectedEntities, [expectedEntity]);
+        assert.strictEqual(await pathExists(remoteFile), false);
+        assert.deepStrictEqual((scm as any).syncManifest.pendingOperations, {});
+    });
+
+    test('blocks a local file delete when a same-byte collaborator entity replaces it at the guarded stage', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-file-delete-entity-race-remote-');
+        const localRoot = await tempDir('sr-overleaf-file-delete-entity-race-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteFile = vscode.Uri.joinPath(remoteRoot, 'obsolete.pdf');
+        const localFile = vscode.Uri.joinPath(localRoot, 'obsolete.pdf');
+        const baseline = Buffer.from('%PDF-1.7 same bytes\\n', 'utf-8');
+        await writeBytes(remoteFile, baseline);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('', 'file-delete-parent-original');
+        fakeVfs.setEntityId('obsolete.pdf', 'file-delete-original');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.delete(localFile);
+
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let replacementInjected = false;
+        let guardedRenameObserved = false;
+        (fakeVfs as any).rename = async (...args: any[]) => {
+            const [targetUri, _stagingUri, _force, expectedEntity] = args;
+            if (
+                !replacementInjected
+                && targetUri.toString()===remoteFile.toString()
+                && expectedEntity?.id==='file-delete-original'
+            ) {
+                guardedRenameObserved = true;
+                replacementInjected = true;
+                await vscode.workspace.fs.delete(remoteFile);
+                await writeBytes(remoteFile, baseline);
+                fakeVfs.setEntityId('obsolete.pdf', 'file-delete-collaborator');
+            }
+            return (originalRename as any)(...args);
+        };
+
+        const event = await (scm as any).applySync(
+            'push', 'delete', '/obsolete.pdf', localFile, remoteFile,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(guardedRenameObserved, true);
+        assert.strictEqual(replacementInjected, true);
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.strictEqual(await pathExists(remoteFile), true);
+        assert.deepStrictEqual(await readBytes(remoteFile), baseline);
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(remoteFile)).fileEntity._id,
+            'file-delete-collaborator',
+        );
+        assert.strictEqual((scm as any).syncConflicts.has('/obsolete.pdf'), true);
+        const pending = (scm as any).syncManifest.pendingOperations['/obsolete.pdf'];
+        assert.strictEqual(pending.kind, 'delete');
+        assert.deepStrictEqual(pending.targetEntity, {id: 'file-delete-original', type: 'file'});
+        assert.deepStrictEqual(pending.parentEntity, {id: 'file-delete-parent-original', type: 'folder'});
+    });
+
+    test('keeps both entities when guarded delete recovery finds a same-byte collaborator target', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-file-delete-recovery-entity-race-remote-');
+        const localRoot = await tempDir('sr-overleaf-file-delete-recovery-entity-race-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        const baseline = 'same bytes across recovery\\n';
+        await writeText(remoteMain, baseline);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('', 'file-delete-recovery-parent');
+        fakeVfs.setEntityId('main.tex', 'file-delete-recovery-original');
+        const firstScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const firstInternals = firstScm as any;
+        const originalSyncToVFS = firstInternals.syncToVFS;
+        firstInternals.syncToVFS = () => Promise.resolve();
+        await vscode.workspace.fs.delete(localMain);
+        const generation = firstInternals.syncGeneration as number;
+        const expected = await firstInternals.captureRemotePathRevision('/main.tex', generation);
+        const identity = await firstInternals.resolveRemoteFilePathIdentity(remoteMain);
+        assert.ok(identity);
+        const pending = await firstInternals.journalPendingFilePushOperation(
+            '/main.tex',
+            'delete',
+            '\0',
+            expected,
+            identity,
+            generation,
+        );
+        const operationId = firstInternals.remoteDeleteOperationId(
+            '/main.tex',
+            expected.revision,
+            'file-delete-recovery-original',
+        );
+        const stagingRelPath = firstInternals.remoteDeleteStagingPath(
+            '/main.tex',
+            expected.revision,
+            'file-delete-recovery-original',
+        );
+        const stagingUri = fakeVfs.pathToUri(stagingRelPath);
+        await firstInternals.createRemoteDeleteOperationRecord({
+            version: 2,
+            id: operationId,
+            relPath: '/main.tex',
+            stagingRelPath,
+            expectedRevision: expected.revision,
+            fileGuard: {
+                targetEntity: {id: 'file-delete-recovery-original', type: 'doc'},
+                parentEntity: {id: 'file-delete-recovery-parent', type: 'folder'},
+                pendingOperationId: pending.id,
+            },
+            createdAt: new Date().toISOString(),
+        });
+        await fakeVfs.rename(remoteMain, stagingUri, false, {
+            id: 'file-delete-recovery-original',
+            type: 'doc',
+            parentId: 'file-delete-recovery-parent',
+        });
+        await writeText(remoteMain, baseline);
+        fakeVfs.setEntityId('main.tex', 'file-delete-recovery-collaborator');
+        firstInternals.syncToVFS = originalSyncToVFS;
+        firstScm.deactivate();
+
+        const restartedScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+
+        assert.strictEqual((restartedScm as any).syncConflicts.has('/main.tex'), true);
+        assert.strictEqual(await readText(remoteMain), baseline);
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(remoteMain)).fileEntity._id,
+            'file-delete-recovery-collaborator',
+        );
+        assert.strictEqual(await readText(stagingUri), baseline);
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(stagingUri)).fileEntity._id,
+            'file-delete-recovery-original',
+        );
+        const restartedPending = (restartedScm as any).syncManifest.pendingOperations['/main.tex'];
+        assert.strictEqual(restartedPending.kind, 'delete');
+        assert.deepStrictEqual(restartedPending.targetEntity, {
+            id: 'file-delete-recovery-original',
+            type: 'doc',
+        });
+        const journalRoot = vscode.Uri.joinPath(
+            localRoot, REPLICA_SETTINGS_DIR, 'remote-delete-operations',
+        );
+        const journalEntries = await vscode.workspace.fs.readDirectory(journalRoot);
+        assert.strictEqual(journalEntries.filter(([name]) => name.endsWith('.json')).length, 1);
+    });
+
     test('replays a locally moved file after its initial Overleaf proof is unavailable', async () => {
         const remoteRoot = await tempDir('sr-overleaf-local-move-offline-proof-remote-');
         const localRoot = await tempDir('sr-overleaf-local-move-offline-proof-local-');
@@ -4402,7 +4659,7 @@ suite('Select Project Folder Local Replica', function () {
         );
         const interruptedManifest = JSON.parse(await readText(manifestUri));
         const pending = interruptedManifest.pendingOperations['/main.tex'];
-        assert.strictEqual(interruptedManifest.version, 12);
+        assert.strictEqual(interruptedManifest.version, 13);
         assert.strictEqual(pending.kind, 'update');
         assert.strictEqual(pending.localKind, 'file');
         assert.strictEqual(pending.localRevision, sha1('offline local update'));
@@ -4524,7 +4781,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), false);
     });
 
-    test('migrates a version 2 manifest to the version 12 resolution schema', async () => {
+    test('migrates a version 2 manifest to the version 13 resolution schema', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-v3-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-v3-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -4546,7 +4803,7 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 12);
+        assert.strictEqual(migratedManifest.version, 13);
         assert.deepStrictEqual(migratedManifest.pendingOperations, {});
     });
 
@@ -4573,13 +4830,13 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 12);
+        assert.strictEqual(migratedManifest.version, 13);
         assert.deepStrictEqual(migratedManifest.folderConflictResolutions, {});
         assert.deepStrictEqual(migratedManifest.folderConflictResolutionHistory, []);
         assert.ok(migratedManifest.files['/main.tex']);
     });
 
-    test('records remote entity and stable local inode identities in manifest v12', async () => {
+    test('records remote entity and stable local inode identities in manifest v13', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-identity-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-identity-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -4598,7 +4855,7 @@ suite('Select Project Folder Local Replica', function () {
             REPLICA_SETTINGS_DIR,
             'sync-manifest.json',
         )));
-        assert.strictEqual(manifest.version, 12);
+        assert.strictEqual(manifest.version, 13);
         assert.deepStrictEqual(manifest.files['/main.tex'].remoteEntity, {id: 'doc-main', type: 'doc'});
         assert.deepStrictEqual(manifest.files['/figure.png'].remoteEntity, {id: 'file-figure', type: 'file'});
         for (const entry of [
@@ -4793,6 +5050,58 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(pulled.outcome, 'success');
         assert.strictEqual(internals.syncManifest.pendingOperations['/main.tex'], undefined);
         assert.strictEqual(scm.status.status, 'idle');
+    });
+
+    test('does not acknowledge a same-byte pending update after its Overleaf entity is replaced', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-pending-update-entity-race-remote-');
+        const localRoot = await tempDir('sr-overleaf-pending-update-entity-race-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        const acceptedBytes = 'same bytes but unacknowledged\\n';
+        await writeText(remoteMain, 'baseline\\n');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('', 'pending-update-parent-original');
+        fakeVfs.setEntityId('main.tex', 'pending-update-original');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const internals = scm as any;
+        const generation = internals.syncGeneration as number;
+        await writeText(localMain, acceptedBytes);
+        const remoteBeforeAcknowledgement = await internals.captureRemotePathRevision(
+            '/main.tex',
+            generation,
+        );
+        const remoteIdentityBeforeAcknowledgement = await internals.resolveRemoteFilePathIdentity(
+            remoteMain,
+        );
+        assert.ok(remoteIdentityBeforeAcknowledgement);
+        await internals.journalPendingFilePushOperation(
+            '/main.tex',
+            'update',
+            sha1(acceptedBytes),
+            remoteBeforeAcknowledgement,
+            remoteIdentityBeforeAcknowledgement,
+            generation,
+        );
+        await writeText(remoteMain, acceptedBytes);
+        fakeVfs.setEntityId('main.tex', 'pending-update-collaborator');
+
+        await internals.reconcilePendingFilePushOperations(generation);
+
+        assert.strictEqual(await readText(localMain), acceptedBytes);
+        assert.strictEqual(await readText(remoteMain), acceptedBytes);
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(remoteMain)).fileEntity._id,
+            'pending-update-collaborator',
+        );
+        const pending = internals.syncManifest.pendingOperations['/main.tex'];
+        assert.strictEqual(pending.kind, 'update');
+        assert.deepStrictEqual(pending.targetEntity, {id: 'pending-update-original', type: 'doc'});
+        assert.deepStrictEqual(pending.parentEntity, {id: 'pending-update-parent-original', type: 'folder'});
+        assert.strictEqual(internals.syncConflicts.has('/main.tex'), true);
     });
 
     test('quarantines one-sided legacy replica files, media, and folders without a manifest', async () => {
@@ -5067,8 +5376,9 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(event.outcome, 'success');
         assert.strictEqual(await readText(remoteFile), 'guarded local create');
         assert.strictEqual((scm as any).syncManifest.pendingOperations['/draft.tex'], undefined);
+        const createdRemote = await fakeVfs._resolveUri(remoteFile);
         assert.deepStrictEqual((scm as any).syncManifest.files['/draft.tex'].remoteEntity, {
-            id: '/draft.tex', type: 'doc',
+            id: createdRemote.fileEntity._id, type: 'doc',
         });
     });
 
@@ -5101,8 +5411,9 @@ suite('Select Project Folder Local Replica', function () {
                 && scm.status.status==='idle'
             ));
             assert.strictEqual(await readText(remoteFile), 'queued file create');
+            const createdRemote = await fakeVfs._resolveUri(remoteFile);
             assert.deepStrictEqual(internals.syncManifest.files['/offline.tex'].remoteEntity, {
-                id: '/offline.tex', type: 'doc',
+                id: createdRemote.fileEntity._id, type: 'doc',
             });
         } finally {
             triggers.forEach(trigger => trigger.dispose());
@@ -5291,7 +5602,11 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(await pathExists(remoteFolder), true);
         assert.strictEqual((scm as any).syncManifest.pendingOperations['/figures'], undefined);
         const directoryEntry = (scm as any).syncManifest.directories['/figures'];
-        assert.deepStrictEqual(directoryEntry.remoteEntity, {id: '/figures', type: 'folder'});
+        const createdRemote = await fakeVfs._resolveUri(remoteFolder);
+        assert.deepStrictEqual(directoryEntry.remoteEntity, {
+            id: createdRemote.fileEntity._id,
+            type: 'folder',
+        });
         assert.deepStrictEqual(directoryEntry.parentEntity, {id: '/', type: 'folder'});
         assert.match(directoryEntry.localIdentity.dev, /^\d+$/);
         assert.match(directoryEntry.localIdentity.ino, /^[1-9]\d*$/);
@@ -5327,8 +5642,9 @@ suite('Select Project Folder Local Replica', function () {
                 && scm.status.status==='idle'
             ));
             assert.strictEqual(await pathExists(remoteFolder), true);
+            const createdRemote = await fakeVfs._resolveUri(remoteFolder);
             assert.deepStrictEqual(internals.syncManifest.directories['/generated'].remoteEntity, {
-                id: '/generated',
+                id: createdRemote.fileEntity._id,
                 type: 'folder',
             });
         } finally {
@@ -5356,10 +5672,11 @@ suite('Select Project Folder Local Replica', function () {
             {id: '/', type: 'folder'},
         );
         await vscode.workspace.fs.createDirectory(remoteFolder);
+        const createdRemote = await fakeVfs._resolveUri(remoteFolder);
         await internals.markPendingLocalDirectoryCreateEntity(
             '/appendix',
             pending,
-            {id: '/appendix', type: 'folder'},
+            {id: createdRemote.fileEntity._id, type: 'folder'},
         );
         await scm.deactivate();
 
@@ -5370,7 +5687,7 @@ suite('Select Project Folder Local Replica', function () {
         );
         assert.strictEqual((restarted as any).syncManifest.pendingOperations['/appendix'], undefined);
         assert.deepStrictEqual((restarted as any).syncManifest.directories['/appendix'].remoteEntity, {
-            id: '/appendix',
+            id: createdRemote.fileEntity._id,
             type: 'folder',
         });
         assert.deepStrictEqual((restarted as any).syncManifest.directories['/appendix'].parentEntity, {
@@ -7849,14 +8166,14 @@ suite('Select Project Folder Local Replica', function () {
 
         await writeBytes(localImage, Buffer.from([10, 11, 12]));
         const collaboratorRace = Buffer.from([13, 14, 15]);
-        const originalPushWithRetry = (scm as any).pushWithRetry.bind(scm);
+        const originalCreateFileWithRetry = (scm as any).createFileWithRetry.bind(scm);
         let injected = false;
-        (scm as any).pushWithRetry = async (...args: unknown[]) => {
+        (scm as any).createFileWithRetry = async (...args: unknown[]) => {
             if (!injected) {
                 injected = true;
                 await writeBytes(remoteImage, collaboratorRace);
             }
-            return originalPushWithRetry(...args);
+            return originalCreateFileWithRetry(...args);
         };
 
         const blockedPush = await (scm as any).applySync(
@@ -9769,7 +10086,7 @@ suite('Select Project Folder Local Replica', function () {
         };
         fakeVfs.setProjectSCMPersist(scm.scmKey, persist);
 
-        const originalPushWithRetry = (scm as any).pushWithRetry.bind(scm);
+        const originalCreateFileWithRetry = (scm as any).createFileWithRetry.bind(scm);
         let releaseUpload!: () => void;
         const uploadGate = new Promise<void>(resolve => {
             releaseUpload = resolve;
@@ -9778,10 +10095,10 @@ suite('Select Project Folder Local Replica', function () {
         const uploadStarted = new Promise<void>(resolve => {
             signalUploadStarted = resolve;
         });
-        (scm as any).pushWithRetry = async (...args: unknown[]) => {
+        (scm as any).createFileWithRetry = async (...args: unknown[]) => {
             signalUploadStarted();
             await uploadGate;
-            return originalPushWithRetry(...args);
+            return originalCreateFileWithRetry(...args);
         };
 
         const collection = Object.create(
@@ -12532,7 +12849,7 @@ suite('Select Project Folder Local Replica', function () {
         );
     });
 
-    test('resumes a journaled remote delete after Local Replica reactivation', async () => {
+    test('preserves an identity-less legacy delete stage as a durable conflict after reactivation', async () => {
         const remoteRoot = await tempDir('sr-overleaf-remote-delete-crash-remote-');
         const localRoot = await tempDir('sr-overleaf-remote-delete-crash-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -12575,18 +12892,19 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(await pathExists(remoteMain), false);
         assert.strictEqual(
             await pathExists((restartedScm as any).vfs.pathToUri(stagingRelPath)),
-            false,
+            true,
         );
+        assert.strictEqual((restartedScm as any).syncConflicts.has('/main.tex'), true);
         const journalRoot = vscode.Uri.joinPath(
             localRoot,
             REPLICA_SETTINGS_DIR,
             'remote-delete-operations',
         );
         const journalEntries = await vscode.workspace.fs.readDirectory(journalRoot);
-        assert.deepStrictEqual(journalEntries.filter(([name]) => name.endsWith('.json')), []);
+        assert.strictEqual(journalEntries.filter(([name]) => name.endsWith('.json')).length, 1);
     });
 
-    test('restores a staged binary replacement before restart reconciliation', async () => {
+    test('rolls back a legacy staged binary without accepting its local replacement', async () => {
         const remoteRoot = await tempDir('sr-overleaf-binary-replace-crash-remote-');
         const localRoot = await tempDir('sr-overleaf-binary-replace-crash-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -12632,26 +12950,18 @@ suite('Select Project Folder Local Replica', function () {
         firstScm.deactivate();
 
         const restartedScm = createSCM(remoteRoot, localRoot);
-        const originalOverwrite = (restartedScm as any).overwrite.bind(restartedScm);
-        let remoteBeforeReconciliation: Uint8Array | undefined;
-        (restartedScm as any).overwrite = async (...args: unknown[]) => {
-            remoteBeforeReconciliation = await readBytes(remoteImage);
-            return originalOverwrite(...args);
-        };
         assert.strictEqual(
             await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
             true,
         );
 
-        assert.deepStrictEqual(
-            Buffer.from(remoteBeforeReconciliation!),
-            baseline,
-        );
-        assert.deepStrictEqual(await readBytes(remoteImage), replacement);
+        assert.deepStrictEqual(await readBytes(remoteImage), baseline);
+        assert.deepStrictEqual(await readBytes(localImage), replacement);
         assert.strictEqual(
             await pathExists((restartedScm as any).vfs.pathToUri(stagingRelPath)),
             false,
         );
+        assert.strictEqual((restartedScm as any).syncConflicts.has('/figure.png'), true);
         const journalRoot = vscode.Uri.joinPath(
             localRoot,
             REPLICA_SETTINGS_DIR,
@@ -12659,6 +12969,108 @@ suite('Select Project Folder Local Replica', function () {
         );
         const journalEntries = await vscode.workspace.fs.readDirectory(journalRoot);
         assert.deepStrictEqual(journalEntries.filter(([name]) => name.endsWith('.json')), []);
+    });
+
+    test('blocks a binary replacement when a same-byte collaborator entity replaces the target at the guarded stage', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-binary-entity-race-remote-');
+        const localRoot = await tempDir('sr-overleaf-binary-entity-race-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        const baseline = Buffer.from([1, 2, 3]);
+        const localReplacement = Buffer.from([9, 8, 7, 6]);
+        await writeBytes(remoteImage, baseline);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('', 'binary-replace-parent-original');
+        fakeVfs.setEntityId('figure.png', 'binary-replace-original');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, localReplacement);
+
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let replacementInjected = false;
+        let guardedRenameObserved = false;
+        (fakeVfs as any).rename = async (...args: any[]) => {
+            const [targetUri, _stagingUri, _force, expectedEntity] = args;
+            if (
+                !replacementInjected
+                && targetUri.toString()===remoteImage.toString()
+                && expectedEntity?.id==='binary-replace-original'
+            ) {
+                guardedRenameObserved = true;
+                replacementInjected = true;
+                await vscode.workspace.fs.delete(remoteImage);
+                await writeBytes(remoteImage, baseline);
+                fakeVfs.setEntityId('figure.png', 'binary-replace-collaborator');
+            }
+            return (originalRename as any)(...args);
+        };
+
+        const event = await (scm as any).applySync(
+            'push', 'update', '/figure.png', localImage, remoteImage,
+        ) as Events['scmSyncCompleteEvent'];
+
+        assert.strictEqual(guardedRenameObserved, true);
+        assert.strictEqual(replacementInjected, true);
+        assert.strictEqual(event.outcome, 'blocked');
+        assert.deepStrictEqual(await readBytes(localImage), localReplacement);
+        assert.deepStrictEqual(await readBytes(remoteImage), baseline);
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(remoteImage)).fileEntity._id,
+            'binary-replace-collaborator',
+        );
+        assert.strictEqual((scm as any).syncConflicts.has('/figure.png'), true);
+        const pending = (scm as any).syncManifest.pendingOperations['/figure.png'];
+        assert.strictEqual(pending.kind, 'update');
+        assert.deepStrictEqual(pending.targetEntity, {id: 'binary-replace-original', type: 'file'});
+        assert.deepStrictEqual(pending.parentEntity, {id: 'binary-replace-parent-original', type: 'folder'});
+    });
+
+    test('sends the original entity identity when staging and removing a normal binary replacement', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-binary-guard-positive-remote-');
+        const localRoot = await tempDir('sr-overleaf-binary-guard-positive-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteImage = vscode.Uri.joinPath(remoteRoot, 'figure.png');
+        const localImage = vscode.Uri.joinPath(localRoot, 'figure.png');
+        const baseline = Buffer.from([1, 2, 3]);
+        const replacement = Buffer.from([9, 8, 7, 6]);
+        await writeBytes(remoteImage, baseline);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('', 'binary-replace-positive-parent');
+        fakeVfs.setEntityId('figure.png', 'binary-replace-positive-original');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await writeBytes(localImage, replacement);
+
+        const renameExpectedEntities: unknown[] = [];
+        const removeExpectedEntities: unknown[] = [];
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        const originalRemove = fakeVfs.remove.bind(fakeVfs);
+        (fakeVfs as any).rename = async (...args: any[]) => {
+            renameExpectedEntities.push(args[3]);
+            return (originalRename as any)(...args);
+        };
+        (fakeVfs as any).remove = async (...args: any[]) => {
+            removeExpectedEntities.push(args[2]);
+            return (originalRemove as any)(...args);
+        };
+
+        const event = await (scm as any).applySync(
+            'push', 'update', '/figure.png', localImage, remoteImage,
+        ) as Events['scmSyncCompleteEvent'];
+
+        const expectedEntity = {
+            id: 'binary-replace-positive-original',
+            type: 'file',
+            parentId: 'binary-replace-positive-parent',
+        };
+        assert.strictEqual(event.outcome, 'success');
+        assert.deepStrictEqual(renameExpectedEntities, [expectedEntity]);
+        assert.deepStrictEqual(removeExpectedEntities, [expectedEntity]);
+        assert.deepStrictEqual(await readBytes(remoteImage), replacement);
+        assert.deepStrictEqual((scm as any).syncManifest.pendingOperations, {});
     });
 
     test('finishes binary replacement cleanup after restart', async () => {
@@ -13182,7 +13594,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(await pathExists(guardPath), true);
     });
 
-    test('preflights an unmarked older replacement before journal-order recovery', async () => {
+    test('preserves an unmarked identity-less older replacement rather than treating bytes as completion proof', async () => {
         const remoteRoot = await tempDir('sr-overleaf-binary-unmarked-superseded-remote-');
         const localRoot = await tempDir('sr-overleaf-binary-unmarked-superseded-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -13234,21 +13646,21 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         assert.deepStrictEqual(await readBytes(remoteImage), finalReplacement);
-        assert.strictEqual((restartedScm as any).syncConflicts.has('/figure.png'), false);
+        assert.strictEqual((restartedScm as any).syncConflicts.has('/figure.png'), true);
         assert.deepStrictEqual(
             (await vscode.workspace.fs.readDirectory(remoteRoot))
                 .filter(([name]) => name.startsWith('.sr-overleaf-replace-')),
-            [],
+            [[path.basename(olderStage), vscode.FileType.File]],
         );
         const journalRoot = vscode.Uri.joinPath(
             localRoot,
             REPLICA_SETTINGS_DIR,
             'remote-delete-operations',
         );
-        assert.deepStrictEqual(
+        assert.strictEqual(
             (await vscode.workspace.fs.readDirectory(journalRoot))
-                .filter(([name]) => name.endsWith('.json')),
-            [],
+                .filter(([name]) => name.endsWith('.json')).length,
+            2,
         );
     });
 

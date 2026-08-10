@@ -31,6 +31,7 @@ class FakeVirtualFileSystem {
     private readonly connectionEmitter = new vscode.EventEmitter<string>();
     public readonly onDidChangeConnection = this.connectionEmitter.event;
     private readonly persists = new Map<string, PersistRecord>();
+    private readonly entityIds = new Map<string, string>();
 
     constructor(
         private readonly remoteRoot: vscode.Uri,
@@ -44,13 +45,19 @@ class FakeVirtualFileSystem {
         return vscode.Uri.joinPath(this.remoteRoot, ...segments);
     }
 
-    async _resolveUri(uri: vscode.Uri) {
+    private relativeKey(uri: vscode.Uri): string {
         const relativePath = path.relative(this.remoteRoot.fsPath, uri.fsPath).split(path.sep).join('/');
-        const relPath = '/' + relativePath.split('/').filter(Boolean).join('/');
+        return '/' + relativePath.split('/').filter(Boolean).join('/');
+    }
+
+    async _resolveUri(uri: vscode.Uri) {
+        const relPath = this.relativeKey(uri);
         const fileName = path.basename(uri.fsPath);
         let isDirectory = false;
+        let exists = false;
         try {
             isDirectory = (await vscode.workspace.fs.stat(uri)).type===vscode.FileType.Directory;
+            exists = true;
         } catch {
             isDirectory = false;
         }
@@ -58,22 +65,106 @@ class FakeVirtualFileSystem {
             ? 'folder'
             : /\.tex$/i.test(fileName) ? 'doc' : 'file';
         const parentRelPath = relPath==='/' ? '/' : path.posix.dirname(relPath);
+        if (exists) {
+            this.entityIds.set(relPath, this.entityIds.get(relPath) ?? relPath);
+            this.entityIds.set(
+                parentRelPath,
+                this.entityIds.get(parentRelPath) ?? parentRelPath,
+            );
+        }
         return {
             parentFolder: {
-                _id: parentRelPath,
+                _id: this.entityIds.get(parentRelPath) ?? parentRelPath,
                 name: path.posix.basename(parentRelPath),
                 _type: 'folder',
             },
             fileName,
             fileType,
             fileEntity: {
-                _id: relPath,
+                _id: this.entityIds.get(relPath) ?? relPath,
                 name: fileName,
                 _type: fileType,
                 linkedFileData: null,
                 created: new Date(0).toISOString(),
             },
         };
+    }
+
+    _resolveById(entityId: string) {
+        for (const [relPath, id] of this.entityIds) {
+            if (id!==entityId) { continue; }
+            const uri = this.pathToUri(relPath);
+            return this._resolveUri(uri);
+        }
+        return undefined;
+    }
+
+    async rename(
+        oldUri: vscode.Uri,
+        newUri: vscode.Uri,
+        force: boolean,
+        expectedEntity?: {id: string; type: 'doc' | 'file' | 'folder'; parentId?: string},
+    ) {
+        const oldKey = this.relativeKey(oldUri);
+        const resolved = await this._resolveUri(oldUri);
+        if (
+            expectedEntity
+            && (
+                resolved.fileType!==expectedEntity.type
+                || resolved.fileEntity._id!==expectedEntity.id
+                || (
+                    expectedEntity.parentId!==undefined
+                    && resolved.parentFolder._id!==expectedEntity.parentId
+                )
+            )
+        ) {
+            throw vscode.FileSystemError.Unavailable('unexpected remote entity');
+        }
+        if (!force && await pathExists(newUri)) {
+            throw vscode.FileSystemError.FileExists(newUri);
+        }
+        await vscode.workspace.fs.rename(oldUri, newUri, {overwrite: force});
+        const newKey = this.relativeKey(newUri);
+        const moved = [...this.entityIds.entries()]
+            .filter(([key]) => key===oldKey || key.startsWith(oldKey+'/'));
+        for (const [key, id] of moved) {
+            this.entityIds.delete(key);
+            this.entityIds.set(newKey + key.slice(oldKey.length), id);
+        }
+        if (moved.length===0) {
+            this.entityIds.set(newKey, oldKey);
+        }
+    }
+
+    async remove(
+        uri: vscode.Uri,
+        recursive: boolean,
+        expectedEntity?: {id: string; type: 'doc' | 'file' | 'folder'; parentId?: string},
+    ) {
+        const resolved = await this._resolveUri(uri);
+        if (
+            expectedEntity
+            && (
+                resolved.fileType!==expectedEntity.type
+                || resolved.fileEntity._id!==expectedEntity.id
+                || (
+                    expectedEntity.parentId!==undefined
+                    && resolved.parentFolder._id!==expectedEntity.parentId
+                )
+            )
+        ) {
+            throw vscode.FileSystemError.Unavailable('unexpected remote entity');
+        }
+        if (!await pathExists(uri)) {
+            throw vscode.FileSystemError.FileNotFound(uri);
+        }
+        await vscode.workspace.fs.delete(uri, {recursive});
+        const key = this.relativeKey(uri);
+        for (const candidate of [...this.entityIds.keys()]) {
+            if (candidate===key || candidate.startsWith(key+'/')) {
+                this.entityIds.delete(candidate);
+            }
+        }
     }
 
     async ensureConnectedForWrite() {}

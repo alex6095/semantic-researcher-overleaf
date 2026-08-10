@@ -2261,9 +2261,33 @@ export class VirtualFileSystem extends vscode.Disposable {
         content: Uint8Array,
         remoteBaseline?: Uint8Array,
         expectedRemoteMissing = false,
+        expectedEntity?: ExpectedRemoteEntity,
     ): Promise<Uint8Array> {
         await this.ensureConnectedForWrite();
-        const {fileType, fileEntity} = await this._resolveUri(uri);
+        const {parentFolder, fileType, fileEntity} = await this._resolveUri(uri);
+        const assertExpectedEntity = (
+            currentFileType: FileType | undefined,
+            currentFileEntity: FileEntity | undefined,
+            currentParentId: string,
+            phase: string,
+        ): void => {
+            if (expectedEntity===undefined) { return; }
+            if (
+                (currentFileType!=='doc' && currentFileType!=='file')
+                || currentFileType!==expectedEntity.type
+                || currentFileEntity?._id!==expectedEntity.id
+                || (
+                    expectedEntity.parentId!==undefined
+                    && currentParentId!==expectedEntity.parentId
+                )
+            ) {
+                throw new RemoteDocumentMergeConflictError(
+                    'Overleaf file source or parent no longer matches the recorded entity ' +
+                    phase + ': ' + uri.path,
+                );
+            }
+        };
+        assertExpectedEntity(fileType, fileEntity, parentFolder?._id ?? '', 'before write');
         if (expectedRemoteMissing) {
             if (fileType) {
                 if (fileType==='doc' || fileType==='file') {
@@ -2314,9 +2338,30 @@ export class VirtualFileSystem extends vscode.Disposable {
             }
         }
         if (fileType==='doc' && fileEntity) {
-            const doc = fileEntity as DocumentEntity;
+            let doc = fileEntity as DocumentEntity;
             if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
                 await this.openFile(uri);
+            }
+            if (expectedEntity!==undefined) {
+                const current = await this._resolveUri(uri);
+                assertExpectedEntity(
+                    current.fileType,
+                    current.fileEntity,
+                    current.parentFolder?._id ?? '',
+                    'immediately before document update',
+                );
+                doc = current.fileEntity as DocumentEntity;
+                if (doc.version===undefined || doc.localCache===undefined || doc.remoteCache===undefined) {
+                    await this.openFile(uri);
+                    const ready = await this._resolveUri(uri);
+                    assertExpectedEntity(
+                        ready.fileType,
+                        ready.fileEntity,
+                        ready.parentFolder?._id ?? '',
+                        'immediately before document update',
+                    );
+                    doc = ready.fileEntity as DocumentEntity;
+                }
             }
             const effectiveBaseline = remoteBaseline
                 // A base preserved across a rejoin (or a missed OT update) must
@@ -2327,7 +2372,26 @@ export class VirtualFileSystem extends vscode.Disposable {
                 ?? (doc.remoteCache===undefined
                     ? undefined
                     : new TextEncoder().encode(doc.remoteCache));
-            return this.updateDocument(uri, doc, content, effectiveBaseline);
+            const written = await this.updateDocument(uri, doc, content, effectiveBaseline);
+            if (expectedEntity!==undefined) {
+                const current = await this._resolveUri(uri);
+                assertExpectedEntity(
+                    current.fileType,
+                    current.fileEntity,
+                    current.parentFolder?._id ?? '',
+                    'after document update',
+                );
+            }
+            return written;
+        }
+        if (expectedEntity!==undefined) {
+            const current = await this._resolveUri(uri);
+            assertExpectedEntity(
+                current.fileType,
+                current.fileEntity,
+                current.parentFolder?._id ?? '',
+                'immediately before file update',
+            );
         }
         await this.writeFile(uri, content, true, true);
         return content;
