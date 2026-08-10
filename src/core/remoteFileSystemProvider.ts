@@ -2325,9 +2325,25 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    async rename(oldUri: vscode.Uri, newUri: vscode.Uri, force: boolean) {
+    async rename(
+        oldUri: vscode.Uri,
+        newUri: vscode.Uri,
+        force: boolean,
+        expectedEntity?: {id: string; type: 'doc' | 'file'},
+    ) {
         const oldPath = await this._resolveUri(oldUri);
         const newPath = await this._resolveUri(newUri);
+        if (
+            expectedEntity!==undefined
+            && (
+                oldPath.fileType!==expectedEntity.type
+                || oldPath.fileEntity?._id!==expectedEntity.id
+            )
+        ) {
+            throw vscode.FileSystemError.Unavailable(
+                'Overleaf move source no longer matches the recorded entity.',
+            );
+        }
 
         if (oldPath.fileType && oldPath.fileEntity && oldPath.fileEntity) {
             // delete existence firstly

@@ -65,13 +65,17 @@ class FakeVirtualFileSystem {
         return vscode.Uri.joinPath(this.remoteRoot, ...segments);
     }
 
+    private relativeKey(uri: vscode.Uri): string {
+        const relativePath = path.relative(this.remoteRoot.fsPath, uri.fsPath).split(path.sep).join('/');
+        return '/' + relativePath.split('/').filter(Boolean).join('/');
+    }
+
     setEntityId(relPath: string, entityId: string) {
         this.entityIds.set('/' + relPath.split('/').filter(Boolean).join('/'), entityId);
     }
 
     async _resolveUri(uri: vscode.Uri) {
-        const relativePath = path.relative(this.remoteRoot.fsPath, uri.fsPath).split(path.sep).join('/');
-        const relPath = '/' + relativePath.split('/').filter(Boolean).join('/');
+        const relPath = this.relativeKey(uri);
         const fileName = path.basename(uri.fsPath);
         const fileType = /\.tex$/i.test(fileName) ? 'doc' : 'file';
         return {
@@ -85,6 +89,38 @@ class FakeVirtualFileSystem {
                 created: new Date(0).toISOString(),
             },
         };
+    }
+
+    async rename(
+        oldUri: vscode.Uri,
+        newUri: vscode.Uri,
+        force: boolean,
+        expectedEntity?: {id: string; type: 'doc' | 'file'},
+    ) {
+        const oldKey = this.relativeKey(oldUri);
+        const actualType = /\.tex$/i.test(path.basename(oldUri.fsPath)) ? 'doc' : 'file';
+        if (
+            expectedEntity
+            && (
+                (this.entityIds.get(oldKey) ?? oldKey)!==expectedEntity.id
+                || actualType!==expectedEntity.type
+            )
+        ) {
+            throw vscode.FileSystemError.Unavailable('unexpected remote entity');
+        }
+        if (!await pathExists(oldUri)) {
+            throw vscode.FileSystemError.FileNotFound(oldUri);
+        }
+        if (!force && await pathExists(newUri)) {
+            throw vscode.FileSystemError.FileExists(newUri);
+        }
+        await vscode.workspace.fs.rename(oldUri, newUri, {overwrite: force});
+        const newKey = this.relativeKey(newUri);
+        const entityId = this.entityIds.get(oldKey);
+        this.entityIds.delete(oldKey);
+        if (entityId!==undefined) {
+            this.entityIds.set(newKey, entityId);
+        }
     }
 
     async ensureConnectedForWrite() {}
@@ -201,6 +237,19 @@ async function waitUntil(predicate: () => boolean, timeoutMs = 2000) {
     while (!predicate()) {
         if (Date.now()>=deadline) {
             throw new Error('Timed out waiting for test condition');
+        }
+        await new Promise(resolve => setTimeout(resolve, 5));
+    }
+}
+
+async function waitUntilAsync(
+    predicate: () => Promise<boolean>,
+    timeoutMs = 2000,
+) {
+    const deadline = Date.now()+timeoutMs;
+    while (!await predicate()) {
+        if (Date.now()>=deadline) {
+            throw new Error('Timed out waiting for asynchronous test condition');
         }
         await new Promise(resolve => setTimeout(resolve, 5));
     }
@@ -2830,6 +2879,200 @@ suite('Select Project Folder Local Replica', function () {
         assert.deepStrictEqual(await readBytes(vscode.Uri.joinPath(remoteRoot, 'figures', 'new.png')), Buffer.from([1, 2, 3]));
     });
 
+    test('preserves the Overleaf entity for a watcher-observed local media rename', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-local-move-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-move-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteOld = vscode.Uri.joinPath(remoteRoot, 'figures', 'draft.pdf');
+        const remoteNew = vscode.Uri.joinPath(remoteRoot, 'figures', 'final.pdf');
+        const localOld = vscode.Uri.joinPath(localRoot, 'figures', 'draft.pdf');
+        const localNew = vscode.Uri.joinPath(localRoot, 'figures', 'final.pdf');
+        const pdf = Buffer.from('%PDF-1.7 local rename\\n', 'utf-8');
+        await writeBytes(remoteOld, pdf);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('figures/draft.pdf', 'file-original-entity');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.rename(localOld, localNew, {overwrite: false});
+        // These are the same entry point used by the local watcher after it
+        // observes an unlink/create pair. The source event is intentionally
+        // delivered first so the short candidate hold is exercised.
+        await (scm as any).syncToVFS(localOld, 'delete');
+        await (scm as any).syncToVFS(localNew, 'update');
+        await new Promise<void>(resolve => setTimeout(resolve, 400));
+        await (scm as any).drainPendingSyncWork();
+
+        assert.strictEqual(await pathExists(remoteOld), false);
+        assert.deepStrictEqual(await readBytes(remoteNew), pdf);
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(remoteNew)).fileEntity._id,
+            'file-original-entity',
+        );
+        assert.strictEqual((scm as any).syncManifest.files['/figures/draft.pdf'], undefined);
+        assert.strictEqual(
+            (scm as any).syncManifest.files['/figures/final.pdf'].remoteEntity.id,
+            'file-original-entity',
+        );
+        assert.deepStrictEqual((scm as any).syncManifest.pendingOperations, {});
+    });
+
+    test('releases a held local delete when no exact rename destination arrives', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-local-delete-release-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-delete-release-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteFile = vscode.Uri.joinPath(remoteRoot, 'obsolete.pdf');
+        const localFile = vscode.Uri.joinPath(localRoot, 'obsolete.pdf');
+        await writeBytes(remoteFile, Buffer.from('%PDF-1.7 obsolete\\n', 'utf-8'));
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('obsolete.pdf', 'file-delete-entity');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.delete(localFile);
+        await (scm as any).syncToVFS(localFile, 'delete');
+        await new Promise<void>(resolve => setTimeout(resolve, 1_000));
+        await (scm as any).drainPendingSyncWork();
+
+        assert.strictEqual(await pathExists(remoteFile), false);
+        assert.deepStrictEqual((scm as any).syncManifest.pendingOperations, {});
+    });
+
+    test('replays a locally moved file after its initial Overleaf proof is unavailable', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-local-move-offline-proof-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-move-offline-proof-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteOld = vscode.Uri.joinPath(remoteRoot, 'draft.pdf');
+        const remoteNew = vscode.Uri.joinPath(remoteRoot, 'final.pdf');
+        const localOld = vscode.Uri.joinPath(localRoot, 'draft.pdf');
+        const localNew = vscode.Uri.joinPath(localRoot, 'final.pdf');
+        const pdf = Buffer.from('%PDF-1.7 offline move proof\\n', 'utf-8');
+        await writeBytes(remoteOld, pdf);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('draft.pdf', 'file-offline-move-entity');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const triggers = await scm.triggers;
+        try {
+            const internals = scm as any;
+            const originalCapture = internals.captureRemotePathRevision.bind(scm);
+            let unavailable = true;
+            internals.captureRemotePathRevision = async (...args: unknown[]) => {
+                if (unavailable) {
+                    throw new Error('simulated unavailable Overleaf move proof');
+                }
+                return originalCapture(...args);
+            };
+
+            fakeVfs.setConnectionState('disconnected');
+            await vscode.workspace.fs.rename(localOld, localNew, {overwrite: false});
+            await internals.syncToVFS(localOld, 'delete');
+            await internals.syncToVFS(localNew, 'update');
+            await new Promise<void>(resolve => setTimeout(resolve, 400));
+            await internals.drainPendingSyncWork();
+
+            const pendingMove = internals.syncManifest.pendingOperations['/draft.pdf'];
+            assert.strictEqual(pendingMove.kind, 'move');
+            assert.strictEqual(await pathExists(remoteOld), true);
+            assert.strictEqual(await pathExists(remoteNew), false);
+            assert.strictEqual(scm.status.status, 'offline');
+
+            unavailable = false;
+            fakeVfs.setConnectionState('connected');
+            await waitUntil(() => (
+                internals.syncManifest.pendingOperations['/draft.pdf']===undefined
+                && scm.status.status==='idle'
+            ));
+            assert.strictEqual(await pathExists(remoteOld), false);
+            assert.deepStrictEqual(await readBytes(remoteNew), pdf);
+            assert.strictEqual(
+                (await fakeVfs._resolveUri(remoteNew)).fileEntity._id,
+                'file-offline-move-entity',
+            );
+            assert.strictEqual(scm.status.status, 'idle');
+        } finally {
+            triggers.forEach(trigger => trigger.dispose());
+        }
+    });
+
+    test('replays a journaled local move after its remote mutation is deferred', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-local-move-replay-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-move-replay-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteOld = vscode.Uri.joinPath(remoteRoot, 'draft.pdf');
+        const remoteNew = vscode.Uri.joinPath(remoteRoot, 'final.pdf');
+        const localOld = vscode.Uri.joinPath(localRoot, 'draft.pdf');
+        const localNew = vscode.Uri.joinPath(localRoot, 'final.pdf');
+        const pdf = Buffer.from('%PDF-1.7 replay\\n', 'utf-8');
+        await writeBytes(remoteOld, pdf);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('draft.pdf', 'file-replay-entity');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        fakeVfs.rename = async () => {
+            throw new Error('simulated transient rename transport failure');
+        };
+        await vscode.workspace.fs.rename(localOld, localNew, {overwrite: false});
+        await (scm as any).syncToVFS(localOld, 'delete');
+        await (scm as any).syncToVFS(localNew, 'update');
+        await new Promise<void>(resolve => setTimeout(resolve, 400));
+        await (scm as any).drainPendingSyncWork();
+
+        const pendingMove = (scm as any).syncManifest.pendingOperations['/draft.pdf'];
+        assert.strictEqual(pendingMove.kind, 'move');
+        assert.strictEqual(await pathExists(remoteOld), true);
+        assert.strictEqual(await pathExists(remoteNew), false);
+
+        await scm.deactivate();
+        fakeVfs.rename = originalRename;
+        const restartedScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true});
+
+        assert.strictEqual(await pathExists(remoteOld), false);
+        assert.deepStrictEqual(await readBytes(remoteNew), pdf);
+        assert.strictEqual((await fakeVfs._resolveUri(remoteNew)).fileEntity._id, 'file-replay-entity');
+        assert.deepStrictEqual((restartedScm as any).syncManifest.pendingOperations, {});
+    });
+
+    test('preserves both sides when a local move destination is occupied remotely', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-local-move-conflict-remote-');
+        const localRoot = await tempDir('sr-overleaf-local-move-conflict-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteOld = vscode.Uri.joinPath(remoteRoot, 'draft.pdf');
+        const remoteNew = vscode.Uri.joinPath(remoteRoot, 'final.pdf');
+        const localOld = vscode.Uri.joinPath(localRoot, 'draft.pdf');
+        const localNew = vscode.Uri.joinPath(localRoot, 'final.pdf');
+        const sourcePdf = Buffer.from('%PDF-1.7 source\\n', 'utf-8');
+        const remotePdf = Buffer.from('%PDF-1.7 collaborator\\n', 'utf-8');
+        await writeBytes(remoteOld, sourcePdf);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('draft.pdf', 'file-source-entity');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        // A collaborator creates the target after the authoritative baseline.
+        await writeBytes(remoteNew, remotePdf);
+        fakeVfs.setEntityId('final.pdf', 'file-collaborator-entity');
+        await vscode.workspace.fs.rename(localOld, localNew, {overwrite: false});
+        await (scm as any).syncToVFS(localOld, 'delete');
+        await (scm as any).syncToVFS(localNew, 'update');
+        await new Promise<void>(resolve => setTimeout(resolve, 400));
+        await (scm as any).drainPendingSyncWork();
+
+        assert.deepStrictEqual(await readBytes(remoteOld), sourcePdf);
+        assert.deepStrictEqual(await readBytes(remoteNew), remotePdf);
+        assert.deepStrictEqual(await readBytes(localNew), sourcePdf);
+        assert.match((scm as any).syncConflicts.get('/final.pdf'), /local move/i);
+        assert.strictEqual((scm as any).syncManifest.pendingOperations['/draft.pdf'].kind, 'move');
+    });
+
     test('three-way merges non-overlapping offline text edits on restart', async () => {
         const remoteRoot = await tempDir('sr-overleaf-merge-restart-remote-');
         const localRoot = await tempDir('sr-overleaf-merge-restart-local-');
@@ -2878,7 +3121,7 @@ suite('Select Project Folder Local Replica', function () {
         );
         const interruptedManifest = JSON.parse(await readText(manifestUri));
         const pending = interruptedManifest.pendingOperations['/main.tex'];
-        assert.strictEqual(interruptedManifest.version, 4);
+        assert.strictEqual(interruptedManifest.version, 5);
         assert.strictEqual(pending.kind, 'update');
         assert.strictEqual(pending.localKind, 'file');
         assert.strictEqual(pending.localRevision, sha1('offline local update'));
@@ -3000,7 +3243,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), false);
     });
 
-    test('migrates a version 2 manifest to the version 4 identity schema', async () => {
+    test('migrates a version 2 manifest to the version 5 identity schema', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-v3-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-v3-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -3022,11 +3265,11 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 4);
+        assert.strictEqual(migratedManifest.version, 5);
         assert.deepStrictEqual(migratedManifest.pendingOperations, {});
     });
 
-    test('records remote entity and stable local inode identities in manifest v4', async () => {
+    test('records remote entity and stable local inode identities in manifest v5', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-identity-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-identity-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -3045,7 +3288,7 @@ suite('Select Project Folder Local Replica', function () {
             REPLICA_SETTINGS_DIR,
             'sync-manifest.json',
         )));
-        assert.strictEqual(manifest.version, 4);
+        assert.strictEqual(manifest.version, 5);
         assert.deepStrictEqual(manifest.files['/main.tex'].remoteEntity, {id: 'doc-main', type: 'doc'});
         assert.deepStrictEqual(manifest.files['/figure.png'].remoteEntity, {id: 'file-figure', type: 'file'});
         for (const entry of [
@@ -7224,8 +7467,6 @@ suite('Select Project Folder Local Replica', function () {
             assert.strictEqual(pushEvent.outcome, 'success');
             assert.strictEqual(await readText(vscode.Uri.joinPath(remoteRoot, 'main.tex')), 'local v3');
 
-            const deleteWait = waitForSyncComplete(localRoot, '/supplement.pdf', 'push', 'delete');
-            const createWait = waitForSyncComplete(localRoot, '/paper-renamed.pdf', 'push', 'update');
             await vscode.workspace.fs.rename(
                 vscode.Uri.joinPath(localRoot, 'supplement.pdf'),
                 vscode.Uri.joinPath(localRoot, 'paper-renamed.pdf'),
@@ -7233,10 +7474,16 @@ suite('Select Project Folder Local Replica', function () {
             );
             localWatcher.fireDelete(vscode.Uri.joinPath(localRoot, 'supplement.pdf'));
             localWatcher.fireCreate(vscode.Uri.joinPath(localRoot, 'paper-renamed.pdf'));
-            const deleteEvent = await deleteWait;
-            const createEvent = await createWait;
-            assert.strictEqual(deleteEvent.outcome, 'success');
-            assert.strictEqual(createEvent.outcome, 'success');
+            // The watcher pair is one verified entity move, not an unrelated
+            // delete and upload, so it deliberately produces no two-step
+            // push events. Wait for the guarded remote postcondition instead.
+            await waitUntilAsync(async () => {
+                const [sourceExists, destinationExists] = await Promise.all([
+                    pathExists(vscode.Uri.joinPath(remoteRoot, 'supplement.pdf')),
+                    pathExists(vscode.Uri.joinPath(remoteRoot, 'paper-renamed.pdf')),
+                ]);
+                return !sourceExists && destinationExists;
+            }, 5_000);
             assert.strictEqual(await pathExists(vscode.Uri.joinPath(remoteRoot, 'supplement.pdf')), false);
             assert.deepStrictEqual(
                 await readBytes(vscode.Uri.joinPath(remoteRoot, 'paper-renamed.pdf')),

@@ -151,7 +151,7 @@ interface SyncManifestConflictEntry {
 }
 
 interface SyncManifest {
-    version: 4;
+    version: 5;
     projectUri: string;
     baselineComplete: boolean;
     files: Record<string, SyncManifestEntry>;
@@ -173,7 +173,7 @@ interface PathRevision {
     content?: Uint8Array;
 }
 
-interface SyncManifestPendingOperation {
+interface SyncManifestPendingFileOperation {
     version: 1;
     id: string;
     kind: 'update' | 'delete';
@@ -184,6 +184,36 @@ interface SyncManifestPendingOperation {
     createdAt: string;
     updatedAt: string;
 }
+
+interface SyncManifestPendingMoveOperation {
+    version: 2;
+    id: string;
+    kind: 'move';
+    localKind: 'file';
+    localRevision: string;
+    sourceEntity: SyncManifestRemoteEntityIdentity;
+    sourceLocalIdentity: SyncManifestLocalFileIdentity;
+    destinationRelPath: string;
+    sourceRemoteKind?: PathRevision['kind'];
+    sourceRemoteRevision?: string;
+    createdAt: string;
+    updatedAt: string;
+}
+
+type SyncManifestPendingOperation = SyncManifestPendingFileOperation
+    | SyncManifestPendingMoveOperation;
+
+type PendingLocalMoveDelete = {
+    timer: ReturnType<typeof setTimeout>;
+    resolve: () => void;
+};
+
+type PendingLocalMoveInspection = {
+    sourceState: PathRevision;
+    destinationState: PathRevision;
+    accepted: boolean;
+    ready: boolean;
+};
 
 interface LocalReplicaOperationRecord {
     version: 1;
@@ -523,6 +553,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // can't starve the path indefinitely.
     private pendingVfsEvents: Map<string, PendingEvent> = new Map();
     private pendingLocalEvents: Map<string, PendingEvent> = new Map();
+    private pendingLocalMoveDeletes: Map<string, PendingLocalMoveDelete> = new Map();
     private inFlightSessionIO = new Set<Promise<unknown>>();
     private localGuardCleanupPromises = new Map<string, Promise<void>>();
     private deferredSyncWork = new Set<Promise<void>>();
@@ -572,6 +603,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // destructive push-delete, and tuning the classification window must not
     // silently move it.
     private static readonly localDeleteCorroborationMs = 25;
+    // A local rename candidate may wait briefly for its matching watcher event,
+    // but the delay never proves a move. The inode, digest, current remote
+    // entity identity, and destination absence checks below are the proof.
+    private static readonly localMoveCandidateWindowMs = 500;
     private static readonly shouldUseDirectLocalWatcher = () => {
         const remoteName = vscode.env.remoteName?.toLowerCase();
         return remoteName?.includes('ssh')===true || Boolean(
@@ -1805,6 +1840,11 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             clearTimeout(pending.timer);
         }
         this.pendingLocalEvents.clear();
+        for (const pending of this.pendingLocalMoveDeletes.values()) {
+            clearTimeout(pending.timer);
+            pending.resolve();
+        }
+        this.pendingLocalMoveDeletes.clear();
         this.pendingInitialDocumentSubscriptions.clear();
         this.startupReplayGeneration = undefined;
         this.startupReplayPromise = undefined;
@@ -3363,7 +3403,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private emptySyncManifest(baselineComplete = true): SyncManifest {
         return {
-            version: 4,
+            version: 5,
             projectUri: stringifyOverleafUri(this.vfs.origin),
             baselineComplete,
             files: {},
@@ -3478,13 +3518,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && Number.isFinite(Date.parse(entry.updatedAt));
     }
 
-    private isValidSyncManifestPendingOperation(
+    private isValidSyncManifestPendingFileOperation(
         value: unknown,
-    ): value is SyncManifestPendingOperation {
+    ): value is SyncManifestPendingFileOperation {
         if (!value || typeof value!=='object' || Array.isArray(value)) {
             return false;
         }
-        const entry = value as Partial<SyncManifestPendingOperation>;
+        const entry = value as Partial<SyncManifestPendingFileOperation>;
         const validRemoteProof = (
             entry.remoteKind===undefined
             && entry.remoteRevision===undefined
@@ -3515,6 +3555,69 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && Number.isFinite(Date.parse(entry.createdAt))
             && typeof entry.updatedAt==='string'
             && Number.isFinite(Date.parse(entry.updatedAt));
+    }
+
+    private isValidSyncManifestPendingMoveOperation(
+        value: unknown,
+    ): value is SyncManifestPendingMoveOperation {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const entry = value as Partial<SyncManifestPendingMoveOperation>;
+        const sourceEntity = entry.sourceEntity;
+        const validSourceEntity = !!sourceEntity
+            && typeof sourceEntity.id==='string'
+            && sourceEntity.id.length>0
+            && sourceEntity.id.length<=4096
+            && (sourceEntity.type==='doc' || sourceEntity.type==='file');
+        const sourceLocalIdentity = entry.sourceLocalIdentity;
+        const validSourceLocalIdentity = !!sourceLocalIdentity
+            && typeof sourceLocalIdentity.dev==='string'
+            && /^[0-9]+$/.test(sourceLocalIdentity.dev)
+            && typeof sourceLocalIdentity.ino==='string'
+            && /^[1-9][0-9]*$/.test(sourceLocalIdentity.ino);
+        const validRemoteProof = (
+            entry.sourceRemoteKind===undefined
+            && entry.sourceRemoteRevision===undefined
+        ) || (
+            (
+                entry.sourceRemoteKind==='missing'
+                || entry.sourceRemoteKind==='file'
+                || entry.sourceRemoteKind==='directory'
+                || entry.sourceRemoteKind==='other'
+            )
+            && this.isValidRecordedPathRevision(entry.sourceRemoteRevision)
+        );
+        return entry.version===2
+            && typeof entry.id==='string'
+            && /^[a-f0-9]{32}$/.test(entry.id)
+            && entry.kind==='move'
+            && entry.localKind==='file'
+            && /^[a-f0-9]{40}$/.test(entry.localRevision ?? '')
+            && typeof entry.destinationRelPath==='string'
+            && this.isCanonicalReplicaRelPath(entry.destinationRelPath)
+            && validSourceEntity
+            && validSourceLocalIdentity
+            && validRemoteProof
+            && typeof entry.createdAt==='string'
+            && Number.isFinite(Date.parse(entry.createdAt))
+            && typeof entry.updatedAt==='string'
+            && Number.isFinite(Date.parse(entry.updatedAt));
+    }
+
+    private isValidSyncManifestPendingOperation(
+        value: unknown,
+    ): value is SyncManifestPendingOperation {
+        const kind = (
+            value
+            && typeof value==='object'
+            && !Array.isArray(value)
+        )
+            ? (value as {kind?: unknown}).kind
+            : undefined;
+        return kind==='move'
+            ? this.isValidSyncManifestPendingMoveOperation(value)
+            : this.isValidSyncManifestPendingFileOperation(value);
     }
 
     private isCanonicalReplicaRelPath(relPath: string): boolean {
@@ -3588,7 +3691,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } catch {
                 sameProject = false;
             }
-            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4)
+            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5)
                 && sameProject
                 && (manifest.baselineComplete===undefined || typeof manifest.baselineComplete==='boolean')
                 && this.isValidSyncManifestRecord<SyncManifestEntry>(
@@ -3628,7 +3731,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (validShape) {
                 this.requireSyncSession(generation);
                 this.syncManifest = {
-                    version: 4,
+                    version: 5,
                     projectUri,
                     baselineComplete: manifest.baselineComplete!==false,
                     files: manifest.files!,
@@ -3636,7 +3739,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         ? manifest.directories
                         : {},
                     conflicts: manifest.conflicts ?? {},
-                    pendingOperations: manifest.version===3 || manifest.version===4
+                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5
                         ? manifest.pendingOperations!
                         : {},
                 };
@@ -3648,18 +3751,23 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     Object.entries(this.syncManifest.conflicts)
                         .map(([relPath, entry]) => [relPath, entry.localDigest]),
                 );
-                for (const relPath of Object.keys(this.syncManifest.pendingOperations)) {
+                for (const [relPath, pendingOperation] of Object.entries(
+                    this.syncManifest.pendingOperations,
+                )) {
                     // A pending operation is a durable local intent that did not
                     // yet receive an acknowledged terminal outcome. Keep it in
                     // the compile barrier until startup reconciliation proves it
                     // accepted, superseded, or conflicted.
                     this.locallyDivergedPaths.add(relPath);
+                    if (pendingOperation.kind==='move') {
+                        this.locallyDivergedPaths.add(pendingOperation.destinationRelPath);
+                    }
                 }
                 this.syncManifestBaselineMode = manifest.baselineComplete===false
                     ? 'unavailable'
                     : 'trusted';
                 this.syncManifestRevision += 1;
-                this.syncManifestDirty = manifest.version!==4
+                this.syncManifestDirty = manifest.version!==5
                     || manifest.directories===undefined
                     || manifest.conflicts===undefined
                     || manifest.baselineComplete===undefined
@@ -8338,6 +8446,20 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return undefined;
     }
 
+    private async resolveRemoteEntityIdentity(
+        vfsUri: vscode.Uri,
+    ): Promise<SyncManifestRemoteEntityIdentity | undefined> {
+        const {fileType, fileEntity} = await this.vfs._resolveUri(vfsUri);
+        if (
+            (fileType==='doc' || fileType==='file')
+            && typeof fileEntity?._id==='string'
+            && fileEntity._id.length>0
+        ) {
+            return {id: fileEntity._id, type: fileType};
+        }
+        return undefined;
+    }
+
     private async getRemoteEntityIdentity(
         vfsUri: vscode.Uri,
     ): Promise<SyncManifestRemoteEntityIdentity | undefined> {
@@ -8538,6 +8660,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && existing?.remoteRevision===remoteRevision;
         if (unchanged) {
             this.locallyDivergedPaths.add(relPath);
+            this.refreshDerivedSyncStatusWhenNotActive();
             return;
         }
         const now = new Date().toISOString();
@@ -8562,6 +8685,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // If it cannot be persisted, fail closed rather than making the remote
         // change impossible to recover after a process crash.
         await this.persistSyncManifest(false, generation);
+        this.refreshDerivedSyncStatusWhenNotActive();
         getOutputChannel().appendLine(
             `${new Date().toISOString()} [pending operation journaled] ${relPath} ` +
             `kind=${kind} local=${localRevision.slice(0, 12)} ` +
@@ -8569,16 +8693,86 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         );
     }
 
+    // A move is a project-tree mutation, not a delete plus unrelated create.
+    // Persist the exact source entity, its local inode/digest, and a missing
+    // destination before invoking the Overleaf rename/move API. This is the
+    // durable proof replay needs after an interrupted request.
+    private async journalPendingLocalFileMove(
+        sourceRelPath: string,
+        destinationRelPath: string,
+        sourceEntry: SyncManifestEntry,
+        sourceRemoteState: PathRevision,
+        generation = this.syncGeneration,
+    ): Promise<SyncManifestPendingMoveOperation> {
+        this.requireSyncSession(generation);
+        if (!this.syncManifest) {
+            throw new Error('Local Replica move journal requires an active manifest.');
+        }
+        if (!this.isCanonicalReplicaRelPath(destinationRelPath)) {
+            throw new Error('Invalid Local Replica move destination: ' + destinationRelPath);
+        }
+        const sourceEntity = sourceEntry.remoteEntity;
+        const sourceLocalIdentity = sourceEntry.localIdentity;
+        if (!sourceEntity || !sourceLocalIdentity || sourceRemoteState.kind!=='file') {
+            throw new Error('Local Replica move has incomplete source identity: ' + sourceRelPath);
+        }
+        const existing = this.syncManifest.pendingOperations[sourceRelPath];
+        const sameIntent = existing?.kind==='move'
+            && existing.destinationRelPath===destinationRelPath
+            && existing.localRevision===sourceEntry.localDigest
+            && existing.sourceEntity.id===sourceEntity.id
+            && existing.sourceEntity.type===sourceEntity.type
+            && existing.sourceLocalIdentity.dev===sourceLocalIdentity.dev
+            && existing.sourceLocalIdentity.ino===sourceLocalIdentity.ino;
+        if (sameIntent) {
+            this.locallyDivergedPaths.add(sourceRelPath);
+            this.locallyDivergedPaths.add(destinationRelPath);
+            this.refreshDerivedSyncStatusWhenNotActive();
+            return existing;
+        }
+        if (existing || this.syncManifest.pendingOperations[destinationRelPath]) {
+            throw new Error('A different Local Replica operation is already pending for this move.');
+        }
+        const now = new Date().toISOString();
+        const record: SyncManifestPendingMoveOperation = {
+            version: 2,
+            id: crypto.randomBytes(16).toString('hex'),
+            kind: 'move',
+            localKind: 'file',
+            localRevision: sourceEntry.localDigest,
+            sourceEntity: {...sourceEntity},
+            sourceLocalIdentity: {...sourceLocalIdentity},
+            destinationRelPath,
+            sourceRemoteKind: sourceRemoteState.kind,
+            sourceRemoteRevision: sourceRemoteState.revision,
+            createdAt: now,
+            updatedAt: now,
+        };
+        this.syncManifest.pendingOperations[sourceRelPath] = record;
+        this.locallyDivergedPaths.add(sourceRelPath);
+        this.locallyDivergedPaths.add(destinationRelPath);
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+        this.refreshDerivedSyncStatusWhenNotActive();
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [pending move journaled] ' +
+            sourceRelPath + ' -> ' + destinationRelPath +
+            ' entity=' + sourceEntity.type + ':' + sourceEntity.id,
+        );
+        return record;
+    }
+
     private async removePendingFilePushOperation(
         relPath: string,
         reason: string,
         generation = this.syncGeneration,
-        expected?: Pick<SyncManifestPendingOperation, 'kind' | 'localRevision'>,
+        expected?: Pick<SyncManifestPendingFileOperation, 'kind' | 'localRevision'>,
     ): Promise<boolean> {
         this.requireSyncSession(generation);
         const entry = this.syncManifest?.pendingOperations[relPath];
         if (
             !entry
+            || entry.kind==='move'
             || (
                 expected!==undefined
                 && (
@@ -8592,10 +8786,260 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         delete this.syncManifest!.pendingOperations[relPath];
         this.markSyncManifestDirty();
         await this.persistSyncManifest(false, generation);
+        this.refreshDerivedSyncStatusWhenNotActive();
         getOutputChannel().appendLine(
             `${new Date().toISOString()} [pending operation acknowledged] ${relPath}: ${reason}`,
         );
         return true;
+    }
+
+    private async removePendingLocalFileMove(
+        sourceRelPath: string,
+        reason: string,
+        generation = this.syncGeneration,
+        expected?: Pick<SyncManifestPendingMoveOperation,
+            'id' | 'destinationRelPath' | 'localRevision'>,
+    ): Promise<boolean> {
+        this.requireSyncSession(generation);
+        const entry = this.syncManifest?.pendingOperations[sourceRelPath];
+        if (
+            !entry
+            || entry.kind!=='move'
+            || (
+                expected!==undefined
+                && (
+                    entry.id!==expected.id
+                    || entry.destinationRelPath!==expected.destinationRelPath
+                    || entry.localRevision!==expected.localRevision
+                )
+            )
+        ) {
+            return false;
+        }
+        delete this.syncManifest!.pendingOperations[sourceRelPath];
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+        this.refreshDerivedSyncStatusWhenNotActive();
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [pending move acknowledged] ' +
+            sourceRelPath + ': ' + reason,
+        );
+        return true;
+    }
+
+    private localMoveIdentityMatches(
+        left: SyncManifestLocalFileIdentity,
+        right: SyncManifestLocalFileIdentity,
+    ): boolean {
+        return left.dev===right.dev && left.ino===right.ino;
+    }
+
+    private remoteMoveEntityMatches(
+        actual: SyncManifestRemoteEntityIdentity | undefined,
+        expected: SyncManifestRemoteEntityIdentity,
+    ): boolean {
+        return actual?.id===expected.id && actual.type===expected.type;
+    }
+
+    private async inspectPendingLocalFileMove(
+        sourceRelPath: string,
+        record: SyncManifestPendingMoveOperation,
+        generation = this.syncGeneration,
+    ): Promise<PendingLocalMoveInspection> {
+        this.requireSyncSession(generation);
+        const destinationRelPath = record.destinationRelPath;
+        const [sourceState, destinationState] = await Promise.all([
+            this.captureRemotePathRevision(sourceRelPath, generation),
+            this.captureRemotePathRevision(destinationRelPath, generation),
+        ]);
+        this.requireSyncSession(generation);
+        let accepted = false;
+        let ready = false;
+        if (
+            sourceState.kind==='missing'
+            && destinationState.kind==='file'
+            && destinationState.revision===record.localRevision
+        ) {
+            const destinationEntity = await this.resolveRemoteEntityIdentity(
+                this.vfs.pathToUri(destinationRelPath),
+            );
+            this.requireSyncSession(generation);
+            accepted = this.remoteMoveEntityMatches(
+                destinationEntity,
+                record.sourceEntity,
+            );
+        } else if (
+            sourceState.kind==='file'
+            && destinationState.kind==='missing'
+            && record.sourceRemoteKind==='file'
+            && record.sourceRemoteRevision!==undefined
+            && sourceState.revision===record.sourceRemoteRevision
+        ) {
+            const sourceEntity = await this.resolveRemoteEntityIdentity(
+                this.vfs.pathToUri(sourceRelPath),
+            );
+            this.requireSyncSession(generation);
+            ready = this.remoteMoveEntityMatches(sourceEntity, record.sourceEntity);
+        }
+        return {sourceState, destinationState, accepted, ready};
+    }
+
+    private async finalizeAcceptedLocalFileMove(
+        sourceRelPath: string,
+        record: SyncManifestPendingMoveOperation,
+        destinationContent: Uint8Array,
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        const destinationRelPath = record.destinationRelPath;
+        this.removeSyncManifestEntry(sourceRelPath);
+        delete this.baseCache[sourceRelPath];
+        this.seenLocalEntities.delete(sourceRelPath);
+        if (this.pendingInitialDocumentSubscriptions.delete(sourceRelPath)) {
+            this.pendingInitialDocumentSubscriptions.add(destinationRelPath);
+        }
+        this.setBypassCache(sourceRelPath, undefined, 'push', 'delete');
+        this.clearRemoteDelete(sourceRelPath);
+        this.baseCache[destinationRelPath] = destinationContent;
+        this.seenLocalEntities.add(destinationRelPath);
+        this.setBypassCache(destinationRelPath, destinationContent, 'push');
+        this.clearRemoteDelete(destinationRelPath);
+        const stable = await this.recordSyncManifestEntry(
+            destinationRelPath,
+            this.vfs.pathToUri(destinationRelPath),
+            destinationContent,
+            generation,
+        );
+        this.requireSyncSession(generation);
+        this.locallyDivergedPaths.delete(sourceRelPath);
+        if (stable) {
+            this.locallyDivergedPaths.delete(destinationRelPath);
+            this.clearLocalStabilizeState(destinationRelPath);
+        } else {
+            this.locallyDivergedPaths.add(destinationRelPath);
+        }
+        await this.removePendingLocalFileMove(
+            sourceRelPath,
+            'Overleaf accepted the entity-preserving local move',
+            generation,
+            record,
+        );
+        await this.persistSyncManifest(false, generation);
+        if (!stable) {
+            this.scheduleLocalPushRetry(
+                destinationRelPath,
+                this.localUri(destinationRelPath),
+                'local-advanced-during-push',
+                generation,
+            );
+        }
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [local move accepted] ' +
+            sourceRelPath + ' -> ' + destinationRelPath +
+            ' entity=' + record.sourceEntity.type + ':' + record.sourceEntity.id,
+        );
+    }
+
+    private async executePendingLocalFileMove(
+        sourceRelPath: string,
+        record: SyncManifestPendingMoveOperation,
+        destinationContent: Uint8Array,
+        generation = this.syncGeneration,
+    ): Promise<'accepted' | 'deferred' | 'conflict'> {
+        let inspection: PendingLocalMoveInspection;
+        try {
+            inspection = await this.inspectPendingLocalFileMove(
+                sourceRelPath,
+                record,
+                generation,
+            );
+        } catch (error) {
+            getOutputChannel().appendLine(
+                new Date().toISOString() + ' [pending move inspection deferred] ' +
+                sourceRelPath + ' -> ' + record.destinationRelPath + ': ' +
+                formatUnknownError(error),
+            );
+            return 'deferred';
+        }
+        if (inspection.accepted) {
+            await this.finalizeAcceptedLocalFileMove(
+                sourceRelPath,
+                record,
+                destinationContent,
+                generation,
+            );
+            return 'accepted';
+        }
+        if (!inspection.ready) {
+            await this.markSyncConflict(
+                record.destinationRelPath,
+                'A local move could not prove its original Overleaf entity and destination state',
+                destinationContent,
+                generation,
+                inspection.destinationState,
+            );
+            return 'conflict';
+        }
+
+        let mutationError: unknown;
+        try {
+            await this.vfs.ensureConnectedForWrite();
+            this.requireSyncSession(generation);
+            await this.runSessionIO(
+                generation,
+                () => this.vfs.rename(
+                    this.vfs.pathToUri(sourceRelPath),
+                    this.vfs.pathToUri(record.destinationRelPath),
+                    false,
+                    record.sourceEntity,
+                ),
+            );
+            this.requireSyncSession(generation);
+        } catch (error) {
+            mutationError = error;
+        }
+
+        try {
+            inspection = await this.inspectPendingLocalFileMove(
+                sourceRelPath,
+                record,
+                generation,
+            );
+        } catch (error) {
+            getOutputChannel().appendLine(
+                new Date().toISOString() + ' [pending move verification deferred] ' +
+                sourceRelPath + ' -> ' + record.destinationRelPath + ': ' +
+                formatUnknownError(error),
+            );
+            return 'deferred';
+        }
+        if (inspection.accepted) {
+            await this.finalizeAcceptedLocalFileMove(
+                sourceRelPath,
+                record,
+                destinationContent,
+                generation,
+            );
+            return 'accepted';
+        }
+        if (!inspection.ready) {
+            await this.markSyncConflict(
+                record.destinationRelPath,
+                'Overleaf changed while the local entity move was being applied',
+                destinationContent,
+                generation,
+                inspection.destinationState,
+            );
+            return 'conflict';
+        }
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [pending move deferred] ' +
+            sourceRelPath + ' -> ' + record.destinationRelPath + ': ' +
+            (mutationError===undefined
+                ? 'Overleaf did not expose the move postcondition yet'
+                : formatUnknownError(mutationError)),
+        );
+        return 'deferred';
     }
 
     private recordSyncManifestDirectory(relPath: string) {
@@ -8604,6 +9048,14 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             updatedAt: new Date().toISOString(),
         };
         this.markSyncManifestDirty();
+    }
+
+    // Do not replace an active push/pull progress indicator mid-I/O. A direct
+    // watcher move has no applySync envelope, so its durable journal must
+    // explicitly refresh the at-rest status after it is persisted.
+    private refreshDerivedSyncStatusWhenNotActive(): void {
+        if (this.status.status==='push' || this.status.status==='pull') { return; }
+        this.refreshDerivedSyncStatus();
     }
 
     private refreshDerivedSyncStatus(): void {
@@ -8681,7 +9133,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private async acknowledgePendingFilePushOperationFromAuthoritativeState(
         relPath: string,
-        expected: Pick<SyncManifestPendingOperation, 'kind' | 'localRevision'>,
+        expected: Pick<SyncManifestPendingFileOperation, 'kind' | 'localRevision'>,
         generation = this.syncGeneration,
     ): Promise<boolean> {
         this.requireSyncSession(generation);
@@ -8780,6 +9232,12 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 }
             }
         }
+        for (const [sourcePath, pending] of [...this.pendingLocalMoveDeletes]) {
+            if (!matches(sourcePath)) { continue; }
+            clearTimeout(pending.timer);
+            pending.resolve();
+            this.pendingLocalMoveDeletes.delete(sourcePath);
+        }
         for (const path of [...this.bypassCache.keys()]) {
             if (matches(path)) { this.bypassCache.delete(path); }
         }
@@ -8825,6 +9283,26 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 getOutputChannel().appendLine(
                     `${new Date().toISOString()} [pending operation blocked:conflict] ${relPath}`,
                 );
+                continue;
+            }
+            if (recorded.kind==='move') {
+                try {
+                    if (await this.reconcilePendingLocalFileMove(
+                        relPath,
+                        recorded,
+                        generation,
+                    )) {
+                        recovered += 1;
+                    }
+                } catch (error) {
+                    this.locallyDivergedPaths.add(relPath);
+                    this.locallyDivergedPaths.add(recorded.destinationRelPath);
+                    getOutputChannel().appendLine(
+                        new Date().toISOString() + ' [pending move replay deferred] ' +
+                        relPath + ' -> ' + recorded.destinationRelPath + ': ' +
+                        formatUnknownError(error),
+                    );
+                }
                 continue;
             }
             try {
@@ -9280,8 +9758,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 )
                 : undefined;
             const localSnapshotElapsedMs = Date.now()-localSnapshotStartedAt;
+            const pendingMoveSources = new Set<string>();
+            const pendingMoveDestinations = new Set<string>();
+            for (const [sourceRelPath, operation] of Object.entries(this.syncManifest?.pendingOperations ?? {})) {
+                if (operation.kind!=='move') { continue; }
+                pendingMoveSources.add(sourceRelPath);
+                pendingMoveDestinations.add(operation.destinationRelPath);
+            }
+
             if (initialDocumentSnapshots) {
                 for (const [_name, relPath] of files) {
+                    if (pendingMoveSources.has(relPath)) { continue; }
                     if (initialDocumentSnapshots.has(
                         this.vfs.pathToUri(relPath).toString(),
                     )) {
@@ -9536,6 +10023,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 const vfsUri = this.vfs.pathToUri(relPath);
                 if (cancelled()) { initialPullCancelled = true; return; }
                 if (pathIsBlockedByDirectory(relPath)) { return; }
+                if (pendingMoveSources.has(relPath)) { return; }
                 progress.report({increment: 100/total, message: relPath});
                 //
                 const manifestEntry = this.syncManifest?.files[relPath];
@@ -9887,6 +10375,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (localSnapshot) {
                 for (const relPath of localSnapshot.files) {
                     if (pathIsBlockedByDirectory(relPath)) { continue; }
+                    if (pendingMoveDestinations.has(relPath)) { continue; }
                     if (remoteFilePaths.has(relPath)) { continue; }
                     const manifestEntry = this.syncManifest?.files[relPath];
                     if (manifestEntry && await this.isLocalUnchangedFromManifest(relPath)) {
@@ -10701,7 +11190,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         let errorMessage: string | undefined;
         let authoritativePullCompleted = false;
         let resolveConflict = false;
-        let acknowledgedPendingFilePush: Pick<SyncManifestPendingOperation, 'kind' | 'localRevision'> | undefined;
+        let acknowledgedPendingFilePush: Pick<SyncManifestPendingFileOperation, 'kind' | 'localRevision'> | undefined;
         let conflictResolutionProof: ConflictResolutionProof | undefined;
 
         try {
@@ -12048,7 +12537,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         ) {
             try {
                 const pendingOperation = this.syncManifest?.pendingOperations[relPath];
-                if (pendingOperation) {
+                if (pendingOperation && pendingOperation.kind!=='move') {
                     await this.acknowledgePendingFilePushOperationFromAuthoritativeState(
                         relPath,
                         pendingOperation,
@@ -12242,11 +12731,326 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+    private releasePendingLocalMoveDelete(sourceRelPath: string): void {
+        const pending = this.pendingLocalMoveDeletes.get(sourceRelPath);
+        if (!pending) { return; }
+        clearTimeout(pending.timer);
+        this.pendingLocalMoveDeletes.delete(sourceRelPath);
+        pending.resolve();
+    }
+
+    // Hold only a verified tracked-file deletion long enough for a matching
+    // watcher update to arrive. The timer is never rename evidence; expiry
+    // simply resumes the existing guarded delete path.
+    private holdLocalFileMoveDelete(
+        sourceRelPath: string,
+        generation: number,
+    ): boolean {
+        const sourceEntry = this.syncManifest?.files[sourceRelPath];
+        const pendingOperation = this.syncManifest?.pendingOperations[sourceRelPath];
+        if (pendingOperation?.kind==='move') {
+            this.locallyDivergedPaths.add(sourceRelPath);
+            return true;
+        }
+        if (
+            !sourceEntry?.remoteEntity
+            || !sourceEntry.localIdentity
+            || pendingOperation!==undefined
+            || this.touchesSyncConflict(sourceRelPath)
+        ) {
+            return false;
+        }
+        if (this.pendingLocalMoveDeletes.has(sourceRelPath)) {
+            return true;
+        }
+        let resolve!: () => void;
+        const completion = new Promise<void>(done => { resolve = done; });
+        let pending!: PendingLocalMoveDelete;
+        const timer = setTimeout(() => {
+            if (this.pendingLocalMoveDeletes.get(sourceRelPath)!==pending) {
+                resolve();
+                return;
+            }
+            this.pendingLocalMoveDeletes.delete(sourceRelPath);
+            if (!this.isSyncSessionActive(generation)) {
+                resolve();
+                return;
+            }
+            void this.enqueueLocalPendingEvent(
+                sourceRelPath,
+                {latestType: 'delete', latestUri: this.localUri(sourceRelPath)},
+                generation,
+                false,
+                true,
+            ).finally(resolve);
+        }, LocalReplicaSCMProvider.localMoveCandidateWindowMs);
+        pending = {timer, resolve};
+        this.pendingLocalMoveDeletes.set(sourceRelPath, pending);
+        let tracked!: Promise<void>;
+        tracked = completion.finally(() => {
+            this.preQueueSyncWork.delete(tracked);
+        });
+        this.preQueueSyncWork.add(tracked);
+        this.locallyDivergedPaths.add(sourceRelPath);
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [local move candidate held] ' + sourceRelPath,
+        );
+        return true;
+    }
+
+    private async readStableLocalMoveDestination(
+        destinationRelPath: string,
+        destinationUri: vscode.Uri,
+        generation: number,
+    ): Promise<{content: Uint8Array; identity: SyncManifestLocalFileIdentity} | undefined> {
+        const snapshot = await this.readStableConfinedLocalFile(
+            destinationRelPath,
+            destinationUri,
+            generation,
+        );
+        this.requireSyncSession(generation);
+        const identity = await this.captureManifestLocalFileIdentity(
+            destinationRelPath,
+            destinationUri,
+            snapshot.stat,
+        );
+        this.requireSyncSession(generation);
+        return identity===undefined ? undefined : {content: snapshot.content, identity};
+    }
+
+    private async findLocalMoveSourceForDestination(
+        destinationRelPath: string,
+        destinationContent: Uint8Array,
+        destinationIdentity: SyncManifestLocalFileIdentity,
+        generation: number,
+    ): Promise<{relPath: string; entry: SyncManifestEntry} | undefined> {
+        if (
+            !this.syncManifest
+            || this.syncManifest.pendingOperations[destinationRelPath]!==undefined
+            || this.touchesSyncConflict(destinationRelPath)
+        ) {
+            return undefined;
+        }
+        const destinationDigest = contentDigest(destinationContent);
+        const candidates: Array<{relPath: string; entry: SyncManifestEntry}> = [];
+        for (const [sourceRelPath, sourceEntry] of Object.entries(this.syncManifest.files)) {
+            if (
+                sourceRelPath===destinationRelPath
+                || sourceEntry.localDigest!==destinationDigest
+                || !sourceEntry.remoteEntity
+                || !sourceEntry.localIdentity
+                || !this.localMoveIdentityMatches(sourceEntry.localIdentity, destinationIdentity)
+                || this.syncManifest.pendingOperations[sourceRelPath]!==undefined
+                || this.touchesSyncConflict(sourceRelPath)
+            ) {
+                continue;
+            }
+            const sourceLocalState = await this.captureLocalPathRevision(
+                sourceRelPath,
+                generation,
+            );
+            this.requireSyncSession(generation);
+            if (sourceLocalState.kind!=='missing') { continue; }
+            candidates.push({relPath: sourceRelPath, entry: sourceEntry});
+            if (candidates.length>1) {
+                // A hardlink or an inode-reuse edge has ambiguous source
+                // ownership. Preserve normal delete/create semantics instead.
+                return undefined;
+            }
+        }
+        return candidates[0];
+    }
+
+    // A local mv is already a durable local fact. If Overleaf cannot be read
+    // at that instant, retain that intent with the last known manifest digest
+    // and defer the remote proof to the guarded replay. We never infer that
+    // the source is current: replay re-reads the source entity/revision and
+    // turns a collaborator change into a conflict instead of moving it.
+    private async captureMoveSourceRemoteStateOrDefer(
+        sourceRelPath: string,
+        sourceEntry: SyncManifestEntry,
+        generation: number,
+    ): Promise<PathRevision> {
+        try {
+            return await this.captureRemotePathRevision(sourceRelPath, generation);
+        } catch (error) {
+            this.requireSyncSession(generation);
+            getOutputChannel().appendLine(
+                new Date().toISOString() + ' [pending move remote proof deferred] ' +
+                sourceRelPath + ': ' + formatUnknownError(error),
+            );
+            return {
+                kind: 'file',
+                revision: sourceEntry.localDigest,
+            };
+        }
+    }
+
+    // A directory watcher event is handled by the existing recursive
+    // reconciliation path. Never try to open it as a candidate file move.
+    // Re-checking after an unexpected read error also covers an atomic
+    // replacement that changed a former file into a directory.
+    private async isRegularLocalFileMoveDestination(
+        destinationRelPath: string,
+        destinationUri: vscode.Uri,
+        generation: number,
+    ): Promise<boolean> {
+        try {
+            const stat = await this.statConfinedLocalUri(
+                destinationUri,
+                `local move destination inspection of ${destinationRelPath}`,
+            );
+            this.requireSyncSession(generation);
+            return LocalReplicaSCMProvider.isSyncStatType(
+                stat,
+                vscode.FileType.File,
+                false,
+            );
+        } catch (error) {
+            if (!LocalReplicaSCMProvider.isFileNotFoundError(error)) { throw error; }
+            this.requireSyncSession(generation);
+            return false;
+        }
+    }
+
+    // A folder reconciliation owns all of its descendants through the parent
+    // queue. A file move nested below it would be a concurrent tree mutation,
+    // so retain the safe existing delete/create reconciliation for that case.
+    // The queue relationship is only a serialization guard; it is never used
+    // as evidence that a watcher pair is a move.
+    private hasAncestorSyncQueue(relPath: string): boolean {
+        return [...this.syncQueues.keys()].some(queuedRelPath =>
+            queuedRelPath!==relPath
+            && this.isPathAtOrBelow(relPath, queuedRelPath),
+        );
+    }
+
+    private async tryApplyLocalFileMove(
+        destinationRelPath: string,
+        destinationUri: vscode.Uri,
+        generation: number,
+    ): Promise<boolean> {
+        if (this.hasAncestorSyncQueue(destinationRelPath)) { return false; }
+        if (!await this.isRegularLocalFileMoveDestination(
+            destinationRelPath, destinationUri, generation,
+        )) { return false; }
+        let destination: {content: Uint8Array; identity: SyncManifestLocalFileIdentity} | undefined;
+        try {
+            destination = await this.readStableLocalMoveDestination(
+                destinationRelPath,
+                destinationUri,
+                generation,
+            );
+        } catch (error) {
+            if (LocalReplicaSCMProvider.isLocalReadUnstable(error)) {
+                this.scheduleLocalPushRetry(
+                    destinationRelPath,
+                    destinationUri,
+                    'unstable-read',
+                    generation,
+                );
+                return true;
+            }
+            if (!await this.isRegularLocalFileMoveDestination(
+                destinationRelPath, destinationUri, generation,
+            )) { return false; }
+            throw error;
+        }
+        if (!destination) { return false; }
+        const source = await this.findLocalMoveSourceForDestination(
+            destinationRelPath,
+            destination.content,
+            destination.identity,
+            generation,
+        );
+        if (!source) { return false; }
+        const sourceRemoteState = await this.captureMoveSourceRemoteStateOrDefer(
+            source.relPath,
+            source.entry,
+            generation,
+        );
+        this.requireSyncSession(generation);
+        if (sourceRemoteState.kind!=='file') {
+            await this.markSyncConflict(
+                destinationRelPath,
+                'The local move source no longer exists as the expected Overleaf file',
+                destination.content,
+                generation,
+            );
+            this.releasePendingLocalMoveDelete(source.relPath);
+            return true;
+        }
+        const record = await this.journalPendingLocalFileMove(
+            source.relPath,
+            destinationRelPath,
+            source.entry,
+            sourceRemoteState,
+            generation,
+        );
+        this.releasePendingLocalMoveDelete(source.relPath);
+        await this.executePendingLocalFileMove(
+            source.relPath,
+            record,
+            destination.content,
+            generation,
+        );
+        return true;
+    }
+
+    private async reconcilePendingLocalFileMove(
+        sourceRelPath: string,
+        record: SyncManifestPendingMoveOperation,
+        generation: number,
+    ): Promise<boolean> {
+        if (
+            this.touchesSyncConflict(sourceRelPath)
+            || this.touchesSyncConflict(record.destinationRelPath)
+        ) {
+            return false;
+        }
+        const sourceLocalState = await this.captureLocalPathRevision(sourceRelPath, generation);
+        if (sourceLocalState.kind!=='missing') {
+            await this.markSyncConflict(
+                sourceRelPath,
+                'A pending local move cannot replay because its source was recreated locally',
+                sourceLocalState.kind==='file' ? sourceLocalState.content : undefined,
+                generation,
+            );
+            return false;
+        }
+        const destination = await this.readStableLocalMoveDestination(
+            record.destinationRelPath,
+            this.localUri(record.destinationRelPath),
+            generation,
+        );
+        if (
+            !destination
+            || contentDigest(destination.content)!==record.localRevision
+            || !this.localMoveIdentityMatches(destination.identity, record.sourceLocalIdentity)
+        ) {
+            await this.markSyncConflict(
+                record.destinationRelPath,
+                'A pending local move cannot replay because its destination changed locally',
+                destination?.content ?? null,
+                generation,
+            );
+            return false;
+        }
+        const outcome = await this.executePendingLocalFileMove(
+            sourceRelPath,
+            record,
+            destination.content,
+            generation,
+        );
+        return outcome==='accepted';
+    }
+
     private enqueueLocalPendingEvent(
         relPath: string,
         pending: Pick<PendingEvent, 'latestType' | 'latestUri'>,
         generation: number,
         acceptedBeforeRemoval = false,
+        skipLocalMoveHold = false,
     ): Promise<unknown> {
         const vfsUri = this.vfs.pathToUri(relPath);
         const classify = async (
@@ -12313,6 +13117,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 } catch {
                     return undefined;
                 }
+                if (
+                    currentType==='update'
+                    && await this.tryApplyLocalFileMove(relPath, pending.latestUri, generation)
+                ) {
+                    return undefined;
+                }
+
                 if (currentType==='delete') {
                     const promotedRelPath = await this.promoteDeleteToMissingTrackedDirectory(
                         'push',
@@ -12351,6 +13162,9 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             },
                             generation,
                         );
+                        return undefined;
+                    }
+                    if (!skipLocalMoveHold && this.holdLocalFileMoveDelete(relPath, generation)) {
                         return undefined;
                     }
                 }
