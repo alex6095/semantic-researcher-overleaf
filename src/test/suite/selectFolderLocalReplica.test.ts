@@ -2642,6 +2642,273 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual(await pathExists(remoteAppendix), true);
     });
 
+    test('blocks a remote file update without replacing a dirty editor backing file', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-dirty-pull-update-remote-');
+        const localRoot = await tempDir('sr-overleaf-dirty-pull-update-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        const baseline = 'shared baseline';
+        const remoteUpdate = 'Overleaf collaborator update';
+        await writeText(remoteMain, baseline);
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const document = await vscode.workspace.openTextDocument(localMain);
+        const editor = await vscode.window.showTextDocument(document);
+        const edited = await editor.edit(builder => builder.replace(
+            new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)),
+            'unsaved editor buffer',
+        ));
+        assert.strictEqual(edited, true);
+        assert.strictEqual(document.isDirty, true);
+        await writeText(remoteMain, remoteUpdate);
+
+        try {
+            const event = await (scm as any).applySync(
+                'pull',
+                'update',
+                '/main.tex',
+                remoteMain,
+                localMain,
+            ) as Events['scmSyncCompleteEvent'];
+
+            assert.strictEqual(event.outcome, 'blocked');
+            assert.strictEqual(document.isDirty, true);
+            assert.strictEqual(document.getText(), 'unsaved editor buffer');
+            assert.strictEqual(await readText(localMain), baseline);
+            assert.strictEqual(await readText(remoteMain), remoteUpdate);
+            const conflict = (scm as any).syncManifest.conflicts['/main.tex'];
+            assert.strictEqual(conflict.remoteKind, 'file');
+            assert.strictEqual(
+                conflict.remoteRevision,
+                crypto.createHash('sha1').update(remoteUpdate).digest('hex'),
+            );
+            assert.ok((scm as any).syncConflicts.has('/main.tex'));
+            assert.strictEqual(await scm.resolveConflictWithLocalState('/main.tex'), false);
+            assert.strictEqual(await readText(remoteMain), remoteUpdate);
+            assert.strictEqual(await readText(localMain), baseline);
+            assert.ok((scm as any).syncConflicts.has('/main.tex'));
+        } finally {
+            if (document.isDirty) {
+                await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+            }
+        }
+    });
+
+    test('blocks a remote file delete without removing a dirty editor backing file', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-dirty-pull-delete-remote-');
+        const localRoot = await tempDir('sr-overleaf-dirty-pull-delete-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        const baseline = 'shared baseline';
+        await writeText(remoteMain, baseline);
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const document = await vscode.workspace.openTextDocument(localMain);
+        const editor = await vscode.window.showTextDocument(document);
+        const edited = await editor.edit(builder => builder.replace(
+            new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)),
+            'unsaved editor buffer',
+        ));
+        assert.strictEqual(edited, true);
+        assert.strictEqual(document.isDirty, true);
+        await vscode.workspace.fs.delete(remoteMain);
+
+        try {
+            const event = await (scm as any).applySync(
+                'pull',
+                'delete',
+                '/main.tex',
+                remoteMain,
+                localMain,
+            ) as Events['scmSyncCompleteEvent'];
+
+            assert.strictEqual(event.outcome, 'blocked');
+            assert.strictEqual(document.isDirty, true);
+            assert.strictEqual(document.getText(), 'unsaved editor buffer');
+            assert.strictEqual(await readText(localMain), baseline);
+            assert.strictEqual(await pathExists(remoteMain), false);
+            const conflict = (scm as any).syncManifest.conflicts['/main.tex'];
+            assert.strictEqual(conflict.remoteKind, 'missing');
+            assert.strictEqual(conflict.remoteRevision, '\0');
+            assert.ok((scm as any).syncConflicts.has('/main.tex'));
+        } finally {
+            if (document.isDirty) {
+                await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+            }
+        }
+    });
+
+    test('keeps a dirty editor backing file when a queued remote delete is delivered', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-dirty-watcher-delete-remote-');
+        const localRoot = await tempDir('sr-overleaf-dirty-watcher-delete-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        const baseline = 'shared baseline';
+        await writeText(remoteMain, baseline);
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        await vscode.workspace.fs.delete(remoteMain);
+        const eventUri = vscode.Uri.parse(
+            ROOT_NAME + '://test-server/Select%20Folder%20Test/main.tex'
+                + '?user=test-user&project=test-project',
+        );
+        const originalRemoteTargetEventType = (scm as any)
+            .remoteTargetEventType.bind(scm);
+        (scm as any).remoteTargetEventType = async (uri: vscode.Uri) => {
+            assert.strictEqual(uri.toString(), eventUri.toString());
+            return 'delete';
+        };
+        const pulled = waitForSyncComplete(localRoot, '/main.tex', 'pull', 'delete');
+        (scm as any).syncFromVFS(eventUri, 'delete');
+
+        const document = await vscode.workspace.openTextDocument(localMain);
+        const editor = await vscode.window.showTextDocument(document);
+        const edited = await editor.edit(builder => builder.replace(
+            new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)),
+            'unsaved editor buffer',
+        ));
+        assert.strictEqual(edited, true);
+        assert.strictEqual(document.isDirty, true);
+
+        try {
+            const event = await pulled;
+            assert.strictEqual(event.outcome, 'blocked');
+            assert.strictEqual(document.isDirty, true);
+            assert.strictEqual(document.getText(), 'unsaved editor buffer');
+            assert.strictEqual(await readText(localMain), baseline);
+            assert.strictEqual(await pathExists(remoteMain), false);
+            assert.strictEqual(
+                (scm as any).syncManifest.conflicts['/main.tex'].remoteKind,
+                'missing',
+            );
+        } finally {
+            (scm as any).remoteTargetEventType = originalRemoteTargetEventType;
+            if (document.isDirty) {
+                await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+            }
+        }
+    });
+
+    test('blocks a remote folder delete while a descendant editor is dirty', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-dirty-pull-folder-delete-remote-');
+        const localRoot = await tempDir('sr-overleaf-dirty-pull-folder-delete-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteChapter = vscode.Uri.joinPath(remoteRoot, 'chapter');
+        const remoteDraft = vscode.Uri.joinPath(remoteChapter, 'draft.tex');
+        const localChapter = vscode.Uri.joinPath(localRoot, 'chapter');
+        const localDraft = vscode.Uri.joinPath(localChapter, 'draft.tex');
+        const baseline = 'shared draft';
+        await writeText(remoteDraft, baseline);
+        await writeText(vscode.Uri.joinPath(remoteChapter, 'figure.png'), 'remote figure');
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const document = await vscode.workspace.openTextDocument(localDraft);
+        const editor = await vscode.window.showTextDocument(document);
+        const edited = await editor.edit(builder => builder.insert(
+            new vscode.Position(0, 0),
+            '% unsaved editor buffer\n',
+        ));
+        assert.strictEqual(edited, true);
+        assert.strictEqual(document.isDirty, true);
+        await vscode.workspace.fs.delete(remoteChapter, {recursive: true});
+
+        try {
+            const event = await (scm as any).applySync(
+                'pull',
+                'delete',
+                '/chapter',
+                remoteChapter,
+                localChapter,
+            ) as Events['scmSyncCompleteEvent'];
+
+            assert.strictEqual(event.outcome, 'blocked');
+            assert.strictEqual(document.isDirty, true);
+            assert.strictEqual(await readText(localDraft), baseline);
+            assert.strictEqual(await pathExists(vscode.Uri.joinPath(localChapter, 'figure.png')), true);
+            assert.strictEqual(await pathExists(remoteChapter), false);
+            const conflict = (scm as any).syncManifest.conflicts['/chapter'];
+            assert.strictEqual(conflict.remoteKind, 'missing');
+            assert.strictEqual(conflict.remoteRevision, '\0');
+            assert.ok((scm as any).syncConflicts.has('/chapter'));
+        } finally {
+            if (document.isDirty) {
+                await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+            }
+        }
+    });
+
+    test('preserves agent disk bytes and a dirty editor buffer when an outbound merge is written back', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-dirty-push-merge-remote-');
+        const localRoot = await tempDir('sr-overleaf-dirty-push-merge-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteMain = vscode.Uri.joinPath(remoteRoot, 'main.tex');
+        const localMain = vscode.Uri.joinPath(localRoot, 'main.tex');
+        const baseline = '% header\nagent: base\nmiddle one\nmiddle two\nremote: base\n';
+        const agentDisk = '% header\nagent: updated\nmiddle one\nmiddle two\nremote: base\n';
+        const collaborator = '% header\nagent: base\nmiddle one\nmiddle two\nremote: updated\n';
+        const dirtyBuffer = '% unsaved editor buffer\nagent: base\nmiddle one\nmiddle two\nremote: base\n';
+        await writeText(remoteMain, baseline);
+        const scm = createSCM(remoteRoot, localRoot);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const document = await vscode.workspace.openTextDocument(localMain);
+        const editor = await vscode.window.showTextDocument(document);
+        const edited = await editor.edit(builder => builder.replace(
+            new vscode.Range(document.positionAt(0), document.positionAt(document.getText().length)),
+            dirtyBuffer,
+        ));
+        assert.strictEqual(edited, true);
+        assert.strictEqual(document.isDirty, true);
+
+        // Simulate an agent/shell changing the saved working tree while the
+        // human still owns an unsaved editor buffer. The remote collaborator
+        // changes a different hunk, so the normal saved-state logic will
+        // build a merged remote revision and try to write it back locally.
+        await fs.writeFile(localMain.fsPath, agentDisk, 'utf8');
+        await writeText(remoteMain, collaborator);
+
+        try {
+            const event = await (scm as any).applySync(
+                'push',
+                'update',
+                '/main.tex',
+                localMain,
+                remoteMain,
+            ) as Events['scmSyncCompleteEvent'];
+
+            assert.strictEqual(event.outcome, 'blocked');
+            assert.strictEqual(document.isDirty, true);
+            assert.strictEqual(document.getText(), dirtyBuffer);
+            assert.strictEqual(await readText(localMain), agentDisk);
+            const mergedRemote = await readText(remoteMain);
+            assert.ok(mergedRemote.includes('agent: updated'));
+            assert.ok(mergedRemote.includes('remote: updated'));
+            const conflict = (scm as any).syncManifest.conflicts['/main.tex'];
+            assert.strictEqual(conflict.remoteKind, 'file');
+            assert.strictEqual(
+                conflict.remoteRevision,
+                crypto.createHash('sha1').update(mergedRemote).digest('hex'),
+            );
+            assert.ok((scm as any).syncConflicts.has('/main.tex'));
+        } finally {
+            if (document.isDirty) {
+                await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
+            }
+        }
+    });
+
     test('queues a forced push when pull sees local-diverged content', async () => {
         const remoteRoot = await tempDir('sr-overleaf-diverged-remote-');
         const localRoot = await tempDir('sr-overleaf-diverged-local-');

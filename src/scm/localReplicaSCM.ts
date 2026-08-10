@@ -6655,6 +6655,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         expectedIdentity?: LocalReadIdentity | 'unavailable',
     ): Promise<boolean> {
         this.requireSyncSession(generation);
+        // A dirty VS Code document is a third, unsaved revision which is not
+        // represented by the working-tree bytes. Never replace its backing
+        // file with an inbound pull or a rebased agent/Overleaf merge: that
+        // would make a later Ctrl+S silently discard the merged disk state.
+        if (this.hasDirtyOpenReplicaDocument(relPath)) {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [local write blocked:dirty-editor] ${relPath}`,
+            );
+            return false;
+        }
         await this.ensureParentDirectory(relPath, generation);
         const written = await this.runSessionIO(
             generation,
@@ -7763,6 +7773,17 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         ) {
             return false;
         }
+        // Keep Local means the saved working-tree revision, not an unsaved
+        // editor buffer. Sending the disk copy while an editor is dirty would
+        // silently overwrite Overleaf with an older third state, so require an
+        // explicit save or discard before this outbound resolution.
+        if (this.hasDirtyOpenReplicaDocument(confinedRelPath)) {
+            getOutputChannel().appendLine(
+                `${new Date().toISOString()} [conflict resolution blocked:dirty-editor] ` +
+                confinedRelPath,
+            );
+            return false;
+        }
         const localState = await this.captureLocalPathRevision(
             confinedRelPath,
             generation,
@@ -7796,6 +7817,31 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return vscode.workspace.textDocuments.some(document =>
             document.uri.toString()===targetUri && document.isDirty,
         );
+    }
+
+    private async blockRemotePullForDirtyOpenReplicaDocument(
+        relPath: string,
+        generation = this.syncGeneration,
+        includeDescendants = false,
+    ): Promise<boolean> {
+        const dirty = includeDescendants
+            ? this.hasDirtyOpenReplicaDocumentAtOrBelow(relPath)
+            : this.hasDirtyOpenReplicaDocument(relPath);
+        if (!dirty) { return false; }
+        const remoteState = await this.captureRemotePathRevision(relPath, generation);
+        this.requireSyncSession(generation);
+        await this.markSyncConflict(
+            relPath,
+            includeDescendants
+                ? 'Overleaf changed a folder containing unsaved editor changes; '
+                    + 'the local editor buffers and disk tree were preserved'
+                : 'Overleaf changed a file while it has unsaved editor changes; '
+                    + 'the local editor buffer and disk copy were preserved',
+            undefined,
+            generation,
+            remoteState,
+        );
+        return true;
     }
 
     private async captureStableConflictLocalState(
@@ -16460,6 +16506,31 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             }
             if (type==='delete') {
                 const newContent = undefined;
+                // A dirty editor buffer is a local state that is not visible in
+                // the working-tree bytes. Do not let an inbound delete remove
+                // its backing file (or an ancestor tree) before the user has a
+                // durable conflict and an explicit choice. Echo suppression is
+                // evaluated first so a known local operation does not create a
+                // duplicate conflict from its own remote notification.
+                if (
+                    action==='pull'
+                    && this.bypassSync(action, type, relPath, newContent, options)
+                ) {
+                    outcome = 'suppressed';
+                    return;
+                }
+                if (
+                    action==='pull'
+                    && await this.blockRemotePullForDirtyOpenReplicaDocument(
+                        relPath,
+                        generation,
+                        true,
+                    )
+                ) {
+                    outcome = 'blocked';
+                    errorMessage = 'unsaved editor changes';
+                    return;
+                }
                 // The manifest fallback matters most here: a path with a
                 // manifest entry but no baseCache entry (conflict-marked media,
                 // files over the merge-baseline limit, paths blocked during
@@ -16898,7 +16969,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     }
                 }
 
-                if (this.bypassSync(action, type, relPath, newContent, options)) {
+                if (
+                    action==='push'
+                    && this.bypassSync(action, type, relPath, newContent, options)
+                ) {
                     outcome = 'suppressed';
                     return;
                 }
@@ -17329,6 +17403,36 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                             readStat = snapshot.stat;
                         }
                         this.requireSyncSession(generation);
+                        if (action==='pull' && this.hasDirtyOpenReplicaDocument(relPath)) {
+                            const localState = await this.captureLocalPathRevision(
+                                relPath,
+                                generation,
+                            );
+                            const baseline = this.baseCache[relPath]
+                                ?? this.manifestBaseContent(this.syncManifest?.files[relPath]);
+                            const localFileMatchesRemote = (
+                                localState.kind==='file'
+                                && localState.content!==undefined
+                                && bytesEqual(localState.content, newContent)
+                            );
+                            const remoteMatchesKnownBaseline = (
+                                localState.kind==='file'
+                                && baseline!==undefined
+                                && bytesEqual(newContent, baseline)
+                            );
+                            if (
+                                !localFileMatchesRemote
+                                && !remoteMatchesKnownBaseline
+                                && await this.blockRemotePullForDirtyOpenReplicaDocument(
+                                    relPath,
+                                    generation,
+                                )
+                            ) {
+                                outcome = 'blocked';
+                                errorMessage = 'unsaved editor changes';
+                                return;
+                            }
+                        }
                         if (action==='pull') {
                             authoritativePullCompleted = true;
                         }
