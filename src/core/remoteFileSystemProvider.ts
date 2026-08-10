@@ -65,6 +65,12 @@ export interface FolderEntity extends FileEntity {
     outputs?: Array<OutputFileEntity>,
 }
 
+export interface RemoteDirectoryCreateResult {
+    created: boolean;
+    entityId: string;
+    parentId: string;
+}
+
 export interface ProjectEntity {
     _id: string,
     name: string,
@@ -2234,11 +2240,15 @@ export class VirtualFileSystem extends vscode.Disposable {
         );
     }
 
-    async createDirectoryIfMissing(uri: vscode.Uri): Promise<void> {
+    async createDirectoryIfMissing(uri: vscode.Uri): Promise<RemoteDirectoryCreateResult> {
         await this.ensureConnectedForWrite();
         const current = await this._resolveUri(uri);
-        if (current.fileType==='folder') {
-            return;
+        if (current.fileType==='folder' && current.fileEntity?._id) {
+            return {
+                created: false,
+                entityId: current.fileEntity._id,
+                parentId: current.parentFolder._id,
+            };
         }
         if (current.fileType) {
             throw new RemoteDocumentMergeConflictError(
@@ -2246,7 +2256,12 @@ export class VirtualFileSystem extends vscode.Disposable {
             );
         }
         try {
-            await this.mkdir(uri);
+            const entity = await this.mkdir(uri);
+            return {
+                created: true,
+                entityId: entity._id,
+                parentId: current.parentFolder._id,
+            };
         } catch (error) {
             if ((error as {retryable?: boolean})?.retryable===false) {
                 throw error;
@@ -2260,7 +2275,13 @@ export class VirtualFileSystem extends vscode.Disposable {
             await this.reconnect(`verify folder create-if-missing: ${uri.path}`);
             const refreshed = await this._resolveUri(uri);
             if (refreshed.fileType==='folder') {
-                return;
+                // The response to our POST was lost. A folder at this path may
+                // be ours or a collaborator's, and its name alone cannot prove
+                // which. Local Replica retains its journal and turns this into
+                // a conflict instead of silently adopting an unproven entity.
+                throw new RemoteDocumentMergeConflictError(
+                    `Overleaf folder appeared after an uncertain local create: ${uri.path}`,
+                );
             }
             if (refreshed.fileType) {
                 throw new RemoteDocumentMergeConflictError(
@@ -2286,7 +2307,7 @@ export class VirtualFileSystem extends vscode.Disposable {
         }
     }
 
-    async mkdir(uri: vscode.Uri) {
+    async mkdir(uri: vscode.Uri): Promise<FolderEntity> {
         const {parentFolder, fileName} = await this._resolveUri(uri);
         const [folderName, parentFolderId] = [fileName, parentFolder._id];
         const identity = await GlobalStateManager.authenticate(this.context, this.serverName, this.userId, this.sessionIdentity);
@@ -2299,7 +2320,7 @@ export class VirtualFileSystem extends vscode.Disposable {
                 this.notify([
                     {type: vscode.FileChangeType.Created, uri: uri},
                 ]);
-                return;
+                return res.entity as FolderEntity;
             }
             const message = `Overleaf returned an invalid entity while creating "${folderName}".`;
             vscode.window.showErrorMessage(message);
@@ -3134,7 +3155,9 @@ export class RemoteFileSystemProvider implements vscode.FileSystemProvider, vsco
     }
 
     createDirectory(uri: vscode.Uri): Thenable<void> {
-        return this.getVFS(uri).then( vfs => vfs.mkdir(uri) );
+        return this.getVFS(uri).then(async vfs => {
+            await vfs.mkdir(uri);
+        });
     }
 
     readFile(uri: vscode.Uri): Thenable<Uint8Array> {

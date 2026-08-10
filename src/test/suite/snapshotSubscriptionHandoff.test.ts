@@ -40,14 +40,31 @@ class SnapshotVfs {
     }
 
     async _resolveUri(uri: vscode.Uri) {
+        const relativePath = path.relative(this.remoteRoot.fsPath, uri.fsPath).split(path.sep).join('/');
+        const relPath = '/' + relativePath.split('/').filter(Boolean).join('/');
         const fileName = path.basename(uri.fsPath);
+        let isDirectory = false;
+        try {
+            isDirectory = (await vscode.workspace.fs.stat(uri)).type===vscode.FileType.Directory;
+        } catch {
+            isDirectory = false;
+        }
+        const fileType = isDirectory
+            ? 'folder'
+            : /\.tex$/i.test(fileName) ? 'doc' : 'file';
+        const parentRelPath = relPath==='/' ? '/' : path.posix.dirname(relPath);
         return {
+            parentFolder: {
+                _id: parentRelPath,
+                name: path.posix.basename(parentRelPath),
+                _type: 'folder',
+            },
             fileName,
-            fileType: /\.tex$/i.test(fileName) ? 'doc' : 'file',
+            fileType,
             fileEntity: {
-                _id: uri.toString(),
+                _id: fileType==='folder' ? relPath : uri.toString(),
                 name: fileName,
-                _type: /\.tex$/i.test(fileName) ? 'doc' : 'file',
+                _type: fileType,
                 linkedFileData: null,
                 created: new Date(0).toISOString(),
             },
@@ -86,9 +103,27 @@ class SnapshotVfs {
     }
 
     async createDirectoryIfMissing(uri: vscode.Uri) {
-        if (!await pathExists(uri)) {
-            await vscode.workspace.fs.createDirectory(uri);
+        if (await pathExists(uri)) {
+            const stat = await vscode.workspace.fs.stat(uri);
+            if (stat.type===vscode.FileType.Directory) {
+                const resolved = await this._resolveUri(uri);
+                return {
+                    created: false,
+                    entityId: resolved.fileEntity._id,
+                    parentId: resolved.parentFolder._id,
+                };
+            }
+            throw new RemoteDocumentMergeConflictError(
+                `Overleaf path has a different type while the local folder was being created: ${uri.path}`,
+            );
         }
+        await vscode.workspace.fs.createDirectory(uri);
+        const resolved = await this._resolveUri(uri);
+        return {
+            created: true,
+            entityId: resolved.fileEntity._id,
+            parentId: resolved.parentFolder._id,
+        };
     }
 
     async reconnect() { return {} as any; }

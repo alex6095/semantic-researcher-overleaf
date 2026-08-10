@@ -152,6 +152,11 @@ interface SyncManifestLocalFileIdentity {
     ino: string;
 }
 
+interface SyncManifestRemoteFolderIdentity {
+    id: string;
+    type: 'folder';
+}
+
 interface SyncManifestEntry {
     remoteFingerprint: string;
     localSize: number;
@@ -164,6 +169,8 @@ interface SyncManifestEntry {
 }
 
 interface SyncManifestDirectoryEntry {
+    remoteEntity?: SyncManifestRemoteFolderIdentity;
+    parentEntity?: SyncManifestRemoteFolderIdentity;
     updatedAt: string;
 }
 
@@ -176,7 +183,7 @@ interface SyncManifestConflictEntry {
 }
 
 interface SyncManifest {
-    version: 5;
+    version: 6;
     projectUri: string;
     baselineComplete: boolean;
     files: Record<string, SyncManifestEntry>;
@@ -197,6 +204,11 @@ interface PathRevision {
     revision: string;
     content?: Uint8Array;
 }
+
+type RemoteFolderPathIdentity = {
+    entity: SyncManifestRemoteFolderIdentity;
+    parent: SyncManifestRemoteFolderIdentity;
+};
 
 interface SyncManifestPendingFileOperation {
     version: 1;
@@ -225,8 +237,26 @@ interface SyncManifestPendingMoveOperation {
     updatedAt: string;
 }
 
+interface SyncManifestPendingDirectoryCreateOperation {
+    version: 1;
+    id: string;
+    kind: 'mkdir';
+    localKind: 'directory';
+    localRevision: string;
+    remoteKind: 'missing';
+    remoteRevision: typeof DELETE_DIGEST;
+    parentEntity: SyncManifestRemoteFolderIdentity;
+    // Persisted immediately after the server confirms our POST and before the
+    // final authoritative path verification. If a process dies before that
+    // write, a later folder at the same name is intentionally unproven.
+    createdEntity?: SyncManifestRemoteFolderIdentity;
+    createdAt: string;
+    updatedAt: string;
+}
+
 type SyncManifestPendingOperation = SyncManifestPendingFileOperation
-    | SyncManifestPendingMoveOperation;
+    | SyncManifestPendingMoveOperation
+    | SyncManifestPendingDirectoryCreateOperation;
 
 type PendingLocalMoveDelete = {
     timer: ReturnType<typeof setTimeout>;
@@ -402,7 +432,10 @@ export type LocalReadUnstableReason =
     | 'path-identity-changed'
     // The path vanished after classification already concluded 'update' — an
     // atomic temp-file replacement, not evidence of a user deletion.
-    | 'vanished-during-update';
+    | 'vanished-during-update'
+    // A folder changed into a file or disappeared before its create intent
+    // could be persisted; defer rather than creating a stale tree path.
+    | 'directory-changed-during-create';
 
 // A local read that observed a writer mid-flight. This is a normal condition,
 // not a failure: the only correct response is to defer and look again. It is a
@@ -3427,7 +3460,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
 
     private emptySyncManifest(baselineComplete = true): SyncManifest {
         return {
-            version: 5,
+            version: 6,
             projectUri: stringifyOverleafUri(this.vfs.origin),
             baselineComplete,
             files: {},
@@ -3502,16 +3535,30 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && Number.isFinite(Date.parse(entry.updatedAt));
     }
 
+    private isValidSyncManifestFolderIdentity(
+        value: unknown,
+    ): value is SyncManifestRemoteFolderIdentity {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const identity = value as Partial<SyncManifestRemoteFolderIdentity>;
+        return typeof identity.id==='string'
+            && identity.id.length>0
+            && identity.id.length<=4096
+            && identity.type==='folder';
+    }
+
     private isValidSyncManifestDirectoryEntry(
         value: unknown,
     ): value is SyncManifestDirectoryEntry {
-        return !!value
-            && typeof value==='object'
-            && !Array.isArray(value)
-            && typeof (value as Partial<SyncManifestDirectoryEntry>).updatedAt==='string'
-            && Number.isFinite(Date.parse(
-                (value as Partial<SyncManifestDirectoryEntry>).updatedAt!,
-            ));
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const entry = value as Partial<SyncManifestDirectoryEntry>;
+        return (entry.remoteEntity===undefined || this.isValidSyncManifestFolderIdentity(entry.remoteEntity))
+            && (entry.parentEntity===undefined || this.isValidSyncManifestFolderIdentity(entry.parentEntity))
+            && typeof entry.updatedAt==='string'
+            && Number.isFinite(Date.parse(entry.updatedAt));
     }
 
     private isValidSyncManifestConflictEntry(
@@ -3629,6 +3676,32 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             && Number.isFinite(Date.parse(entry.updatedAt));
     }
 
+    private isValidSyncManifestPendingDirectoryCreateOperation(
+        value: unknown,
+    ): value is SyncManifestPendingDirectoryCreateOperation {
+        if (!value || typeof value!=='object' || Array.isArray(value)) {
+            return false;
+        }
+        const entry = value as Partial<SyncManifestPendingDirectoryCreateOperation>;
+        return entry.version===1
+            && typeof entry.id==='string'
+            && /^[a-f0-9]{32}$/.test(entry.id)
+            && entry.kind==='mkdir'
+            && entry.localKind==='directory'
+            && this.isValidRecordedPathRevision(entry.localRevision)
+            && entry.remoteKind==='missing'
+            && entry.remoteRevision===DELETE_DIGEST
+            && this.isValidSyncManifestFolderIdentity(entry.parentEntity)
+            && (
+                entry.createdEntity===undefined
+                || this.isValidSyncManifestFolderIdentity(entry.createdEntity)
+            )
+            && typeof entry.createdAt==='string'
+            && Number.isFinite(Date.parse(entry.createdAt))
+            && typeof entry.updatedAt==='string'
+            && Number.isFinite(Date.parse(entry.updatedAt));
+    }
+
     private isValidSyncManifestPendingOperation(
         value: unknown,
     ): value is SyncManifestPendingOperation {
@@ -3639,9 +3712,13 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         )
             ? (value as {kind?: unknown}).kind
             : undefined;
-        return kind==='move'
-            ? this.isValidSyncManifestPendingMoveOperation(value)
-            : this.isValidSyncManifestPendingFileOperation(value);
+        if (kind==='move') {
+            return this.isValidSyncManifestPendingMoveOperation(value);
+        }
+        if (kind==='mkdir') {
+            return this.isValidSyncManifestPendingDirectoryCreateOperation(value);
+        }
+        return this.isValidSyncManifestPendingFileOperation(value);
     }
 
     private isCanonicalReplicaRelPath(relPath: string): boolean {
@@ -3715,7 +3792,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             } catch {
                 sameProject = false;
             }
-            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5)
+            const validShape = (manifest.version===1 || manifest.version===2 || manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6)
                 && sameProject
                 && (manifest.baselineComplete===undefined || typeof manifest.baselineComplete==='boolean')
                 && this.isValidSyncManifestRecord<SyncManifestEntry>(
@@ -3755,7 +3832,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             if (validShape) {
                 this.requireSyncSession(generation);
                 this.syncManifest = {
-                    version: 5,
+                    version: 6,
                     projectUri,
                     baselineComplete: manifest.baselineComplete!==false,
                     files: manifest.files!,
@@ -3763,7 +3840,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         ? manifest.directories
                         : {},
                     conflicts: manifest.conflicts ?? {},
-                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5
+                    pendingOperations: manifest.version===3 || manifest.version===4 || manifest.version===5 || manifest.version===6
                         ? manifest.pendingOperations!
                         : {},
                 };
@@ -3791,7 +3868,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     ? 'unavailable'
                     : 'trusted';
                 this.syncManifestRevision += 1;
-                this.syncManifestDirty = manifest.version!==5
+                this.syncManifestDirty = manifest.version!==6
                     || manifest.directories===undefined
                     || manifest.conflicts===undefined
                     || manifest.baselineComplete===undefined
@@ -8530,6 +8607,41 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return undefined;
     }
 
+    private async resolveRemoteFolderPathIdentity(
+        vfsUri: vscode.Uri,
+    ): Promise<RemoteFolderPathIdentity | undefined> {
+        const {parentFolder, fileType, fileEntity} = await this.vfs._resolveUri(vfsUri);
+        if (
+            fileType!=='folder'
+            || typeof fileEntity?._id!=='string'
+            || fileEntity._id.length===0
+            || typeof parentFolder?._id!=='string'
+            || parentFolder._id.length===0
+        ) {
+            return undefined;
+        }
+        return {
+            entity: {id: fileEntity._id, type: 'folder'},
+            parent: {id: parentFolder._id, type: 'folder'},
+        };
+    }
+
+    private remoteFolderIdentityMatches(
+        actual: SyncManifestRemoteFolderIdentity | undefined,
+        expected: SyncManifestRemoteFolderIdentity,
+    ): boolean {
+        return actual?.id===expected.id && actual.type==='folder';
+    }
+
+    private remoteFolderPathIdentityMatches(
+        actual: RemoteFolderPathIdentity | undefined,
+        expectedEntity: SyncManifestRemoteFolderIdentity,
+        expectedParent: SyncManifestRemoteFolderIdentity,
+    ): boolean {
+        return this.remoteFolderIdentityMatches(actual?.entity, expectedEntity)
+            && this.remoteFolderIdentityMatches(actual?.parent, expectedParent);
+    }
+
     private async manifestLocalStat(relPath: string): Promise<{size: number; mtime: number} | undefined> {
         try {
             const stat = await this.statConfinedLocalUri(
@@ -8812,6 +8924,124 @@ export class LocalReplicaSCMProvider extends BaseSCM {
             ' entity=' + sourceEntity.type + ':' + sourceEntity.id,
         );
         return record;
+    }
+
+    // A folder create is a tree entity mutation. The journal proves that the
+    // intended path was missing under this exact remote parent before the POST;
+    // a name match after a lost response is deliberately not enough proof.
+    private async journalPendingLocalDirectoryCreate(
+        relPath: string,
+        localRevision: string,
+        parentEntity: SyncManifestRemoteFolderIdentity,
+        generation = this.syncGeneration,
+    ): Promise<SyncManifestPendingDirectoryCreateOperation> {
+        this.requireSyncSession(generation);
+        if (!this.syncManifest) {
+            throw new Error('Local Replica mkdir journal requires an active manifest.');
+        }
+        if (
+            !this.isCanonicalReplicaRelPath(relPath)
+            || !localRevision.startsWith('directory:')
+            || !this.isValidRecordedPathRevision(localRevision)
+        ) {
+            throw new Error('Invalid stable local folder revision for pending mkdir: ' + relPath);
+        }
+        const existing = this.syncManifest.pendingOperations[relPath];
+        // Child files can appear while the parent mkdir is in flight. The
+        // folder is still the same local intent as long as it remains a
+        // directory beneath the same authoritative parent; its recursive
+        // fingerprint is diagnostic, not a second create precondition.
+        const sameIntent = existing?.kind==='mkdir'
+            && this.remoteFolderIdentityMatches(existing.parentEntity, parentEntity);
+        if (sameIntent) {
+            this.locallyDivergedPaths.add(relPath);
+            this.refreshDerivedSyncStatusWhenNotActive();
+            return existing;
+        }
+        if (existing) {
+            throw new Error('A different Local Replica operation is already pending for this folder.');
+        }
+        const now = new Date().toISOString();
+        const record: SyncManifestPendingDirectoryCreateOperation = {
+            version: 1,
+            id: crypto.randomBytes(16).toString('hex'),
+            kind: 'mkdir',
+            localKind: 'directory',
+            localRevision,
+            remoteKind: 'missing',
+            remoteRevision: DELETE_DIGEST,
+            parentEntity: {...parentEntity},
+            createdAt: now,
+            updatedAt: now,
+        };
+        this.syncManifest.pendingOperations[relPath] = record;
+        this.locallyDivergedPaths.add(relPath);
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+        this.refreshDerivedSyncStatusWhenNotActive();
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [pending mkdir journaled] ' +
+            relPath + ' parent=folder:' + parentEntity.id,
+        );
+        return record;
+    }
+
+    private async markPendingLocalDirectoryCreateEntity(
+        relPath: string,
+        record: SyncManifestPendingDirectoryCreateOperation,
+        createdEntity: SyncManifestRemoteFolderIdentity,
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        const current = this.syncManifest?.pendingOperations[relPath];
+        if (
+            !current
+            || current.kind!=='mkdir'
+            || current.id!==record.id
+            || !this.remoteFolderIdentityMatches(current.parentEntity, record.parentEntity)
+        ) {
+            throw new Error('Local Replica mkdir journal changed before its server acknowledgement.');
+        }
+        if (
+            current.createdEntity!==undefined
+            && !this.remoteFolderIdentityMatches(current.createdEntity, createdEntity)
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf returned a different folder identity for the pending local create.',
+            );
+        }
+        current.createdEntity = {...createdEntity};
+        current.updatedAt = new Date().toISOString();
+        this.markSyncManifestDirty();
+        // Persist the server-issued ID before any postcondition lookup. A crash
+        // after this point can safely recognize only this exact entity on replay.
+        await this.persistSyncManifest(false, generation);
+    }
+
+    private async removePendingLocalDirectoryCreate(
+        relPath: string,
+        reason: string,
+        generation = this.syncGeneration,
+        expected?: Pick<SyncManifestPendingDirectoryCreateOperation, 'id'>,
+    ): Promise<boolean> {
+        this.requireSyncSession(generation);
+        const current = this.syncManifest?.pendingOperations[relPath];
+        if (
+            !current
+            || current.kind!=='mkdir'
+            || (expected!==undefined && current.id!==expected.id)
+        ) {
+            return false;
+        }
+        delete this.syncManifest!.pendingOperations[relPath];
+        this.markSyncManifestDirty();
+        await this.persistSyncManifest(false, generation);
+        this.refreshDerivedSyncStatusWhenNotActive();
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [pending mkdir acknowledged] ' +
+            relPath + ': ' + reason,
+        );
+        return true;
     }
 
     private async removePendingFilePushOperation(
@@ -9152,12 +9382,59 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         return 'deferred';
     }
 
-    private recordSyncManifestDirectory(relPath: string) {
+    private recordSyncManifestDirectory(
+        relPath: string,
+        remoteIdentity?: RemoteFolderPathIdentity,
+    ) {
         if (!this.syncManifest) { return; }
-        this.syncManifest.directories[relPath] = {
-            updatedAt: new Date().toISOString(),
-        };
+        this.syncManifest.directories[relPath] = remoteIdentity===undefined
+            ? {
+                updatedAt: new Date().toISOString(),
+            }
+            : {
+                remoteEntity: {...remoteIdentity.entity},
+                parentEntity: {...remoteIdentity.parent},
+                updatedAt: new Date().toISOString(),
+            };
         this.markSyncManifestDirty();
+    }
+
+    private async finalizeAcceptedPendingLocalDirectoryCreate(
+        relPath: string,
+        record: SyncManifestPendingDirectoryCreateOperation,
+        remoteIdentity: RemoteFolderPathIdentity,
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        if (
+            !record.createdEntity
+            || !this.remoteFolderPathIdentityMatches(
+                remoteIdentity,
+                record.createdEntity,
+                record.parentEntity,
+            )
+        ) {
+            throw new RemoteDocumentMergeConflictError(
+                'Overleaf folder identity changed before the pending local create was verified.',
+            );
+        }
+        this.recordSyncManifestDirectory(relPath, remoteIdentity);
+        this.seenLocalEntities.add(relPath);
+        this.clearRemoteDelete(relPath);
+        this.locallyDivergedPaths.delete(relPath);
+        const removed = await this.removePendingLocalDirectoryCreate(
+            relPath,
+            'Overleaf accepted the guarded local folder create',
+            generation,
+            record,
+        );
+        if (!removed) {
+            throw new Error('Local Replica mkdir journal changed before final acknowledgement.');
+        }
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [local mkdir accepted] ' +
+            relPath + ' entity=folder:' + remoteIdentity.entity.id,
+        );
     }
 
     // Do not replace an active push/pull progress indicator mid-I/O. A direct
@@ -9380,6 +9657,163 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         }
     }
 
+    private async reconcilePendingLocalDirectoryCreate(
+        relPath: string,
+        record: SyncManifestPendingDirectoryCreateOperation,
+        generation = this.syncGeneration,
+    ): Promise<boolean> {
+        this.requireSyncSession(generation);
+        const localState = await this.captureLocalPathRevision(relPath, generation);
+        if (localState.kind!=='directory') {
+            await this.markSyncConflict(
+                relPath,
+                'A pending local folder create cannot replay because that local path changed type or disappeared',
+                undefined,
+                generation,
+            );
+            return false;
+        }
+        const remoteState = await this.captureRemotePathRevision(relPath, generation);
+        this.requireSyncSession(generation);
+        if (remoteState.kind==='directory') {
+            const actual = await this.resolveRemoteFolderPathIdentity(
+                this.vfs.pathToUri(relPath),
+            );
+            this.requireSyncSession(generation);
+            if (
+                record.createdEntity!==undefined
+                && this.remoteFolderPathIdentityMatches(
+                    actual,
+                    record.createdEntity,
+                    record.parentEntity,
+                )
+            ) {
+                await this.finalizeAcceptedPendingLocalDirectoryCreate(
+                    relPath,
+                    record,
+                    actual!,
+                    generation,
+                );
+                return true;
+            }
+            await this.markSyncConflict(
+                relPath,
+                record.createdEntity===undefined
+                    ? 'Overleaf folder appeared after an unacknowledged local create; its identity is not proven'
+                    : 'Overleaf folder identity changed while the local create was being verified',
+                undefined,
+                generation,
+                remoteState,
+            );
+            return false;
+        }
+        if (remoteState.kind!=='missing') {
+            await this.markSyncConflict(
+                relPath,
+                'Overleaf path changed type while the local folder create was pending',
+                undefined,
+                generation,
+                remoteState,
+            );
+            return false;
+        }
+
+        const parentRelPath = nodePath.posix.dirname(relPath);
+        const actualParent = await this.resolveRemoteFolderPathIdentity(
+            this.vfs.pathToUri(parentRelPath),
+        );
+        this.requireSyncSession(generation);
+        if (!this.remoteFolderIdentityMatches(actualParent?.entity, record.parentEntity)) {
+            await this.markSyncConflict(
+                relPath,
+                'Overleaf parent folder changed before the pending local create could be applied',
+                undefined,
+                generation,
+            );
+            return false;
+        }
+
+        let creation: Awaited<ReturnType<VirtualFileSystem['createDirectoryIfMissing']>>;
+        try {
+            creation = await this.withRetry('push', relPath, async () => {
+                await this.vfs.ensureConnectedForWrite();
+                this.requireSyncSession(generation);
+                return this.runSessionIO(
+                    generation,
+                    () => this.vfs.createDirectoryIfMissing(this.vfs.pathToUri(relPath)),
+                );
+            }, {
+                delays: LocalReplicaSCMProvider.pushRetryDelays,
+                generation,
+                betweenAttempts: async () => {
+                    await this.waitForConnectedOrTimeout(
+                        LocalReplicaSCMProvider.pushReconnectWaitMs,
+                    );
+                },
+            });
+        } catch (error) {
+            if (!(error instanceof RemoteDocumentMergeConflictError)) {
+                throw error;
+            }
+            await this.markSyncConflict(
+                relPath,
+                error.message,
+                undefined,
+                generation,
+            );
+            return false;
+        }
+        if (
+            !creation.created
+            || typeof creation.entityId!=='string'
+            || creation.entityId.length===0
+            || creation.parentId!==record.parentEntity.id
+        ) {
+            await this.markSyncConflict(
+                relPath,
+                'Overleaf did not prove that the pending local folder create produced the expected entity',
+                undefined,
+                generation,
+            );
+            return false;
+        }
+
+        const createdEntity: SyncManifestRemoteFolderIdentity = {
+            id: creation.entityId,
+            type: 'folder',
+        };
+        await this.markPendingLocalDirectoryCreateEntity(
+            relPath,
+            record,
+            createdEntity,
+            generation,
+        );
+        const verified = await this.resolveRemoteFolderPathIdentity(
+            this.vfs.pathToUri(relPath),
+        );
+        this.requireSyncSession(generation);
+        if (!this.remoteFolderPathIdentityMatches(
+            verified,
+            createdEntity,
+            record.parentEntity,
+        )) {
+            await this.markSyncConflict(
+                relPath,
+                'Overleaf did not retain the created folder identity at the requested path',
+                undefined,
+                generation,
+            );
+            return false;
+        }
+        await this.finalizeAcceptedPendingLocalDirectoryCreate(
+            relPath,
+            record,
+            verified!,
+            generation,
+        );
+        return true;
+    }
+
     private async reconcilePendingFilePushOperations(
         generation = this.syncGeneration,
     ): Promise<void> {
@@ -9393,6 +9827,24 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                 getOutputChannel().appendLine(
                     `${new Date().toISOString()} [pending operation blocked:conflict] ${relPath}`,
                 );
+                continue;
+            }
+            if (recorded.kind==='mkdir') {
+                try {
+                    if (await this.reconcilePendingLocalDirectoryCreate(
+                        relPath,
+                        recorded,
+                        generation,
+                    )) {
+                        recovered += 1;
+                    }
+                } catch (error) {
+                    this.locallyDivergedPaths.add(relPath);
+                    getOutputChannel().appendLine(
+                        new Date().toISOString() + ' [pending mkdir replay deferred] ' +
+                        relPath + ': ' + formatUnknownError(error),
+                    );
+                }
                 continue;
             }
             if (recorded.kind==='move') {
@@ -11876,6 +12328,8 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     vscode.FileType.File,
                     isRemotePull,
                 );
+                let directoryCreateAlreadyFinalized = false;
+                let observedRemoteDirectoryIdentity: RemoteFolderPathIdentity | undefined;
                 if (isDirectory) {
                     const newContent = new Uint8Array();
                     if (this.bypassSync(action, type, relPath, newContent, options)) {
@@ -11883,36 +12337,116 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                         return;
                     }
                     if (action==='push') {
-                        try {
-                            await this.withRetry('push', relPath, async () => {
-                                await this.vfs.ensureConnectedForWrite();
-                                this.requireSyncSession(generation);
-                                await this.runSessionIO(
+                        const localState = await this.captureLocalPathRevision(
+                            relPath,
+                            generation,
+                        );
+                        if (localState.kind!=='directory') {
+                            throw new LocalReadUnstableError(
+                                relPath,
+                                'directory-changed-during-create',
+                                'Local Replica folder changed before the Overleaf create could be journaled: ' +
+                                    relPath,
+                            );
+                        }
+                        const remoteState = await this.captureRemotePathRevision(
+                            relPath,
+                            generation,
+                        );
+                        this.requireSyncSession(generation);
+                        const reconcilePendingCreate = async (
+                            record: SyncManifestPendingDirectoryCreateOperation,
+                        ) => {
+                            let accepted = false;
+                            try {
+                                accepted = await this.reconcilePendingLocalDirectoryCreate(
+                                    relPath,
+                                    record,
                                     generation,
-                                    () => this.vfs.createDirectoryIfMissing(toUri),
                                 );
-                            }, {
-                                delays: LocalReplicaSCMProvider.pushRetryDelays,
-                                generation,
-                                betweenAttempts: async () => {
-                                    await this.waitForConnectedOrTimeout(
-                                        LocalReplicaSCMProvider.pushReconnectWaitMs,
-                                    );
-                                },
-                            });
-                        } catch (error) {
-                            if (!(error instanceof RemoteDocumentMergeConflictError)) {
-                                throw error;
+                            } catch (error) {
+                                if (!(error instanceof RemoteDocumentMergeConflictError)) {
+                                    throw error;
+                                }
+                                await this.markSyncConflict(
+                                    relPath,
+                                    error.message,
+                                    undefined,
+                                    generation,
+                                );
                             }
+                            if (!accepted) {
+                                outcome = 'blocked';
+                                errorMessage = 'guarded local folder create was not accepted';
+                                return false;
+                            }
+                            directoryCreateAlreadyFinalized = true;
+                            return true;
+                        };
+                        if (remoteState.kind==='directory') {
+                            const pending = this.syncManifest?.pendingOperations[relPath];
+                            if (pending?.kind==='mkdir') {
+                                if (!await reconcilePendingCreate(pending)) {
+                                    return;
+                                }
+                            } else if (pending!==undefined) {
+                                await this.markSyncConflict(
+                                    relPath,
+                                    'A non-folder Local Replica operation is pending at an existing Overleaf folder',
+                                    undefined,
+                                    generation,
+                                    remoteState,
+                                );
+                                outcome = 'blocked';
+                                errorMessage = 'pending operation has incompatible folder type';
+                                return;
+                            } else {
+                                // No unacknowledged local mkdir exists. This is
+                                // an already-authoritative shared container
+                                // (often a watcher echo or an ancestor created
+                                // while reconciling a child), so do not treat
+                                // its name alone as a competing mutation.
+                                observedRemoteDirectoryIdentity =
+                                    await this.resolveRemoteFolderPathIdentity(toUri);
+                                this.requireSyncSession(generation);
+                                if (!observedRemoteDirectoryIdentity) {
+                                    throw new Error(
+                                        'Could not resolve the authoritative Overleaf folder identity for ' +
+                                        relPath,
+                                    );
+                                }
+                            }
+                        } else if (remoteState.kind!=='missing') {
                             await this.markSyncConflict(
                                 relPath,
-                                error.message,
+                                'Overleaf path has a different type before the local folder create could be applied',
                                 undefined,
                                 generation,
+                                remoteState,
                             );
                             outcome = 'blocked';
                             errorMessage = 'concurrent untracked path type conflict';
                             return;
+                        } else {
+                            const parentRelPath = nodePath.posix.dirname(relPath);
+                            const parentIdentity = await this.resolveRemoteFolderPathIdentity(
+                                this.vfs.pathToUri(parentRelPath),
+                            );
+                            this.requireSyncSession(generation);
+                            if (!parentIdentity) {
+                                throw new Error(
+                                    'Could not resolve the authoritative Overleaf parent folder for ' + relPath,
+                                );
+                            }
+                            const record = await this.journalPendingLocalDirectoryCreate(
+                                relPath,
+                                localState.revision,
+                                parentIdentity.entity,
+                                generation,
+                            );
+                            if (!await reconcilePendingCreate(record)) {
+                                return;
+                            }
                         }
                     } else {
                         this.requireSyncSession(generation);
@@ -11925,11 +12459,16 @@ export class LocalReplicaSCMProvider extends BaseSCM {
                     if (action==='pull') {
                         authoritativePullCompleted = true;
                     }
-                    this.seenLocalEntities.add(relPath);
-                    this.clearRemoteDelete(relPath);
-                    this.locallyDivergedPaths.delete(relPath);
-                    this.recordSyncManifestDirectory(relPath);
-                    await this.persistSyncManifest(false, generation);
+                    if (!directoryCreateAlreadyFinalized) {
+                        this.seenLocalEntities.add(relPath);
+                        this.clearRemoteDelete(relPath);
+                        this.locallyDivergedPaths.delete(relPath);
+                        this.recordSyncManifestDirectory(
+                            relPath,
+                            observedRemoteDirectoryIdentity,
+                        );
+                        await this.persistSyncManifest(false, generation);
+                    }
                     if (
                         !options.skipDirectoryDescendants
                         && !options.resolveConflict
@@ -12660,7 +13199,10 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         ) {
             try {
                 const pendingOperation = this.syncManifest?.pendingOperations[relPath];
-                if (pendingOperation && pendingOperation.kind!=='move') {
+                if (
+                    pendingOperation
+                    && (pendingOperation.kind==='update' || pendingOperation.kind==='delete')
+                ) {
                     await this.acknowledgePendingFilePushOperationFromAuthoritativeState(
                         relPath,
                         pendingOperation,

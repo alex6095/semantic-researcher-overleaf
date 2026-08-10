@@ -78,8 +78,22 @@ class FakeVirtualFileSystem {
     async _resolveUri(uri: vscode.Uri) {
         const relPath = this.relativeKey(uri);
         const fileName = path.basename(uri.fsPath);
-        const fileType = /\.tex$/i.test(fileName) ? 'doc' : 'file';
+        let isDirectory = false;
+        try {
+            isDirectory = (await vscode.workspace.fs.stat(uri)).type===vscode.FileType.Directory;
+        } catch {
+            isDirectory = false;
+        }
+        const fileType = isDirectory
+            ? 'folder'
+            : /\.tex$/i.test(fileName) ? 'doc' : 'file';
+        const parentRelPath = relPath==='/' ? '/' : path.posix.dirname(relPath);
         return {
+            parentFolder: {
+                _id: this.entityIds.get(parentRelPath) ?? parentRelPath,
+                name: path.posix.basename(parentRelPath),
+                _type: 'folder',
+            },
             fileName,
             fileType,
             fileEntity: {
@@ -149,13 +163,24 @@ class FakeVirtualFileSystem {
         if (await pathExists(uri)) {
             const stat = await vscode.workspace.fs.stat(uri);
             if (stat.type===vscode.FileType.Directory) {
-                return;
+                const resolved = await this._resolveUri(uri);
+                return {
+                    created: false,
+                    entityId: resolved.fileEntity._id,
+                    parentId: resolved.parentFolder._id,
+                };
             }
             throw new RemoteDocumentMergeConflictError(
                 `Overleaf path has a different type while the local folder was being created: ${uri.path}`,
             );
         }
         await vscode.workspace.fs.createDirectory(uri);
+        const resolved = await this._resolveUri(uri);
+        return {
+            created: true,
+            entityId: resolved.fileEntity._id,
+            parentId: resolved.parentFolder._id,
+        };
     }
 
     async reconnect() {
@@ -3244,7 +3269,7 @@ suite('Select Project Folder Local Replica', function () {
         );
         const interruptedManifest = JSON.parse(await readText(manifestUri));
         const pending = interruptedManifest.pendingOperations['/main.tex'];
-        assert.strictEqual(interruptedManifest.version, 5);
+        assert.strictEqual(interruptedManifest.version, 6);
         assert.strictEqual(pending.kind, 'update');
         assert.strictEqual(pending.localKind, 'file');
         assert.strictEqual(pending.localRevision, sha1('offline local update'));
@@ -3366,7 +3391,7 @@ suite('Select Project Folder Local Replica', function () {
         assert.strictEqual((restartedScm as any).locallyDivergedPaths.has('/main.tex'), false);
     });
 
-    test('migrates a version 2 manifest to the version 5 identity schema', async () => {
+    test('migrates a version 2 manifest to the version 6 identity schema', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-v3-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-v3-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -3388,11 +3413,11 @@ suite('Select Project Folder Local Replica', function () {
             true,
         );
         const migratedManifest = JSON.parse(await readText(manifestUri));
-        assert.strictEqual(migratedManifest.version, 5);
+        assert.strictEqual(migratedManifest.version, 6);
         assert.deepStrictEqual(migratedManifest.pendingOperations, {});
     });
 
-    test('records remote entity and stable local inode identities in manifest v5', async () => {
+    test('records remote entity and stable local inode identities in manifest v6', async () => {
         const remoteRoot = await tempDir('sr-overleaf-manifest-identity-remote-');
         const localRoot = await tempDir('sr-overleaf-manifest-identity-local-');
         tempRoots.push(remoteRoot, localRoot);
@@ -3411,7 +3436,7 @@ suite('Select Project Folder Local Replica', function () {
             REPLICA_SETTINGS_DIR,
             'sync-manifest.json',
         )));
-        assert.strictEqual(manifest.version, 5);
+        assert.strictEqual(manifest.version, 6);
         assert.deepStrictEqual(manifest.files['/main.tex'].remoteEntity, {id: 'doc-main', type: 'doc'});
         assert.deepStrictEqual(manifest.files['/figure.png'].remoteEntity, {id: 'file-figure', type: 'file'});
         for (const entry of [
@@ -3837,6 +3862,170 @@ suite('Select Project Folder Local Replica', function () {
             'sync-manifest.json',
         )));
         assert.strictEqual(manifest.baselineComplete, true);
+    });
+
+    test('journals and verifies a local folder create by authoritative entity id', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-mkdir-journal-remote-');
+        const localRoot = await tempDir('sr-overleaf-mkdir-journal-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const localFolder = vscode.Uri.joinPath(localRoot, 'figures');
+        const remoteFolder = vscode.Uri.joinPath(remoteRoot, 'figures');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.createDirectory(localFolder);
+
+        const originalCreate = fakeVfs.createDirectoryIfMissing.bind(fakeVfs);
+        let enteredCreate!: () => void;
+        let releaseCreate!: () => void;
+        const createEntered = new Promise<void>(resolve => { enteredCreate = resolve; });
+        const release = new Promise<void>(resolve => { releaseCreate = resolve; });
+        fakeVfs.createDirectoryIfMissing = async uri => {
+            enteredCreate();
+            await release;
+            return originalCreate(uri);
+        };
+
+        const sync = (scm as any).applySync(
+            'push',
+            'update',
+            '/figures',
+            localFolder,
+            remoteFolder,
+        ) as Promise<Events['scmSyncCompleteEvent']>;
+        await createEntered;
+        const pending = (scm as any).syncManifest.pendingOperations['/figures'];
+        assert.strictEqual(pending.kind, 'mkdir');
+        assert.strictEqual(pending.remoteKind, 'missing');
+        assert.strictEqual(pending.parentEntity.id, '/');
+        assert.strictEqual(await pathExists(remoteFolder), false);
+
+        releaseCreate();
+        const event = await sync;
+        assert.strictEqual(event.outcome, 'success');
+        assert.strictEqual(await pathExists(remoteFolder), true);
+        assert.strictEqual((scm as any).syncManifest.pendingOperations['/figures'], undefined);
+        assert.deepStrictEqual((scm as any).syncManifest.directories['/figures'], {
+            remoteEntity: {id: '/figures', type: 'folder'},
+            parentEntity: {id: '/', type: 'folder'},
+            updatedAt: (scm as any).syncManifest.directories['/figures'].updatedAt,
+        });
+    });
+
+    test('replays a journaled local folder create on reconnect without another watcher event', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-mkdir-reconnect-remote-');
+        const localRoot = await tempDir('sr-overleaf-mkdir-reconnect-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const localFolder = vscode.Uri.joinPath(localRoot, 'generated');
+        const remoteFolder = vscode.Uri.joinPath(remoteRoot, 'generated');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        const triggers = await scm.triggers;
+        try {
+            await vscode.workspace.fs.createDirectory(localFolder);
+            const internals = scm as any;
+            const localState = await internals.captureLocalPathRevision('/generated');
+            await internals.journalPendingLocalDirectoryCreate(
+                '/generated',
+                localState.revision,
+                {id: '/', type: 'folder'},
+            );
+
+            fakeVfs.setConnectionState('disconnected');
+            assert.strictEqual(scm.status.status, 'offline');
+            fakeVfs.setConnectionState('connected');
+
+            await waitUntil(() => (
+                internals.syncManifest.pendingOperations['/generated']===undefined
+                && scm.status.status==='idle'
+            ));
+            assert.strictEqual(await pathExists(remoteFolder), true);
+            assert.deepStrictEqual(internals.syncManifest.directories['/generated'].remoteEntity, {
+                id: '/generated',
+                type: 'folder',
+            });
+        } finally {
+            triggers.forEach(trigger => trigger.dispose());
+        }
+    });
+
+    test('replays an acknowledged local folder create after restart', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-mkdir-replay-remote-');
+        const localRoot = await tempDir('sr-overleaf-mkdir-replay-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const localFolder = vscode.Uri.joinPath(localRoot, 'appendix');
+        const remoteFolder = vscode.Uri.joinPath(remoteRoot, 'appendix');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.createDirectory(localFolder);
+
+        const internals = scm as any;
+        const localState = await internals.captureLocalPathRevision('/appendix');
+        const pending = await internals.journalPendingLocalDirectoryCreate(
+            '/appendix',
+            localState.revision,
+            {id: '/', type: 'folder'},
+        );
+        await vscode.workspace.fs.createDirectory(remoteFolder);
+        await internals.markPendingLocalDirectoryCreateEntity(
+            '/appendix',
+            pending,
+            {id: '/appendix', type: 'folder'},
+        );
+        await scm.deactivate();
+
+        const restarted = createSCM(remoteRoot, localRoot, fakeVfs);
+        assert.strictEqual(
+            await restarted.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        assert.strictEqual((restarted as any).syncManifest.pendingOperations['/appendix'], undefined);
+        assert.deepStrictEqual((restarted as any).syncManifest.directories['/appendix'].remoteEntity, {
+            id: '/appendix',
+            type: 'folder',
+        });
+        assert.deepStrictEqual((restarted as any).syncManifest.directories['/appendix'].parentEntity, {
+            id: '/',
+            type: 'folder',
+        });
+    });
+
+    test('conflicts when an unacknowledged local folder create name appears remotely', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-mkdir-ambiguous-remote-');
+        const localRoot = await tempDir('sr-overleaf-mkdir-ambiguous-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const localFolder = vscode.Uri.joinPath(localRoot, 'results');
+        const remoteFolder = vscode.Uri.joinPath(remoteRoot, 'results');
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+        await vscode.workspace.fs.createDirectory(localFolder);
+
+        const internals = scm as any;
+        const localState = await internals.captureLocalPathRevision('/results');
+        await internals.journalPendingLocalDirectoryCreate(
+            '/results',
+            localState.revision,
+            {id: '/', type: 'folder'},
+        );
+        // Simulate a collaborator's same-name folder appearing after our request
+        // was journaled but before the server acknowledged it.
+        await vscode.workspace.fs.createDirectory(remoteFolder);
+        await internals.reconcilePendingFilePushOperations();
+
+        assert.match(
+            internals.syncConflicts.get('/results'),
+            /unacknowledged local create/,
+        );
+        assert.strictEqual(internals.syncManifest.pendingOperations['/results'].kind, 'mkdir');
+        assert.strictEqual(await pathExists(localFolder), true);
+        assert.strictEqual(await pathExists(remoteFolder), true);
     });
 
     test('three-way merges a pull-first live collaboration race', async () => {
