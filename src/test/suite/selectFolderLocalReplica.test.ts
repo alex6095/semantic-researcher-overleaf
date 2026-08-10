@@ -8298,6 +8298,208 @@ suite('Select Project Folder Local Replica', function () {
     });
 
 
+    test('offers only remote-authoritative choices and routes folder Keep Both through its tree transaction', async () => {
+        const fixture = await createFolderReplacementConflictFixture('folder-picker-keep-both');
+        const setting = (fixture.scm as any).settingItems.find((item: any) =>
+            /Resolve a Local Replica sync conflict/.test(item.label),
+        );
+        assert.ok(setting);
+        let pickCount = 0;
+        let genericLocalCalls = 0;
+        const originalGenericLocal = (fixture.scm as any).resolveConflictWithLocalState;
+        (fixture.scm as any).resolveConflictWithLocalState = async () => {
+            genericLocalCalls += 1;
+            return false;
+        };
+        (vscode.window as any).showQuickPick = async (items: unknown) => {
+            if (pickCount++===0) {
+                assert.deepStrictEqual(items, ['/chapter']);
+                return '/chapter';
+            }
+            const choices = items as Array<{choice: string}>;
+            assert.deepStrictEqual(
+                choices.map(item => item.choice),
+                ['keep-overleaf', 'keep-both'],
+            );
+            return choices.find(item => item.choice==='keep-both');
+        };
+        (vscode.window as any).showWarningMessage = async (...args: unknown[]) => args.at(-1);
+        (vscode.window as any).showInformationMessage = async () => undefined;
+        try {
+            await setting.callback();
+        } finally {
+            (fixture.scm as any).resolveConflictWithLocalState = originalGenericLocal;
+        }
+
+        assert.strictEqual(genericLocalCalls, 0);
+        assert.strictEqual(await readText(vscode.Uri.joinPath(
+            fixture.localFolder,
+            'remote.tex',
+        )), fixture.replacementTexContent);
+        assert.deepStrictEqual(
+            await readBytes(vscode.Uri.joinPath(fixture.localFolder, 'figures', 'new.png')),
+            fixture.replacementImageContent,
+        );
+        const history = (fixture.scm as any).syncManifest.folderConflictResolutionHistory;
+        assert.strictEqual(history.at(-1).choice, 'keep-both');
+        assert.strictEqual(history.at(-1).outcome, 'completed');
+        const artifact = uriForRelPath(fixture.localRoot, history.at(-1).artifactRelPath);
+        assert.deepStrictEqual(
+            await readBytes(vscode.Uri.joinPath(artifact, 'paper.pdf')),
+            fixture.localPdfContent,
+        );
+        assert.deepStrictEqual(
+            await readBytes(vscode.Uri.joinPath(artifact, 'local-only.zip')),
+            fixture.localZipContent,
+        );
+        assert.strictEqual(await readText(fixture.replacementTex), fixture.replacementTexContent);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/chapter'), false);
+    });
+
+    test('keeps a folder conflict unchanged on picker confirmation cancellation then routes Keep Overleaf', async () => {
+        const fixture = await createFolderDeleteConflictFixture('folder-picker-keep-overleaf');
+        const setting = (fixture.scm as any).settingItems.find((item: any) =>
+            /Resolve a Local Replica sync conflict/.test(item.label),
+        );
+        assert.ok(setting);
+        let confirm = false;
+        let pickCount = 0;
+        (vscode.window as any).showQuickPick = async (items: unknown) => {
+            if (pickCount++ % 2===0) {
+                assert.deepStrictEqual(items, ['/chapter']);
+                return '/chapter';
+            }
+            const choices = items as Array<{choice: string}>;
+            assert.deepStrictEqual(
+                choices.map(item => item.choice),
+                ['keep-overleaf', 'keep-both'],
+            );
+            return choices.find(item => item.choice==='keep-overleaf');
+        };
+        (vscode.window as any).showWarningMessage = async (...args: unknown[]) =>
+            confirm ? args.at(-1) : undefined;
+        (vscode.window as any).showInformationMessage = async () => undefined;
+
+        await setting.callback();
+        assert.strictEqual(await pathExists(fixture.localFolder), true);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/chapter'), true);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.folderConflictResolutions['/chapter'],
+            undefined,
+        );
+
+        confirm = true;
+        await setting.callback();
+        assert.strictEqual(await pathExists(fixture.localFolder), false);
+        assert.strictEqual(await pathExists(fixture.remoteFolder), false);
+        const history = (fixture.scm as any).syncManifest.folderConflictResolutionHistory;
+        assert.strictEqual(history.at(-1).choice, 'keep-overleaf');
+        assert.strictEqual(history.at(-1).outcome, 'completed');
+        const guard = uriForRelPath(fixture.localRoot, history.at(-1).guardRelPath);
+        assert.deepStrictEqual(
+            await readBytes(vscode.Uri.joinPath(guard, 'paper.pdf')),
+            fixture.localPdfContent,
+        );
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/chapter'), false);
+    });
+
+    test('offers only Keep Overleaf when a folder conflict has no local tree', async () => {
+        const fixture = await createFolderReplacementConflictFixture('folder-picker-missing-local');
+        await vscode.workspace.fs.delete(fixture.localFolder, {recursive: true});
+        const setting = (fixture.scm as any).settingItems.find((item: any) =>
+            /Resolve a Local Replica sync conflict/.test(item.label),
+        );
+        assert.ok(setting);
+        let pickCount = 0;
+        (vscode.window as any).showQuickPick = async (items: unknown) => {
+            if (pickCount++===0) {
+                return '/chapter';
+            }
+            assert.deepStrictEqual(
+                (items as Array<{choice: string}>).map(item => item.choice),
+                ['keep-overleaf'],
+            );
+            return undefined;
+        };
+
+        await setting.callback();
+
+        assert.strictEqual(await pathExists(fixture.localFolder), false);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/chapter'), true);
+        assert.strictEqual(
+            (fixture.scm as any).syncManifest.folderConflictResolutions['/chapter'],
+            undefined,
+        );
+    });
+
+    test('does not classify an entirely missing file conflict as a folder choice', async () => {
+        const fixture = await createBinaryConflictFixture('picker-both-missing-file');
+        await vscode.workspace.fs.delete(fixture.localImage);
+        await vscode.workspace.fs.delete(fixture.remoteImage);
+        const remoteState = await (fixture.scm as any).captureRemotePathRevision(
+            fixture.relPath,
+        );
+        await (fixture.scm as any).markSyncConflict(
+            fixture.relPath,
+            'test both-missing file conflict',
+            undefined,
+            undefined,
+            remoteState,
+        );
+        const setting = (fixture.scm as any).settingItems.find((item: any) =>
+            /Resolve a Local Replica sync conflict/.test(item.label),
+        );
+        assert.ok(setting);
+        let pickCount = 0;
+        (vscode.window as any).showQuickPick = async (items: unknown) => {
+            if (pickCount++===0) {
+                return fixture.relPath;
+            }
+            assert.deepStrictEqual(
+                (items as Array<{choice: string}>).map(item => item.choice),
+                ['keep-local', 'keep-overleaf'],
+            );
+            return undefined;
+        };
+
+        await setting.callback();
+
+        assert.strictEqual(await pathExists(fixture.localImage), false);
+        assert.strictEqual(await pathExists(fixture.remoteImage), false);
+        assert.strictEqual((fixture.scm as any).syncConflicts.has(fixture.relPath), true);
+    });
+
+    test('refuses to present an unsafe tree choice for a file-folder type conflict', async () => {
+        const fixture = await createFolderReplacementConflictFixture('folder-picker-type-conflict');
+        await vscode.workspace.fs.delete(fixture.remoteFolder, {recursive: true});
+        await writeText(fixture.remoteFolder, 'remote file replacement');
+        const remoteState = await (fixture.scm as any).captureRemotePathRevision('/chapter');
+        await (fixture.scm as any).markSyncConflict(
+            '/chapter',
+            'test file-folder conflict',
+            undefined,
+            undefined,
+            remoteState,
+        );
+        const setting = (fixture.scm as any).settingItems.find((item: any) =>
+            /Resolve a Local Replica sync conflict/.test(item.label),
+        );
+        assert.ok(setting);
+        let warning: unknown;
+        (vscode.window as any).showQuickPick = async () => '/chapter';
+        (vscode.window as any).showWarningMessage = async (message: unknown) => {
+            warning = message;
+            return undefined;
+        };
+
+        await setting.callback();
+
+        assert.match(String(warning), /cannot be resolved automatically/i);
+        assert.strictEqual(await pathExists(fixture.localFolder), true);
+        assert.strictEqual(await readText(fixture.remoteFolder), 'remote file replacement');
+        assert.strictEqual((fixture.scm as any).syncConflicts.has('/chapter'), true);
+    });
+
     test('opens a text merge preview without mutating either copy and cancel discards it', async () => {
         const fixture = await createTextConflictFixture('text-merge-preview');
         const manifestBefore = JSON.stringify((fixture.scm as any).syncManifest);

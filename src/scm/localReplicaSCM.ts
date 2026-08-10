@@ -23861,14 +23861,31 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         } catch {
             localKind = undefined;
         }
-        const supportsRemoteCanonicalChoice = (
+        const supportsFileRemoteCanonicalChoice = (
             conflictEntry?.remoteKind==='file'
             || conflictEntry?.remoteKind==='missing'
         ) && (
             localKind==='file'
             || localKind==='missing'
         );
-        const supportsTextMergeChoice = localKind==='file'
+        // A folder conflict may be resolved only by choosing verified Overleaf
+        // state locally. Never fall through to generic Keep Local: that path
+        // mutates a remote tree and Hosted Overleaf does not offer a conditional
+        // tree-mutation API.
+        const isTreeConflict = localKind==='directory'
+            || conflictEntry?.remoteKind==='directory';
+        const supportsFolderRemoteCanonicalChoice = isTreeConflict
+            && relPath!=='/'
+            && (
+                conflictEntry?.remoteKind==='directory'
+                || conflictEntry?.remoteKind==='missing'
+            )
+            && (
+                localKind==='directory'
+                || localKind==='missing'
+            );
+        const supportsTextMergeChoice = !isTreeConflict
+            && localKind==='file'
             && conflictEntry?.mergeBaseContentBase64!==undefined
             && conflictEntry.mergeBaseRevision!==undefined
             && conflictEntry.mergeRemoteEntity?.type==='doc'
@@ -23876,13 +23893,14 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
             && this.syncManifest?.textMergeResolutions[relPath]===undefined;
         type ConflictChoice = 'review-merge' | 'keep-local' | 'keep-overleaf' | 'keep-both';
         type ConflictChoiceItem = vscode.QuickPickItem & {choice: ConflictChoice};
-        const choices: ConflictChoiceItem[] = [
-            {
+        const choices: ConflictChoiceItem[] = [];
+        if (!isTreeConflict) {
+            choices.push({
                 label: vscode.l10n.t('Keep Local'),
                 description: vscode.l10n.t('Apply the current local state to Overleaf'),
                 choice: 'keep-local',
-            },
-        ];
+            });
+        }
         if (supportsTextMergeChoice) {
             choices.push({
                 label: vscode.l10n.t('Review & Merge Text...'),
@@ -23890,21 +23908,43 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
                 choice: 'review-merge',
             });
         }
-        if (supportsRemoteCanonicalChoice) {
+        if (supportsFileRemoteCanonicalChoice) {
             choices.push({
                 label: vscode.l10n.t('Keep Overleaf'),
                 description: vscode.l10n.t('Replace the canonical local file with the current Overleaf state'),
                 choice: 'keep-overleaf',
             });
         }
+        if (supportsFolderRemoteCanonicalChoice) {
+            choices.push({
+                label: vscode.l10n.t('Keep Overleaf'),
+                description: vscode.l10n.t('Replace the canonical local tree with the verified current Overleaf tree'),
+                choice: 'keep-overleaf',
+            });
+        }
         // A missing local path has no second copy to retain. Keep Both is only
-        // meaningful when there is a stable local file to preserve.
-        if (supportsRemoteCanonicalChoice && localKind==='file') {
+        // meaningful when there is a stable local file or directory to preserve.
+        if (supportsFileRemoteCanonicalChoice && localKind==='file') {
             choices.push({
                 label: vscode.l10n.t('Keep Both'),
                 description: vscode.l10n.t('Keep Overleaf at the canonical path and save the local copy as an ignored recovery artifact'),
                 choice: 'keep-both',
             });
+        }
+        if (supportsFolderRemoteCanonicalChoice && localKind==='directory') {
+            choices.push({
+                label: vscode.l10n.t('Keep Both'),
+                description: vscode.l10n.t('Keep Overleaf at the canonical tree and save the complete local tree as an ignored recovery artifact'),
+                choice: 'keep-both',
+            });
+        }
+        if (choices.length===0) {
+            vscode.window.showWarningMessage(
+                vscode.l10n.t(
+                    'This tree conflict cannot be resolved automatically. Its local and Overleaf path types must be reviewed without mutating Overleaf.',
+                ),
+            );
+            return;
         }
         const choice = await vscode.window.showQuickPick(choices, {
             ignoreFocusOut: true,
@@ -23943,17 +23983,22 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         }
 
         const keepBoth = choice.choice==='keep-both';
+        const folderResolution = supportsFolderRemoteCanonicalChoice;
         const action = keepBoth
             ? vscode.l10n.t('Keep Both')
             : vscode.l10n.t('Keep Overleaf');
         const confirmation = await vscode.window.showWarningMessage(
             keepBoth
                 ? vscode.l10n.t(
-                    'Keep Overleaf as the canonical state for "{relPath}" and preserve the current local file under ignored extension metadata?',
+                    folderResolution
+                        ? 'Keep Overleaf as the canonical tree for "{relPath}" and preserve the complete current local tree under ignored extension metadata?'
+                        : 'Keep Overleaf as the canonical state for "{relPath}" and preserve the current local file under ignored extension metadata?',
                     {relPath},
                 )
                 : vscode.l10n.t(
-                    'Replace or delete the local canonical path "{relPath}" with the verified current Overleaf state?',
+                    folderResolution
+                        ? 'Replace or delete the local canonical tree "{relPath}" with the verified current Overleaf tree?'
+                        : 'Replace or delete the local canonical path "{relPath}" with the verified current Overleaf state?',
                     {relPath},
                 ),
             {modal: true},
@@ -23962,7 +24007,9 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         if (confirmation!==action) {
             return;
         }
-        const result = await this.resolveConflictWithOverleafState(relPath, keepBoth);
+        const result = folderResolution
+            ? await this.resolveFolderConflictWithOverleafState(relPath, keepBoth)
+            : await this.resolveConflictWithOverleafState(relPath, keepBoth);
         if (!result.resolved) {
             vscode.window.showWarningMessage(
                 vscode.l10n.t(
@@ -23973,21 +24020,26 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
             return;
         }
         if (result.artifactRelPath!==undefined) {
-            const openArtifact = vscode.l10n.t('Open Preserved Local Artifact');
+            const openArtifact = folderResolution
+                ? vscode.l10n.t('Reveal Preserved Local Tree')
+                : vscode.l10n.t('Open Preserved Local Artifact');
             const selection = await vscode.window.showInformationMessage(
                 vscode.l10n.t(
-                    'Overleaf is now canonical for "{relPath}". The prior local copy was preserved as an ignored recovery artifact.',
+                    folderResolution
+                        ? 'Overleaf is now canonical for "{relPath}". The prior local tree was preserved as an ignored recovery artifact.'
+                        : 'Overleaf is now canonical for "{relPath}". The prior local copy was preserved as an ignored recovery artifact.',
                     {relPath},
                 ),
                 openArtifact,
             );
             if (selection===openArtifact) {
                 await vscode.commands.executeCommand(
-                    'vscode.open',
+                    folderResolution ? 'revealInExplorer' : 'vscode.open',
                     this.localUri(result.artifactRelPath),
                 );
             }
         }
+
     }
 
     get settingItems(): SettingItem[] {
