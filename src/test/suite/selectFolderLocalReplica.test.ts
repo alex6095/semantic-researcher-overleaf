@@ -6143,6 +6143,72 @@ suite('Select Project Folder Local Replica', function () {
         assert.ok((fixture.scm as any).syncConflicts.has('/chapter'));
     });
 
+    test('preserves the local artifact and blocks a tampered stage after local preservation restart', async () => {
+        const fixture = await createFolderReplacementConflictFixture(
+            'folder-replacement-local-preserved-stage-tamper',
+        );
+        const originalInstall = (fixture.scm as any)
+            .installStagedFolderConflictTree.bind(fixture.scm);
+        (fixture.scm as any).installStagedFolderConflictTree = async () => false;
+        try {
+            const initial = await fixture.scm.resolveFolderConflictWithOverleafState(
+                '/chapter',
+                true,
+            );
+            assert.strictEqual(initial.resolved, false);
+        } finally {
+            (fixture.scm as any).installStagedFolderConflictTree = originalInstall;
+        }
+
+        const record = (fixture.scm as any).syncManifest.folderConflictResolutions['/chapter'];
+        assert.strictEqual(record.phase, 'local-preserved');
+        assert.strictEqual(await pathExists(fixture.localFolder), false);
+        await writeText(uriForRelPath(
+            fixture.localRoot,
+            record.stageRelPath + '/tampered.tex',
+        ), 'metadata tamper after local preservation');
+        await fixture.scm.deactivate();
+
+        const restarted = createSCM(
+            fixture.remoteRoot,
+            fixture.localRoot,
+            fixture.fakeVfs,
+        );
+        assert.strictEqual(
+            await restarted.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        const blocked = (restarted as any).syncManifest
+            .folderConflictResolutions['/chapter'];
+        assert.strictEqual(blocked.phase, 'blocked');
+        assert.deepStrictEqual(
+            await readBytes(uriForRelPath(
+                fixture.localRoot,
+                record.artifactRelPath + '/paper.pdf',
+            )),
+            fixture.localPdfContent,
+        );
+        assert.strictEqual(
+            await pathExists(uriForRelPath(
+                fixture.localRoot,
+                record.stageRelPath + '/tampered.tex',
+            )),
+            true,
+        );
+        assert.strictEqual(await readText(fixture.replacementTex), fixture.replacementTexContent);
+        assert.ok((restarted as any).syncConflicts.has('/chapter'));
+        if (await pathExists(fixture.localFolder)) {
+            assert.strictEqual(
+                await pathExists(vscode.Uri.joinPath(fixture.localFolder, 'paper.pdf')),
+                false,
+            );
+            assert.strictEqual(
+                await readText(vscode.Uri.joinPath(fixture.localFolder, 'remote.tex')),
+                fixture.replacementTexContent,
+            );
+        }
+    });
+
     test('rebuilds a missing remote folder stage before preserving the local tree', async () => {
         const fixture = await createFolderReplacementConflictFixture(
             'folder-replacement-stage-rebuild',
