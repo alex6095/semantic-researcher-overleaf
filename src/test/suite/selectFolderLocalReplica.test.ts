@@ -6092,6 +6092,70 @@ suite('Select Project Folder Local Replica', function () {
         }
     });
 
+    test('blocks a partial prepared remote folder stage on restart without moving the canonical local tree', async () => {
+        const fixture = await createFolderReplacementConflictFixture(
+            'folder-replacement-prepared-partial-stage',
+        );
+        const originalStage = (fixture.scm as any)
+            .stageFolderConflictRemoteDirectory.bind(fixture.scm);
+        (fixture.scm as any).stageFolderConflictRemoteDirectory = async (
+            record: any,
+        ) => {
+            await writeText(uriForRelPath(
+                fixture.localRoot,
+                record.stageRelPath + '/partial.tex',
+            ), 'interrupted protected stage');
+            return false;
+        };
+        let initial: any;
+        try {
+            initial = await fixture.scm.resolveFolderConflictWithOverleafState(
+                '/chapter',
+                true,
+            );
+        } finally {
+            (fixture.scm as any).stageFolderConflictRemoteDirectory = originalStage;
+        }
+        assert.strictEqual(initial.resolved, false);
+        const record = (fixture.scm as any).syncManifest
+            .folderConflictResolutions['/chapter'];
+        assert.strictEqual(record.phase, 'prepared');
+        const localInode = (await fs.lstat(fixture.localFolder.fsPath)).ino;
+        assert.deepStrictEqual(await readBytes(fixture.localPdf), fixture.localPdfContent);
+        assert.strictEqual(
+            await pathExists(uriForRelPath(
+                fixture.localRoot,
+                record.stageRelPath + '/partial.tex',
+            )),
+            true,
+        );
+
+        await fixture.scm.deactivate();
+        const restarted = createSCM(
+            fixture.remoteRoot,
+            fixture.localRoot,
+            fixture.fakeVfs,
+        );
+        assert.strictEqual(
+            await restarted.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        const blocked = (restarted as any).syncManifest
+            .folderConflictResolutions['/chapter'];
+        assert.strictEqual(blocked.phase, 'blocked');
+        assert.strictEqual((await fs.lstat(fixture.localFolder.fsPath)).ino, localInode);
+        assert.deepStrictEqual(await readBytes(fixture.localPdf), fixture.localPdfContent);
+        assert.strictEqual(
+            await pathExists(uriForRelPath(
+                fixture.localRoot,
+                record.stageRelPath + '/partial.tex',
+            )),
+            true,
+        );
+        assert.strictEqual(await readText(fixture.replacementTex), fixture.replacementTexContent);
+        assert.ok((restarted as any).syncConflicts.has('/chapter'));
+    });
+
     test('blocks a tampered remote folder stage before moving the canonical local tree', async () => {
         const fixture = await createFolderReplacementConflictFixture(
             'folder-replacement-stage-tamper',
