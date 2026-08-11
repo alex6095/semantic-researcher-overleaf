@@ -5,7 +5,7 @@ import { SocketIOAPI, UpdateUserSchema } from '../api/socketio';
 import { VirtualFileSystem } from '../core/remoteFileSystemProvider';
 import { ChatViewProvider } from './chatViewProvider';
 import { LocalReplicaSCMProvider } from '../scm/localReplicaSCM';
-import { isSupportedReplicaDocument } from '../utils/localReplicaWorkspace';
+import { isSupportedReplicaDocument, isWithinActiveReplica } from '../utils/localReplicaWorkspace';
 
 interface ExtendedUpdateUserSchema extends UpdateUserSchema {
     selection?: {
@@ -62,7 +62,7 @@ export class ClientManager {
     private readonly chatViewer: ChatViewProvider;
     private disposed = false;
     private readonly socketHandlers: vscode.Disposable;
-    private pendingPosition?: {uri: vscode.Uri, row: number, column: number};
+    private pendingPosition?: {document: vscode.TextDocument, row: number, column: number};
     private lastSentPosition?: {docId: string, row: number, column: number};
     private positionTimer?: NodeJS.Timeout;
     private lastPositionUpdateAt = 0;
@@ -352,9 +352,28 @@ export class ClientManager {
         this.updateStatus();
     }
 
-    private queuePositionUpdate(uri: vscode.Uri, row: number, column: number) {
+    private isSaveGatedLocalReplicaDocument(document: vscode.TextDocument) {
+        return isWithinActiveReplica(document.uri) && isSupportedReplicaDocument(document.uri);
+    }
+
+    private clearPendingPosition() {
+        this.pendingPosition = undefined;
+        if (this.positionTimer) {
+            clearTimeout(this.positionTimer);
+            this.positionTimer = undefined;
+        }
+    }
+
+    private queuePositionUpdate(document: vscode.TextDocument, row: number, column: number) {
+        const uri = document.uri;
         if (this.disposed || !isSupportedReplicaDocument(uri)) { return; }
-        this.pendingPosition = {uri, row, column};
+        if (this.isSaveGatedLocalReplicaDocument(document) && document.isDirty) {
+            // Local Replica content is save-gated. Do not advertise a cursor
+            // whose surrounding unsaved text is not yet visible in Overleaf.
+            this.clearPendingPosition();
+            return;
+        }
+        this.pendingPosition = {document, row, column};
         const elapsed = Date.now() - this.lastPositionUpdateAt;
         if (!this.positionTimer && elapsed>=ClientManager.positionUpdateThrottleMs) {
             void this.sendPendingPosition().catch(console.error);
@@ -373,7 +392,11 @@ export class ClientManager {
         if (!pending || this.disposed) { return; }
         this.lastPositionUpdateAt = Date.now();
 
-        let uri = pending.uri;
+        if (this.isSaveGatedLocalReplicaDocument(pending.document) && pending.document.isDirty) {
+            return;
+        }
+
+        let uri = pending.document.uri;
         if (uri.scheme==='file') {
             const path = await LocalReplicaSCMProvider.uriToPath(uri);
             if (path) {
@@ -397,6 +420,37 @@ export class ClientManager {
         }
         this.lastSentPosition = {docId, row: pending.row, column: pending.column};
         await this.socket.updatePosition(docId, pending.row, pending.column);
+    }
+
+    private async publishSavedLocalReplicaPosition(document: vscode.TextDocument) {
+        if (
+            this.disposed
+            || document.isDirty
+            || !this.isSaveGatedLocalReplicaDocument(document)
+        ) {
+            return;
+        }
+        const activeEditor = vscode.window.activeTextEditor;
+        const editor = activeEditor?.document.uri.toString()===document.uri.toString()
+            ? activeEditor
+            : vscode.window.visibleTextEditors.find(
+                candidate => candidate.document.uri.toString()===document.uri.toString(),
+            );
+        if (!editor) { return; }
+
+        try {
+            // Do not publish Local Replica presence until the save has crossed
+            // the same guarded push boundary as its document content.
+            await this.vfs.flushPendingLocalPush(document.uri);
+        } catch (error) {
+            console.warn(
+                `Withholding Local Replica cursor position until ${document.uri.toString()} syncs:`,
+                error,
+            );
+            return;
+        }
+        if (this.disposed || document.isDirty) { return; }
+        this.queuePositionUpdate(document, editor.selection.active.line, editor.selection.active.character);
     }
 
     collaborationSettings() {
@@ -467,11 +521,13 @@ export class ClientManager {
             vscode.window.onDidChangeTextEditorSelection(async e => {
                 if (e.kind===undefined) { return; }
                 this.queuePositionUpdate(
-                    e.textEditor.document.uri,
+                    e.textEditor.document,
                     e.selections[0].active.line,
                     e.selections[0].active.character,
                 );
             }),
+            // Saved Local Replica content and cursor presence cross together.
+            vscode.workspace.onDidSaveTextDocument(document => void this.publishSavedLocalReplicaPosition(document)),
             // refresh decorations when editor is switched
             vscode.window.onDidChangeVisibleTextEditors(e => {
                 this.refreshDecorations(e);

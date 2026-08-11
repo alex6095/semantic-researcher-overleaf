@@ -652,8 +652,58 @@ suite('Audited Local Replica fix lifecycle', () => {
         assert.match(warned, /no longer online/);
     });
 
-    // ------------------------------------------------ replica settings compat
+    test('withholds Local Replica cursor presence until a saved buffer has flushed', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-audit-presence-remote-');
+        const localRoot = await tempDir('sr-overleaf-audit-presence-local-');
+        tempRoots.push(remoteRoot, localRoot);
+        await writeReplicaSettings(localRoot, remoteRoot);
+        await setActiveReplicaRoot(localRoot);
 
+        const localUri = vscode.Uri.joinPath(localRoot, 'main.tex');
+        const dirtyDocument = {uri: localUri, isDirty: true} as vscode.TextDocument;
+        const savedDocument = {uri: localUri, isDirty: false} as vscode.TextDocument;
+        const sentPositions: Array<{docId: string, row: number, column: number}> = [];
+        const flushedUris: string[] = [];
+        const manager = Object.create(ClientManager.prototype) as ClientManager;
+        const internals = manager as any;
+        internals.disposed = false;
+        internals.lastPositionUpdateAt = 0;
+        internals.vfs = {
+            pathToUri: (...parts: string[]) => vscode.Uri.joinPath(
+                remoteRoot,
+                ...parts.flatMap(part => part.split('/').filter(Boolean)),
+            ),
+            // eslint-disable-next-line @typescript-eslint/naming-convention
+            _resolveUri: async () => ({fileEntity: {_id: 'main-doc'}}),
+            flushPendingLocalPush: async (uri: vscode.Uri) => {
+                flushedUris.push(uri.toString());
+            },
+        };
+        internals.socket = {
+            updatePosition: async (docId: string, row: number, column: number) => {
+                sentPositions.push({docId, row, column});
+            },
+        };
+        Object.defineProperty(vscode.window, 'visibleTextEditors', {
+            configurable: true,
+            value: [{
+                document: savedDocument,
+                selection: new vscode.Selection(11, 5, 11, 5),
+            }],
+        });
+
+        internals.queuePositionUpdate(dirtyDocument, 11, 5);
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+        assert.deepStrictEqual(sentPositions, []);
+        assert.strictEqual(internals.pendingPosition, undefined);
+
+        await internals.publishSavedLocalReplicaPosition(savedDocument);
+        await new Promise<void>(resolve => setTimeout(resolve, 0));
+        assert.deepStrictEqual(flushedUris, [localUri.toString()]);
+        assert.deepStrictEqual(sentPositions, [{docId: 'main-doc', row: 11, column: 5}]);
+    });
+
+    // ------------------------------------------------ replica settings compat
     test('normalizes replica settings carrying removed-feature keys without looping', async () => {
         const remoteRoot = await tempDir('sr-overleaf-audit-settings-remote-');
         const localRoot = await tempDir('sr-overleaf-audit-settings-local-');

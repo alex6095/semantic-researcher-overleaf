@@ -306,6 +306,11 @@ When there are other collaborators (or your other login sessions) online, the co
 The online collaborators information is displayed on the status bar. The item icon shows the number of online collaborators, and the color represents the latest active collaborator.
 You can hover on the item like below to see the detailed information of the online collaborators, and click the text like `@xxx` to cite the collaborator [in the chat view](#chat-with-collaborators), or click the text like `main.tex#L1` to jump to the exact position of the collaborator. 
 
+For a Local Replica, document content and your cursor presence are deliberately
+save-gated together. An unsaved editor buffer stays local and its cursor is not
+published to Overleaf. After you save, the extension first completes the
+guarded Local Replica push and then publishes the current cursor position.
+
 #### Chat with Collaborators
 
 The chat view is located at the primary sidebar of the VS Code window by default. You can type in the input box at the bottom of the chat view and press <kbd>Enter</kbd> to send the message.
