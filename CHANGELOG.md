@@ -4,7 +4,19 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.16.1] - Unreleased
+## [0.16.1] - 2026-08-11
+
+### Highlights
+
+- Make Overleaf the explicit canonical state for a selected Local Replica. A
+  manifest v16 preserves durable file, folder, create, delete, and move intent
+  across restarts and reconnects, and makes unproven states conflicts.
+- Synchronize clean closed files changed by shells or agents, including ordinary
+  PNG/PDF/ZIP media, with stable-read guards, entity identity checks, and safe
+  three-way text reconciliation.
+- Add guarded Base/Local/Overleaf text review plus remote-authoritative folder
+  Keep Overleaf/Keep Both conflict choices; neither silently overwrites a
+  dirty editor buffer.
 
 ### Added
 - Add manifest schema v3 with a durable pending-operation journal for stable
@@ -45,14 +57,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   applied; a missing predecessor triggers authoritative snapshot recovery, and
   malformed operations cannot mutate the cached document.
 
-### Planned
-- Make Overleaf the explicit canonical project state while treating the selected
-  local folder as a durable working copy and queue of pending local intent.
-- Reconcile text through current-revision OT and file/tree changes through
-  guarded project-entity transactions, with a human-reviewable conflict path
-  whenever a safe automatic result cannot be proven.
-- Add conflict-resolution UX that preserves both copies rather than relying on
-  event timing or a last-writer-wins policy.
+### Fixed
+
+- Save-gate Local Replica cursor presence with document content. A dirty editor
+  buffer neither publishes new cursor positions nor sends text; after Ctrl+S,
+  the guarded local push completes before the active cursor is published.
+- Rehydrate clean legacy media mappings before startup watcher replay, allowing
+  a proven older PNG/PDF/ZIP rename or cross-folder move to retain its
+  Overleaf entity identity.
+
+### Known limitations
+- The public hosted Overleaf folder-tree API does not expose server-side
+  compare-and-swap preconditions. Automatic local folder Keep Local remains
+  fail-closed; only remote-authoritative folder choices are exposed.
+- Local Replica editor content is save-gated. It deliberately does not offer
+  a live, keystroke-level OT mode; unsaved buffers and cursor presence remain
+  local until the guarded save push succeeds.
+
+### Verified
+
+- 569 extension-host tests, TypeScript compilation, lint, dependency audits,
+  and both VSIX archive-integrity checks pass.
 
 ## [0.16.0] - 2026-08-06
 
