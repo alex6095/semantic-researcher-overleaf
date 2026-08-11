@@ -3673,6 +3673,116 @@ suite('Select Project Folder Local Replica', function () {
     });
 
 
+    test('rehydrates a clean v15 PNG baseline before a watcher-observed cross-folder move', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-legacy-media-move-remote-');
+        const localRoot = await tempDir('sr-overleaf-legacy-media-move-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteOld = vscode.Uri.joinPath(remoteRoot, 'figures', 'status.png');
+        const remoteNew = vscode.Uri.joinPath(remoteRoot, 'status.png');
+        const localOld = vscode.Uri.joinPath(localRoot, 'figures', 'status.png');
+        const localNew = vscode.Uri.joinPath(localRoot, 'status.png');
+        const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x76, 0x31, 0x35]);
+        await writeBytes(remoteOld, png);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('', 'legacy-media-root');
+        fakeVfs.setEntityId('figures', 'legacy-media-figures');
+        fakeVfs.setEntityId('figures/status.png', 'legacy-media-file');
+        const firstScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const manifestUri = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-manifest.json',
+        );
+        const legacyManifest = JSON.parse(await readText(manifestUri));
+        legacyManifest.version = 15;
+        delete legacyManifest.files['/figures/status.png'].remoteEntity;
+        delete legacyManifest.files['/figures/status.png'].parentEntity;
+        delete legacyManifest.files['/figures/status.png'].localIdentity;
+        await writeText(manifestUri, JSON.stringify(legacyManifest, null, 2));
+        await firstScm.deactivate();
+
+        const restartedScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        const rehydrated = (restartedScm as any).syncManifest.files['/figures/status.png'];
+        assert.strictEqual(rehydrated.remoteEntity.id, 'legacy-media-file');
+        assert.strictEqual(rehydrated.parentEntity.id, 'legacy-media-figures');
+        assert.ok(rehydrated.localIdentity);
+
+        await vscode.workspace.fs.rename(localOld, localNew, {overwrite: false});
+        await (restartedScm as any).syncToVFS(localOld, 'delete');
+        await (restartedScm as any).syncToVFS(localNew, 'update');
+        await new Promise<void>(resolve => setTimeout(resolve, 400));
+        await (restartedScm as any).drainPendingSyncWork();
+
+        assert.strictEqual(await pathExists(remoteOld), false);
+        assert.deepStrictEqual(await readBytes(remoteNew), png);
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(remoteNew)).fileEntity._id,
+            'legacy-media-file',
+        );
+        assert.deepStrictEqual((restartedScm as any).syncManifest.pendingOperations, {});
+        assert.strictEqual(
+            (restartedScm as any).syncConflicts.get('/status.png'),
+            undefined,
+        );
+    });
+
+    test('does not rehydrate a conflicted v15 media mapping', async () => {
+        const remoteRoot = await tempDir('sr-overleaf-legacy-media-conflict-remote-');
+        const localRoot = await tempDir('sr-overleaf-legacy-media-conflict-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remotePng = vscode.Uri.joinPath(remoteRoot, 'figures', 'status.png');
+        const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x63, 0x66]);
+        await writeBytes(remotePng, png);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('figures', 'legacy-conflict-figures');
+        fakeVfs.setEntityId('figures/status.png', 'legacy-conflict-file');
+        const firstScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        await firstScm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const manifestUri = vscode.Uri.joinPath(
+            localRoot,
+            REPLICA_SETTINGS_DIR,
+            'sync-manifest.json',
+        );
+        const legacyManifest = JSON.parse(await readText(manifestUri));
+        legacyManifest.version = 15;
+        delete legacyManifest.files['/figures/status.png'].remoteEntity;
+        delete legacyManifest.files['/figures/status.png'].parentEntity;
+        delete legacyManifest.files['/figures/status.png'].localIdentity;
+        legacyManifest.conflicts['/figures/status.png'] = {
+            reason: 'existing durable conflict',
+            localDigest: sha1(png),
+            remoteKind: 'file',
+            remoteRevision: sha1(png),
+            updatedAt: new Date().toISOString(),
+        };
+        await writeText(manifestUri, JSON.stringify(legacyManifest, null, 2));
+        await firstScm.deactivate();
+
+        const restartedScm = createSCM(remoteRoot, localRoot, fakeVfs);
+        assert.strictEqual(
+            await restartedScm.initializeLocalReplica({preserveExistingLocalFiles: true}),
+            true,
+        );
+        const retained = (restartedScm as any).syncManifest.files['/figures/status.png'];
+        assert.strictEqual(retained.remoteEntity, undefined);
+        assert.strictEqual(retained.parentEntity, undefined);
+        assert.strictEqual(retained.localIdentity, undefined);
+        assert.match(
+            (restartedScm as any).syncConflicts.get('/figures/status.png'),
+            /existing durable conflict/,
+        );
+        assert.deepStrictEqual(await readBytes(remotePng), png);
+    });
+
     test('keeps a journaled file move conflicted when its source parent is replaced at the rename boundary', async () => {
         const remoteRoot = await tempDir('sr-overleaf-file-move-source-parent-race-remote-');
         const localRoot = await tempDir('sr-overleaf-file-move-source-parent-race-local-');

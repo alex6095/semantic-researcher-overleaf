@@ -14769,6 +14769,189 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         return true;
     }
 
+    // A v15-or-earlier binary skip can have a perfectly good digest/fingerprint
+    // but no durable file entity, parent, or local inode. Such an entry must
+    // never turn a later unlink/create pair into a guessed move. Rehydrate it
+    // only after both current byte snapshots and both path identities agree;
+    // watcher events are still buffered during this startup phase.
+    private async rehydrateLegacyFileMoveBaselines(
+        generation = this.syncGeneration,
+    ): Promise<void> {
+        this.requireSyncSession(generation);
+        const manifest = this.syncManifest;
+        if (!manifest || manifest.baselineComplete===false) { return; }
+        const candidates = Object.entries(manifest.files)
+            .filter(([, entry]) =>
+                entry.remoteEntity===undefined
+                || entry.parentEntity===undefined
+                || entry.localIdentity===undefined,
+            )
+            .map(([relPath]) => relPath)
+            .sort();
+        if (candidates.length===0) { return; }
+
+        let nextCandidate = 0;
+        let rehydrated = 0;
+        let deferred = 0;
+        const workerCount = Math.min(4, candidates.length);
+        const rehydrateOne = async (relPath: string): Promise<void> => {
+            const entry = this.syncManifest?.files[relPath];
+            if (
+                !entry
+                || (
+                    entry.remoteEntity!==undefined
+                    && entry.parentEntity!==undefined
+                    && entry.localIdentity!==undefined
+                )
+            ) {
+                return;
+            }
+            if (
+                this.syncManifest?.pendingOperations[relPath]!==undefined
+                || this.touchesSyncConflict(relPath)
+                || this.failedInitialPulls.has(relPath)
+                || this.pendingInitialDocumentSubscriptions.has(relPath)
+            ) {
+                deferred += 1;
+                return;
+            }
+            const localUri = this.localUri(relPath);
+            try {
+                const localBefore = await this.readStableConfinedLocalFile(
+                    relPath,
+                    localUri,
+                    generation,
+                );
+                this.requireSyncSession(generation);
+                if (
+                    localBefore.identity===undefined
+                    || contentDigest(localBefore.content)!==entry.localDigest
+                ) {
+                    deferred += 1;
+                    return;
+                }
+
+                const remoteBefore = await this.captureRemotePathRevision(
+                    relPath,
+                    generation,
+                );
+                this.requireSyncSession(generation);
+                if (
+                    remoteBefore.kind!=='file'
+                    || remoteBefore.content===undefined
+                    || !bytesEqual(localBefore.content, remoteBefore.content)
+                ) {
+                    deferred += 1;
+                    return;
+                }
+                const remoteIdentity = await this.resolveStableRemoteFilePathIdentity(
+                    relPath,
+                    remoteBefore,
+                    generation,
+                );
+                this.requireSyncSession(generation);
+                const remoteAfter = await this.captureRemotePathRevision(
+                    relPath,
+                    generation,
+                );
+                const identityAfter = await this.resolveRemoteFilePathIdentity(
+                    this.vfs.pathToUri(relPath),
+                );
+                this.requireSyncSession(generation);
+                if (
+                    remoteAfter.kind!=='file'
+                    || remoteAfter.content===undefined
+                    || !bytesEqual(remoteBefore.content, remoteAfter.content)
+                    || !this.remoteFilePathIdentityMatches(
+                        identityAfter,
+                        remoteIdentity.entity,
+                        remoteIdentity.parent,
+                    )
+                ) {
+                    deferred += 1;
+                    return;
+                }
+
+                const localAfter = await this.readStableConfinedLocalFile(
+                    relPath,
+                    localUri,
+                    generation,
+                );
+                this.requireSyncSession(generation);
+                if (
+                    localAfter.identity===undefined
+                    || !this.localReadIdentityEquals(
+                        localBefore.identity,
+                        localAfter.identity,
+                    )
+                    || !bytesEqual(localBefore.content, localAfter.content)
+                    || !bytesEqual(localAfter.content, remoteAfter.content)
+                ) {
+                    deferred += 1;
+                    return;
+                }
+                const localIdentity = await this.captureManifestLocalFileIdentity(
+                    relPath,
+                    localUri,
+                    localAfter.stat,
+                );
+                this.requireSyncSession(generation);
+                if (localIdentity===undefined || this.syncManifest?.files[relPath]!==entry) {
+                    deferred += 1;
+                    return;
+                }
+                const remoteFingerprint = this.isLikelyBinaryRelPath(relPath)
+                    ? remoteIdentity.entity.type==='file'
+                        ? `file:${remoteIdentity.entity.id}`
+                        : undefined
+                    : `content:${contentDigest(remoteAfter.content)}`;
+                if (remoteFingerprint===undefined) {
+                    deferred += 1;
+                    return;
+                }
+                this.syncManifest.files[relPath] = {
+                    remoteFingerprint,
+                    localSize: localAfter.stat.size,
+                    localMtime: localAfter.stat.mtime,
+                    localDigest: contentDigest(remoteAfter.content),
+                    remoteEntity: remoteIdentity.entity,
+                    parentEntity: remoteIdentity.parent,
+                    localIdentity,
+                    baseContentBase64: this.decodeMergeableText(remoteAfter.content)===undefined
+                        ? undefined
+                        : Buffer.from(remoteAfter.content).toString('base64'),
+                    updatedAt: new Date().toISOString(),
+                };
+                this.markSyncManifestDirty();
+                rehydrated += 1;
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [legacy move baseline rehydrated] ` +
+                    `${relPath} entity=${remoteIdentity.entity.type}:${remoteIdentity.entity.id}`,
+                );
+            } catch (error) {
+                if (!this.isSyncSessionActive(generation)) { throw error; }
+                deferred += 1;
+                getOutputChannel().appendLine(
+                    `${new Date().toISOString()} [legacy move baseline deferred] ` +
+                    `${relPath}: ${formatUnknownError(error)}`,
+                );
+            }
+        };
+        await Promise.all(Array.from({length: workerCount}, async () => {
+            while (true) {
+                const index = nextCandidate;
+                nextCandidate += 1;
+                if (index>=candidates.length) { return; }
+                await rehydrateOne(candidates[index]);
+            }
+        }));
+        this.requireSyncSession(generation);
+        getOutputChannel().appendLine(
+            `${new Date().toISOString()} [legacy move baseline reconciliation] ` +
+            `rehydrated=${rehydrated} deferred=${deferred}`,
+        );
+    }
+
     // A watcher event is only an observation. Once a stable local file snapshot
     // is available, retain that intent before any remote I/O so a restart can
     // re-check the authoritative Overleaf state instead of forgetting it.
@@ -23694,6 +23877,8 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
                 remoteBootstrapPromise,
             );
             if (completed!==true || !this.isSyncSessionActive(activeGeneration)) { return false; }
+            await this.rehydrateLegacyFileMoveBaselines(activeGeneration);
+            if (!this.isSyncSessionActive(activeGeneration)) { return false; }
             await this.reconcilePendingFilePushOperations(activeGeneration);
             if (!this.isSyncSessionActive(activeGeneration)) { return false; }
         } catch (error) {
