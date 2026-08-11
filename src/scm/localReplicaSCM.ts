@@ -570,7 +570,7 @@ interface PendingEvent {
 // journal. The transient intermediate basename is not globally unique, so
 // source/destination coverage alone must never let an old conflicted move
 // replay its event through a later unrelated move.
-interface DeferredRemoteDirectoryMoveEvent extends Pick<
+interface DeferredRemoteMoveEvent extends Pick<
     PendingEvent,
     'latestType' | 'latestUri'
 > {
@@ -1001,7 +1001,15 @@ export class LocalReplicaSCMProvider extends BaseSCM {
     // unresolved; they are reclassified from the final authoritative tree.
     private deferredRemoteEventsDuringDirectoryMove = new Map<
         string,
-        DeferredRemoteDirectoryMoveEvent
+        DeferredRemoteMoveEvent
+    >();
+    // Regular file/media moves use the same server-side rename-then-move
+    // sequence as folders. Keep a short-lived socket event for the
+    // intermediate basename from becoming a stale pull while the durable
+    // entity-preserving file-move journal is still proving its final path.
+    private deferredRemoteEventsDuringFileMove = new Map<
+        string,
+        DeferredRemoteMoveEvent
     >();
     // A directory rename can surface child Create/Change events before the
     // watcher reports its destination root. Serialize discovery by that
@@ -2303,6 +2311,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         this.pendingLocalMoveDeletes.clear();
         this.deferredLocalEventsDuringDirectoryMove.clear();
         this.deferredRemoteEventsDuringDirectoryMove.clear();
+        this.deferredRemoteEventsDuringFileMove.clear();
         this.pendingLocalDirectoryMoveDiscoveries.clear();
         this.pendingInitialDocumentSubscriptions.clear();
         this.startupReplayGeneration = undefined;
@@ -8466,6 +8475,7 @@ export class LocalReplicaSCMProvider extends BaseSCM {
         // only events tagged with that exact journal, otherwise an old
         // /final-style intermediate event can leak into a later move.
         this.reclassifyDeferredRemoteEventsForDirectoryMoveConflict(relPath, generation);
+        this.reclassifyDeferredRemoteEventsForFileMoveConflict(relPath, generation);
     }
 
     private async clearSyncConflict(
@@ -12634,6 +12644,38 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         return undefined;
     }
 
+    // File/media moves can expose the same temporary old-parent basename as
+    // folder moves. The move journal owns only its source, final destination,
+    // and those two protocol-defined intermediate paths; unrelated sibling
+    // socket events must continue through ordinary reconciliation.
+    private pendingFileMoveCoveringRemoteEvent(
+        relPath: string,
+    ): {sourceRelPath: string; record: SyncManifestPendingMoveOperation} | undefined {
+        for (const [sourceRelPath, operation] of Object.entries(
+            this.syncManifest?.pendingOperations ?? {},
+        )) {
+            if (
+                operation.kind!=='move'
+                || this.touchesSyncConflict(sourceRelPath)
+                || this.touchesSyncConflict(operation.destinationRelPath)
+            ) {
+                continue;
+            }
+            const coveredPaths = [
+                sourceRelPath,
+                operation.destinationRelPath,
+                ...this.pendingLocalMoveIntermediateRelPaths(
+                    sourceRelPath,
+                    operation.destinationRelPath,
+                ),
+            ];
+            if (coveredPaths.some(path => this.isPathAtOrBelow(relPath, path))) {
+                return {sourceRelPath, record: operation};
+            }
+        }
+        return undefined;
+    }
+
     private replayDeferredLocalEventsAfterDirectoryMove(
         destinationRelPath: string,
         generation: number,
@@ -12679,6 +12721,40 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         return true;
     }
 
+    private deferRemoteEventDuringFileMove(
+        relPath: string,
+        vfsUri: vscode.Uri,
+        type: 'update' | 'delete',
+        generation = this.syncGeneration,
+    ): boolean {
+        if (!this.isSyncSessionActive(generation)) { return false; }
+        const pendingFileMove = this.pendingFileMoveCoveringRemoteEvent(relPath);
+        if (pendingFileMove===undefined) { return false; }
+        this.deferredRemoteEventsDuringFileMove.set(relPath, {
+            sourceRelPath: pendingFileMove.sourceRelPath,
+            destinationRelPath: pendingFileMove.record.destinationRelPath,
+            operationId: pendingFileMove.record.id,
+            latestType: type,
+            latestUri: vfsUri,
+        });
+        getOutputChannel().appendLine(
+            new Date().toISOString() + ' [remote event deferred:pending-file-move] ' +
+            relPath + ' under ' + pendingFileMove.sourceRelPath +
+            ' -> ' + pendingFileMove.record.destinationRelPath,
+        );
+        return true;
+    }
+
+    private deferRemoteEventDuringPendingMove(
+        relPath: string,
+        vfsUri: vscode.Uri,
+        type: 'update' | 'delete',
+        generation = this.syncGeneration,
+    ): boolean {
+        return this.deferRemoteEventDuringDirectoryMove(relPath, vfsUri, type, generation)
+            || this.deferRemoteEventDuringFileMove(relPath, vfsUri, type, generation);
+    }
+
     private replayDeferredRemoteEventsAfterDirectoryMove(
         sourceRelPath: string,
         record: SyncManifestPendingDirectoryMoveOperation,
@@ -12718,6 +12794,43 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         }
     }
 
+    private replayDeferredRemoteEventsAfterFileMove(
+        sourceRelPath: string,
+        record: SyncManifestPendingMoveOperation,
+        generation: number,
+        reason: 'accepted' | 'conflict' = 'accepted',
+    ): void {
+        if (!this.isSyncSessionActive(generation)) { return; }
+        const deferred = [...this.deferredRemoteEventsDuringFileMove]
+            .filter(([, pending]) =>
+                pending.operationId===record.id
+                && pending.sourceRelPath===sourceRelPath
+                && pending.destinationRelPath===record.destinationRelPath,
+            );
+        if (deferred.length===0) { return; }
+        for (const [relPath] of deferred) {
+            this.deferredRemoteEventsDuringFileMove.delete(relPath);
+        }
+        const replay = () => {
+            if (!this.isSyncSessionActive(generation)) { return; }
+            for (const [relPath, pending] of deferred) {
+                getOutputChannel().appendLine(
+                    new Date().toISOString() +
+                    (reason==='accepted'
+                        ? ' [remote event replay:file-move] '
+                        : ' [remote event reclassified:file-move-conflict] ') +
+                    relPath,
+                );
+                this.syncFromVFS(pending.latestUri, pending.latestType);
+            }
+        };
+        if (reason==='conflict') {
+            setTimeout(replay, 0);
+        } else {
+            replay();
+        }
+    }
+
     private reclassifyDeferredRemoteEventsForDirectoryMoveConflict(
         conflictRelPath: string,
         generation = this.syncGeneration,
@@ -12742,6 +12855,38 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
                 continue;
             }
             this.replayDeferredRemoteEventsAfterDirectoryMove(
+                sourceRelPath,
+                operation,
+                generation,
+                'conflict',
+            );
+        }
+    }
+
+    private reclassifyDeferredRemoteEventsForFileMoveConflict(
+        conflictRelPath: string,
+        generation = this.syncGeneration,
+    ): void {
+        if (!this.isSyncSessionActive(generation)) { return; }
+        for (const [sourceRelPath, operation] of Object.entries(
+            this.syncManifest?.pendingOperations ?? {},
+        )) {
+            if (operation.kind!=='move') { continue; }
+            const coveredPaths = [
+                sourceRelPath,
+                operation.destinationRelPath,
+                ...this.pendingLocalMoveIntermediateRelPaths(
+                    sourceRelPath,
+                    operation.destinationRelPath,
+                ),
+            ];
+            if (!coveredPaths.some(path =>
+                this.isPathAtOrBelow(conflictRelPath, path)
+                || this.isPathAtOrBelow(path, conflictRelPath),
+            )) {
+                continue;
+            }
+            this.replayDeferredRemoteEventsAfterFileMove(
                 sourceRelPath,
                 operation,
                 generation,
@@ -16539,6 +16684,11 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
             record,
         );
         await this.persistSyncManifest(false, generation);
+        this.replayDeferredRemoteEventsAfterFileMove(
+            sourceRelPath,
+            record,
+            generation,
+        );
         if (!stable) {
             this.scheduleLocalPushRetry(
                 destinationRelPath,
@@ -22748,7 +22898,7 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
         // bypassSync check rejects them — wasting socket traffic and adding
         // retry/reconnect pressure during compile cycles.
         if (this.matchIgnorePatterns(relPath)) { return; }
-        if (this.deferRemoteEventDuringDirectoryMove(relPath, vfsUri, type, generation)) {
+        if (this.deferRemoteEventDuringPendingMove(relPath, vfsUri, type, generation)) {
             return;
         }
         if (this.deferFolderConflictResolutionEvent(
@@ -22776,7 +22926,7 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
             // The event may have arrived just before the local watcher
             // journaled a folder move. Re-check after debounce rather than
             // letting an already queued pull bypass that durable fence.
-            if (this.deferRemoteEventDuringDirectoryMove(
+            if (this.deferRemoteEventDuringPendingMove(
                 relPath,
                 pending.latestUri,
                 pending.latestType,
@@ -22788,7 +22938,7 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
             void this.enqueueSync(
                 relPath,
                 async () => {
-                    if (this.deferRemoteEventDuringDirectoryMove(
+                    if (this.deferRemoteEventDuringPendingMove(
                         relPath,
                         pending.latestUri,
                         pending.latestType,
@@ -22804,7 +22954,7 @@ byId('cancel').addEventListener('click', () => send('cancel', false));
                         // waits. It owns this path until it is accepted or
                         // becomes a durable conflict, so never apply the stale
                         // pull classification through its tree.
-                        if (this.deferRemoteEventDuringDirectoryMove(
+                        if (this.deferRemoteEventDuringPendingMove(
                             relPath,
                             pending.latestUri,
                             currentType,

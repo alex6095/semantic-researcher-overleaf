@@ -4,6 +4,21 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.16.2] - 2026-08-12
+
+### Fixed
+
+- Defer Socket.IO tree events for a pending regular-file/media move, including
+  Overleaf's short-lived old-parent rename path during a cross-folder basename
+  change. The event is reclassified only after the entity-preserving move is
+  accepted or deliberately retained as a conflict, so a moved PNG/PDF/ZIP no
+  longer emits a stale `pull update` FileNotFound warning.
+
+### Verified
+
+- TypeScript compilation, lint, the full extension-host suite, and deterministic
+  file/folder intermediate-event move tests pass.
+
 ## [0.16.1] - 2026-08-11
 
 ### Highlights

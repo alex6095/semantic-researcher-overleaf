@@ -4530,6 +4530,92 @@ suite('Select Project Folder Local Replica', function () {
     });
 
 
+    test('defers transient remote file-move events until the local journal finalizes', async function () {
+        this.timeout(20_000);
+        const remoteRoot = await tempDir('sr-overleaf-file-move-remote-echo-remote-');
+        const localRoot = await tempDir('sr-overleaf-file-move-remote-echo-local-');
+        tempRoots.push(remoteRoot, localRoot);
+
+        const remoteSource = vscode.Uri.joinPath(remoteRoot, 'figures', 'sync-status.png');
+        const remoteDestination = vscode.Uri.joinPath(remoteRoot, 'sync-status-moved.png');
+        const localSource = vscode.Uri.joinPath(localRoot, 'figures', 'sync-status.png');
+        const localDestination = vscode.Uri.joinPath(localRoot, 'sync-status-moved.png');
+        const png = Buffer.from([
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a,
+            0x00, 0x00, 0x00, 0x00,
+        ]);
+        await writeBytes(remoteSource, png);
+        const fakeVfs = new FakeVirtualFileSystem(remoteRoot);
+        fakeVfs.setEntityId('figures', 'folder-file-remote-echo-figures');
+        fakeVfs.setEntityId('figures/sync-status.png', 'file-remote-echo-source');
+        const scm = createSCM(remoteRoot, localRoot, fakeVfs) as any;
+        await scm.initializeLocalReplica({resetLocalFilesToRemote: true});
+
+        const remoteEventUri = vscode.Uri.parse(
+            ROOT_NAME + '://test-server/Select%20Folder%20Test/figures/sync-status-moved.png' +
+            '?user=test-user&project=test-project',
+        );
+        const originalApplySync = scm.applySync.bind(scm);
+        let pullBeforeFinalization = 0;
+        let finalized = false;
+        scm.applySync = async (...args: unknown[]) => {
+            if (args[0]==='pull' && !finalized) {
+                pullBeforeFinalization += 1;
+            }
+            return originalApplySync(...args);
+        };
+        const originalFinalize = scm.finalizeAcceptedLocalFileMove.bind(scm);
+        scm.finalizeAcceptedLocalFileMove = async (...args: unknown[]) => {
+            assert.strictEqual(pullBeforeFinalization, 0);
+            const result = await originalFinalize(...args);
+            finalized = true;
+            return result;
+        };
+        const originalRename = fakeVfs.rename.bind(fakeVfs);
+        let injected = false;
+        fakeVfs.rename = async (...args: Parameters<FakeVirtualFileSystem['rename']>) => {
+            if (!injected) {
+                injected = true;
+                // The official tree API changes the basename in /figures
+                // before moving the same media entity to /. This socket echo
+                // must wait for the durable file-move proof rather than turn
+                // into a stale pull of /figures/sync-status-moved.png.
+                const fence = scm.pendingFileMoveCoveringRemoteEvent(
+                    '/figures/sync-status-moved.png',
+                );
+                assert.strictEqual(fence?.sourceRelPath, '/figures/sync-status.png');
+                assert.strictEqual(fence?.record.destinationRelPath, '/sync-status-moved.png');
+                scm.syncFromVFS(remoteEventUri, 'update');
+                await new Promise<void>(resolve => setTimeout(resolve, 400));
+            }
+            return originalRename(...args);
+        };
+        try {
+            await vscode.workspace.fs.rename(localSource, localDestination, {overwrite: false});
+            await scm.syncToVFS(localSource, 'delete');
+            await scm.syncToVFS(localDestination, 'update');
+            await new Promise<void>(resolve => setTimeout(resolve, 1_000));
+            await scm.drainPendingSyncWork();
+        } finally {
+            fakeVfs.rename = originalRename;
+            scm.finalizeAcceptedLocalFileMove = originalFinalize;
+            scm.applySync = originalApplySync;
+        }
+
+        assert.strictEqual(injected, true);
+        assert.strictEqual(finalized, true);
+        assert.strictEqual(pullBeforeFinalization, 0);
+        assert.strictEqual(await pathExists(remoteSource), false);
+        assert.deepStrictEqual(await readBytes(remoteDestination), png);
+        assert.strictEqual(
+            (await fakeVfs._resolveUri(remoteDestination)).fileEntity._id,
+            'file-remote-echo-source',
+        );
+        assert.deepStrictEqual(scm.syncManifest.pendingOperations, {});
+        assert.strictEqual(scm.syncConflicts.has('/sync-status-moved.png'), false);
+        assert.strictEqual(scm.deferredRemoteEventsDuringFileMove.size, 0);
+    });
+
     test('defers child watcher events until local parent folders are replicated', async function () {
         this.timeout(20_000);
         const remoteRoot = await tempDir('sr-overleaf-recursive-create-remote-');
